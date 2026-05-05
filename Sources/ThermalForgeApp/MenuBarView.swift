@@ -120,6 +120,45 @@ struct MenuBarView: View {
 
             Divider().padding(.vertical, 4)
 
+            // Custom IF/THEN rule
+            SectionHeader(title: "IF / THEN RULE")
+            Toggle("Enable Custom Rule", isOn: $appState.customRuleEnabled)
+                .padding(.horizontal, 12)
+
+            if appState.customRuleEnabled {
+                Stepper(
+                    value: $appState.customRuleTriggerTempC,
+                    in: 40 ... 95,
+                    step: 1
+                ) {
+                    Text("IF temp ≥ \(Int(appState.customRuleTriggerTempC))°C")
+                        .font(.caption)
+                }
+                .padding(.horizontal, 12)
+
+                Stepper(
+                    value: $appState.customRuleFanPercent,
+                    in: 20 ... 100,
+                    step: 5
+                ) {
+                    Text("THEN set fan \(Int(appState.customRuleFanPercent))%")
+                        .font(.caption)
+                }
+                .padding(.horizontal, 12)
+
+                Stepper(
+                    value: $appState.customRuleReleaseTempC,
+                    in: 35 ... 94,
+                    step: 1
+                ) {
+                    Text("ELSE when temp ≤ \(Int(appState.customRuleReleaseTempC))°C")
+                        .font(.caption)
+                }
+                .padding(.horizontal, 12)
+            }
+
+            Divider().padding(.vertical, 4)
+
             // Footer
             Toggle("°F / °C", isOn: $appState.useFahrenheit)
                 .padding(.horizontal, 12)
@@ -135,7 +174,7 @@ struct MenuBarView: View {
             .padding(.top, 4)
             .padding(.bottom, 10)
         }
-        .frame(width: 260)
+        .frame(width: 300)
     }
 
     // MARK: - Helpers

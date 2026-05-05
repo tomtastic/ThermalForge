@@ -21,10 +21,32 @@ final class AppState: ObservableObject {
     @Published var launchAtLogin: Bool = false {
         didSet { updateLoginItem() }
     }
+    @Published var customRuleEnabled: Bool = UserDefaults.standard.bool(forKey: "customRuleEnabled") {
+        didSet { syncTemperatureRuleFromSettings() }
+    }
+    @Published var customRuleTriggerTempC: Double = {
+        let value = UserDefaults.standard.object(forKey: "customRuleTriggerTempC") as? Double
+        return value ?? 55
+    }() {
+        didSet { syncTemperatureRuleFromSettings() }
+    }
+    @Published var customRuleReleaseTempC: Double = {
+        let value = UserDefaults.standard.object(forKey: "customRuleReleaseTempC") as? Double
+        return value ?? 50
+    }() {
+        didSet { syncTemperatureRuleFromSettings() }
+    }
+    @Published var customRuleFanPercent: Double = {
+        let value = UserDefaults.standard.object(forKey: "customRuleFanPercent") as? Double
+        return value ?? 100
+    }() {
+        didSet { syncTemperatureRuleFromSettings() }
+    }
 
     private var monitor: ThermalMonitor?
     private let executor = PrivilegedExecutor()
     private var heartbeatTimer: Timer?
+    private var syncingRuleSettings = false
 
     init() {
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
@@ -79,6 +101,7 @@ final class AppState: ObservableObject {
         }
         monitor.start()
         self.monitor = monitor
+        syncTemperatureRuleFromSettings()
     }
 
     // MARK: - Actions
@@ -131,5 +154,31 @@ final class AppState: ObservableObject {
             TFLogger.shared.error("Launch at login toggle failed: \(error)")
             launchAtLogin = !launchAtLogin // revert toggle
         }
+    }
+
+    // MARK: - Custom IF/THEN Rule
+
+    private func syncTemperatureRuleFromSettings() {
+        guard !syncingRuleSettings else { return }
+        syncingRuleSettings = true
+        defer { syncingRuleSettings = false }
+
+        customRuleTriggerTempC = min(max(customRuleTriggerTempC, 40), 95)
+        customRuleReleaseTempC = min(max(customRuleReleaseTempC, 35), customRuleTriggerTempC - 1)
+        customRuleFanPercent = min(max(customRuleFanPercent, 20), 100)
+
+        UserDefaults.standard.set(customRuleEnabled, forKey: "customRuleEnabled")
+        UserDefaults.standard.set(customRuleTriggerTempC, forKey: "customRuleTriggerTempC")
+        UserDefaults.standard.set(customRuleReleaseTempC, forKey: "customRuleReleaseTempC")
+        UserDefaults.standard.set(customRuleFanPercent, forKey: "customRuleFanPercent")
+
+        let rule: TemperatureRule? = customRuleEnabled
+            ? TemperatureRule(
+                triggerTempC: Float(customRuleTriggerTempC),
+                releaseTempC: Float(customRuleReleaseTempC),
+                fanPercent: Float(customRuleFanPercent / 100)
+            )
+            : nil
+        monitor?.setTemperatureRule(rule)
     }
 }
