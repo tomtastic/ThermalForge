@@ -81,6 +81,19 @@ public final class DaemonClient {
     }
 
     public func send(_ request: DaemonRequest) throws -> DaemonResponse {
+        do {
+            return try sendTyped(request)
+        } catch let error as DaemonError {
+            if shouldRetryLegacy(error: error, for: request),
+               let legacyCommand = legacyCommand(for: request)
+            {
+                return try sendLegacy(legacyCommand, requestID: request.requestID, command: request.command)
+            }
+            throw error
+        }
+    }
+
+    private func sendTyped(_ request: DaemonRequest) throws -> DaemonResponse {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.connectionFailed }
         defer { close(fd) }
@@ -117,6 +130,76 @@ public final class DaemonClient {
             throw DaemonError.commandFailed(code: "legacy_error", message: String(fallback.dropFirst(6)).trimmingCharacters(in: .whitespaces))
         }
         return DaemonResponse(requestID: request.requestID, ok: true, message: fallback)
+    }
+
+    private func shouldRetryLegacy(error: DaemonError, for request: DaemonRequest) -> Bool {
+        guard legacyCommand(for: request) != nil else { return false }
+        switch error {
+        case .commandFailed(let code, let message):
+            return code == "legacy_error" && message.contains("unknown command")
+        default:
+            return false
+        }
+    }
+
+    private func legacyCommand(for request: DaemonRequest) -> String? {
+        switch request.command {
+        case "max", "auto", "status", "heartbeat":
+            return request.command
+        case "set":
+            guard let rpm = request.rpm else { return nil }
+            return "set \(rpm)"
+        default:
+            return nil
+        }
+    }
+
+    private func sendLegacy(_ command: String, requestID: String, command originalCommand: String) throws -> DaemonResponse {
+        let raw = try sendLegacyRaw(command)
+        if raw.hasPrefix("error:") {
+            throw DaemonError.commandFailed(
+                code: "legacy_error",
+                message: String(raw.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+            )
+        }
+
+        if originalCommand == "status",
+           let data = raw.data(using: .utf8),
+           let status = try? JSONDecoder().decode(ThermalStatus.self, from: data)
+        {
+            return DaemonResponse(requestID: requestID, ok: true, status: status)
+        }
+
+        return DaemonResponse(requestID: requestID, ok: true, message: raw)
+    }
+
+    private func sendLegacyRaw(_ command: String) throws -> String {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw DaemonError.connectionFailed }
+        defer { close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        setPath(&addr, ThermalForgeDaemon.socketPath)
+
+        let connectResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connectResult == 0 else { throw DaemonError.notRunning }
+
+        let cmdData = Array((command + "\n").utf8)
+        _ = cmdData.withUnsafeBufferPointer { buf in
+            write(fd, buf.baseAddress!, buf.count)
+        }
+
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        let n = read(fd, &buffer, buffer.count - 1)
+        guard n > 0 else { throw DaemonError.connectionFailed }
+
+        return String(decoding: buffer[0..<n], as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func execute(_ command: FanCommand) throws {
