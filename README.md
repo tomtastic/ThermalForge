@@ -11,15 +11,20 @@ This repository is an actively maintained fork.
 
 ## Release
 
-Current fork release: **`v0.2.0`**
+Current fork release: **`v0.2.1`**
 
-- Release page: <https://github.com/d37atm/ThermalForge/releases/tag/v0.2.0>
+- Release page: <https://github.com/d37atm/ThermalForge/releases/tag/v0.2.1>
 - Artifacts:
-  - `ThermalForge-v0.2.0-macos-arm64-app.zip`
-  - `ThermalForge-v0.2.0-macos-arm64-cli.tar.gz`
+  - `ThermalForge-v0.2.1-macos-arm64-app.zip`
+  - `ThermalForge-v0.2.1-macos-arm64-cli.tar.gz`
   - `checksums.txt`
 
-`v0.2.0` adds:
+`v0.2.1` adds:
+- fix for menu bar freeze path caused by high-frequency repeated rule command dispatch
+- daemon client socket timeout hardening + non-blocking app-side daemon call path
+- runtime performance optimization: deduped rule-trigger events and reduced UI update cadence
+
+`v0.2.0` added:
 - typed daemon protocol (`DaemonRequest` / `DaemonResponse`) with legacy command fallback
 - rule engine (IF/THEN with priority + latch/until)
 - extracted control state machine + service
@@ -74,7 +79,7 @@ Built-in:
 Control loop:
 - thermal cadence: 100ms
 - monitor cadence: 2s
-- UI cadence: 500ms
+- UI cadence: 1s
 
 ## Rules (IF/THEN)
 

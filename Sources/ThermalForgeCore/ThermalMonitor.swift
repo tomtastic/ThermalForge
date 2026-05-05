@@ -67,8 +67,10 @@ public final class ThermalMonitor {
     private static let monitorCadence = 20
 
     /// UI update cadence: onUpdate fires every N thermal ticks.
-    /// At 100ms thermal tick, 5 × 0.1s = 500ms — smooth UI without excessive redraws.
-    private static let uiUpdateCadence = 5
+    /// At 100ms thermal tick, 10 × 0.1s = 1 second — lower UI churn in menu-bar mode.
+    private static let uiUpdateCadence = 10
+    /// Re-apply an active rule command periodically for resilience without saturating daemon I/O.
+    private static let ruleCommandRefreshInterval: TimeInterval = 5
 
     private var tickCounter = 0
 
@@ -79,6 +81,8 @@ public final class ThermalMonitor {
     private var sustainedAboveCount = 0
     private var temperatureRule: TemperatureRule?
     private var temperatureRuleEngaged = false
+    private var lastRuleDecision: RuleDecision?
+    private var lastRuleCommandAppliedAt: Date?
 
     // MARK: - Smart Profile State
 
@@ -168,6 +172,8 @@ public final class ThermalMonitor {
             fansCurrentlyRunning = false
             sustainedAboveCount = 0
             tickCounter = 0
+            lastRuleDecision = nil
+            lastRuleCommandAppliedAt = nil
 
             if profile.id == "smart" {
                 // Reset Smart state and reload calibration data.
@@ -191,6 +197,8 @@ public final class ThermalMonitor {
             temperatureRule = rule
             temperatureRuleEngaged = false
             sustainedAboveCount = 0
+            lastRuleDecision = nil
+            lastRuleCommandAppliedAt = nil
 
             // Keep transitions deterministic when toggling the override rule.
             if hadRule != (rule != nil), fansCurrentlyRunning {
@@ -222,6 +230,8 @@ public final class ThermalMonitor {
 
         // Safety override: any sensor > 95°C.
         if maxTemp >= FanProfile.safetyTempThreshold {
+            lastRuleDecision = nil
+            lastRuleCommandAppliedAt = nil
             if state != .safetyOverride {
                 applyCommand(.setMax)
                 state = controlService.transition(.safetyTriggered)
@@ -246,6 +256,8 @@ public final class ThermalMonitor {
         }
 
         if let rule = temperatureRule {
+            lastRuleDecision = nil
+            lastRuleCommandAppliedAt = nil
             tickTemperatureRule(status: status, peakTemp: maxTemp, rule: rule)
             if tickCounter % Self.uiUpdateCadence == 0 {
                 onUpdate?(status, activeProfile, state)
@@ -270,17 +282,33 @@ public final class ThermalMonitor {
             profileID: activeProfile.id
         )
         if let decision = controlService.evaluateRules(context: context) {
+            let decisionChanged = decision != lastRuleDecision
             var preempted = false
 
             if let profileID = decision.profileID,
                let targetProfile = FanProfile.builtIn.first(where: { $0.id == profileID })
             {
-                activeProfile = targetProfile
+                if decisionChanged || activeProfile.id != targetProfile.id {
+                    activeProfile = targetProfile
+                }
                 preempted = true
             }
 
             if let command = decision.command {
-                applyCommand(command)
+                let shouldReapply: Bool
+                if decisionChanged {
+                    shouldReapply = true
+                } else if let lastAppliedAt = lastRuleCommandAppliedAt {
+                    shouldReapply = Date().timeIntervalSince(lastAppliedAt) >= Self.ruleCommandRefreshInterval
+                } else {
+                    shouldReapply = true
+                }
+
+                if shouldReapply {
+                    applyCommand(command)
+                    lastRuleCommandAppliedAt = Date()
+                }
+
                 switch command {
                 case .setMax:
                     lastAppliedRPMPercent = 1.0
@@ -300,7 +328,10 @@ public final class ThermalMonitor {
             }
 
             if preempted {
-                TFLogger.shared.event(ThermalEvent(type: .ruleTriggered, details: "rule=\(decision.sourceRuleID) name=\(decision.sourceRuleName)"))
+                if decisionChanged {
+                    TFLogger.shared.event(ThermalEvent(type: .ruleTriggered, details: "rule=\(decision.sourceRuleID) name=\(decision.sourceRuleName)"))
+                }
+                lastRuleDecision = decision
                 if tickCounter % Self.uiUpdateCadence == 0 {
                     onUpdate?(status, activeProfile, state)
                 }
@@ -308,6 +339,9 @@ public final class ThermalMonitor {
                 return
             }
         }
+
+        lastRuleDecision = nil
+        lastRuleCommandAppliedAt = nil
 
         // Profile-specific logic.
         if activeProfile.id == "smart" {
