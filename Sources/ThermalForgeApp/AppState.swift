@@ -100,6 +100,7 @@ final class AppState: ObservableObject {
 
     func startMonitoring() {
         guard let fc = try? FanControl() else { return }
+        let executor = self.executor
 
         let ruleEngine = RuleEngine(rules: rules, isEnabled: rulesEnabled)
         let controlService = ControlService(ruleEngine: ruleEngine)
@@ -117,10 +118,8 @@ final class AppState: ObservableObject {
             }
         }
 
-        monitor.onFanCommand = { [weak self] command in
-            Task { @MainActor [weak self] in
-                try self?.executor.execute(command)
-            }
+        monitor.onFanCommand = { command in
+            try executor.execute(command)
         }
 
         monitor.start()
