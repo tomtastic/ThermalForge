@@ -60,6 +60,8 @@ public enum DaemonError: Error, CustomStringConvertible {
 }
 
 public final class DaemonClient {
+    private let socketTimeoutSeconds: Int = 3
+
     public init() {}
 
     /// Backward-compatible string command transport.
@@ -97,6 +99,7 @@ public final class DaemonClient {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.connectionFailed }
         defer { close(fd) }
+        configureClientSocket(fd)
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -111,15 +114,12 @@ public final class DaemonClient {
 
         let payload = try DaemonCodec.encodeRequest(request)
         let bytes = [UInt8](payload + [0x0A])
-        _ = bytes.withUnsafeBufferPointer { buf in
+        let written = bytes.withUnsafeBufferPointer { buf in
             write(fd, buf.baseAddress!, buf.count)
         }
+        guard written >= 0 else { throw DaemonError.connectionFailed }
 
-        var buffer = [UInt8](repeating: 0, count: 65536)
-        let n = read(fd, &buffer, buffer.count - 1)
-        guard n > 0 else { throw DaemonError.connectionFailed }
-
-        let responseData = Data(buffer[0..<n])
+        let responseData = try readResponse(fd)
         if let typedResponse = try? DaemonCodec.decodeResponse(responseData) {
             return typedResponse
         }
@@ -177,6 +177,7 @@ public final class DaemonClient {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.connectionFailed }
         defer { close(fd) }
+        configureClientSocket(fd)
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -190,16 +191,47 @@ public final class DaemonClient {
         guard connectResult == 0 else { throw DaemonError.notRunning }
 
         let cmdData = Array((command + "\n").utf8)
-        _ = cmdData.withUnsafeBufferPointer { buf in
+        let written = cmdData.withUnsafeBufferPointer { buf in
             write(fd, buf.baseAddress!, buf.count)
         }
+        guard written >= 0 else { throw DaemonError.connectionFailed }
 
+        let responseData = try readResponse(fd)
+        return String(decoding: responseData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func configureClientSocket(_ fd: Int32) {
+        var noSigPipe: Int32 = 1
+        withUnsafePointer(to: &noSigPipe) { ptr in
+            _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, ptr, socklen_t(MemoryLayout<Int32>.size))
+        }
+
+        var timeout = timeval(tv_sec: numericCast(socketTimeoutSeconds), tv_usec: 0)
+        let timeoutLen = socklen_t(MemoryLayout<timeval>.size)
+        withUnsafePointer(to: &timeout) { ptr in
+            _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, ptr, timeoutLen)
+        }
+        withUnsafePointer(to: &timeout) { ptr in
+            _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, ptr, timeoutLen)
+        }
+    }
+
+    private func readResponse(_ fd: Int32) throws -> Data {
         var buffer = [UInt8](repeating: 0, count: 65536)
         let n = read(fd, &buffer, buffer.count - 1)
-        guard n > 0 else { throw DaemonError.connectionFailed }
+        if n > 0 {
+            return Data(buffer[0..<n])
+        }
 
-        return String(decoding: buffer[0..<n], as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if n == 0 {
+            throw DaemonError.connectionFailed
+        }
+
+        if errno == EAGAIN || errno == EWOULDBLOCK {
+            throw DaemonError.protocolError("timed out waiting for daemon response")
+        }
+        throw DaemonError.connectionFailed
     }
 
     public func execute(_ command: FanCommand) throws {

@@ -61,6 +61,7 @@ final class AppState: ObservableObject {
 
     private var monitor: ThermalMonitor?
     private let executor = PrivilegedExecutor()
+    private let daemonQueue = DispatchQueue(label: "com.thermalforge.app.daemon", qos: .utility)
     private var heartbeatTimer: Timer?
     private var syncingRuleSettings = false
 
@@ -68,8 +69,11 @@ final class AppState: ObservableObject {
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
 
         // Clean state: reset fans to auto on every launch.
-        try? executor.execute(.resetAuto)
-        TFLogger.shared.info("App launched — fans reset to auto")
+        runDaemonTask(
+            action: { [executor] in try executor.execute(.resetAuto) },
+            successMessage: "App launched — fans reset to auto",
+            failureContext: "Startup reset failed"
+        )
 
         // Clean expired logs.
         ThermalLogger.cleanExpired()
@@ -87,11 +91,15 @@ final class AppState: ObservableObject {
     // MARK: - Heartbeat
 
     private func startHeartbeat() {
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            do {
-                try self?.executor.heartbeat()
-            } catch {
-                TFLogger.shared.error("Heartbeat failed: \(error)")
+        let daemonQueue = self.daemonQueue
+        let executor = self.executor
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            daemonQueue.async {
+                do {
+                    try executor.heartbeat()
+                } catch {
+                    TFLogger.shared.error("Heartbeat failed: \(error)")
+                }
             }
         }
     }
@@ -146,14 +154,13 @@ final class AppState: ObservableObject {
     }
 
     func resetAuto() {
-        do {
-            try executor.execute(.resetAuto)
-            activeProfile = .silent
-            monitor?.switchProfile(.silent)
-            TFLogger.shared.profile("Reset to Default (Silent (Apple Default))")
-        } catch {
-            TFLogger.shared.error("Reset to Default failed: \(error)")
-        }
+        activeProfile = .silent
+        monitor?.switchProfile(.silent)
+        runDaemonTask(
+            action: { [executor] in try executor.execute(.resetAuto) },
+            successMessage: "Reset to Default (Silent (Apple Default))",
+            failureContext: "Reset to Default failed"
+        )
     }
 
     func selectProfile(_ profile: FanProfile) {
@@ -161,12 +168,11 @@ final class AppState: ObservableObject {
         monitor?.switchProfile(profile)
         TFLogger.shared.profile("Selected: \(profile.name)")
 
-        do {
-            if profile.curve.handsOff || profile.id == "silent" {
-                try executor.execute(.resetAuto)
-            }
-        } catch {
-            TFLogger.shared.error("Profile \(profile.name) failed: \(error)")
+        if profile.curve.handsOff || profile.id == "silent" {
+            runDaemonTask(
+                action: { [executor] in try executor.execute(.resetAuto) },
+                failureContext: "Profile \(profile.name) failed"
+            )
         }
     }
 
@@ -235,5 +241,24 @@ final class AppState: ObservableObject {
             )
             : nil
         monitor?.setTemperatureRule(rule)
+    }
+
+    // MARK: - Daemon Calls
+
+    private func runDaemonTask(
+        action: @escaping () throws -> Void,
+        successMessage: String? = nil,
+        failureContext: String
+    ) {
+        daemonQueue.async {
+            do {
+                try action()
+                if let successMessage {
+                    TFLogger.shared.info(successMessage)
+                }
+            } catch {
+                TFLogger.shared.error("\(failureContext): \(error)")
+            }
+        }
     }
 }
