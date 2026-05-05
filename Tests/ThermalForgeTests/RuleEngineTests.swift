@@ -70,4 +70,56 @@ struct RuleEngineTests {
         let decision = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 80, gpuTemp: 75, maxTemp: 80, profileID: "max"))
         #expect(decision == nil)
     }
+
+    @Test("Rules sort by priority then name")
+    func sortedOrder() {
+        let c = ThermalRule(
+            id: "c",
+            name: "zeta",
+            enabled: true,
+            priority: 10,
+            condition: ThermalRuleCondition(metric: .maxTemp, comparator: .greaterThanOrEqual, valueCelsius: 55),
+            action: .setMax
+        )
+        let a = ThermalRule(
+            id: "a",
+            name: "alpha",
+            enabled: true,
+            priority: 100,
+            condition: ThermalRuleCondition(metric: .maxTemp, comparator: .greaterThanOrEqual, valueCelsius: 55),
+            action: .setMax
+        )
+        let b = ThermalRule(
+            id: "b",
+            name: "beta",
+            enabled: true,
+            priority: 100,
+            condition: ThermalRuleCondition(metric: .maxTemp, comparator: .greaterThanOrEqual, valueCelsius: 55),
+            action: .setMax
+        )
+
+        let engine = RuleEngine(rules: [c, b, a], isEnabled: true)
+        #expect(engine.allRules().map(\.id) == ["a", "b", "c"])
+    }
+
+    @Test("Latched rule is cleared when disabled by rule update")
+    func latchedRuleClearsWhenDisabled() {
+        var rule = ThermalRule(
+            id: "latched",
+            name: "latched",
+            enabled: true,
+            priority: 500,
+            condition: ThermalRuleCondition(metric: .maxTemp, comparator: .greaterThanOrEqual, valueCelsius: 70),
+            action: .setMax,
+            untilTempBelowC: 65
+        )
+
+        let engine = RuleEngine(rules: [rule], isEnabled: true)
+        let hot = RuleEvaluationContext(cpuTemp: 72, gpuTemp: 71, maxTemp: 72, profileID: "balanced")
+        #expect(engine.evaluate(context: hot)?.command == .setMax)
+
+        rule.enabled = false
+        engine.setRules([rule])
+        #expect(engine.evaluate(context: hot) == nil)
+    }
 }

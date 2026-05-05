@@ -1,31 +1,44 @@
 import Foundation
 
 public final class RuleEngine {
+    private struct CompiledRule {
+        let rule: ThermalRule
+        let decision: RuleDecision
+
+        var id: String { rule.id }
+        var enabled: Bool { rule.enabled }
+        var untilTempBelowC: Float? { rule.untilTempBelowC }
+        var metric: ThermalMetric { rule.condition.metric }
+        var comparator: RuleComparator { rule.condition.comparator }
+        var threshold: Float { rule.condition.valueCelsius }
+    }
+
     public var isEnabled: Bool
     private var rules: [ThermalRule]
+    private var sortedRules: [ThermalRule]
+    private var enabledRules: [CompiledRule]
+    private var enabledRulesByID: [String: CompiledRule]
     private var latchedRuleID: String?
 
     public init(rules: [ThermalRule] = [], isEnabled: Bool = true) {
         self.rules = rules
+        self.sortedRules = []
+        self.enabledRules = []
+        self.enabledRulesByID = [:]
         self.isEnabled = isEnabled
+        rebuildCaches()
     }
 
     public func setRules(_ rules: [ThermalRule]) {
         self.rules = rules
-        if let latchedRuleID,
-           !rules.contains(where: { $0.id == latchedRuleID && $0.enabled })
-        {
+        rebuildCaches()
+        if let latchedRuleID, enabledRulesByID[latchedRuleID] == nil {
             self.latchedRuleID = nil
         }
     }
 
     public func allRules() -> [ThermalRule] {
-        rules.sorted { lhs, rhs in
-            if lhs.priority == rhs.priority {
-                return lhs.name < rhs.name
-            }
-            return lhs.priority > rhs.priority
-        }
+        sortedRules
     }
 
     public func evaluate(context: RuleEvaluationContext) -> RuleDecision? {
@@ -38,27 +51,24 @@ public final class RuleEngine {
             return latched
         }
 
-        let sorted = allRules().filter { $0.enabled }
-        for rule in sorted where matches(rule: rule, context: context) {
+        for rule in enabledRules where matches(rule: rule, context: context) {
             if rule.untilTempBelowC != nil {
                 latchedRuleID = rule.id
             }
-            return makeDecision(rule: rule)
+            return rule.decision
         }
         return nil
     }
 
     private func resolveLatchedRule(context: RuleEvaluationContext) -> RuleDecision? {
-        guard let latchedRuleID,
-              let rule = rules.first(where: { $0.id == latchedRuleID && $0.enabled })
-        else {
+        guard let latchedRuleID, let rule = enabledRulesByID[latchedRuleID] else {
             self.latchedRuleID = nil
             return nil
         }
 
         if let until = rule.untilTempBelowC {
             if context.maxTemp > until {
-                return makeDecision(rule: rule)
+                return rule.decision
             }
             self.latchedRuleID = nil
             return nil
@@ -68,9 +78,9 @@ public final class RuleEngine {
         return nil
     }
 
-    private func matches(rule: ThermalRule, context: RuleEvaluationContext) -> Bool {
+    private func matches(rule: CompiledRule, context: RuleEvaluationContext) -> Bool {
         let current: Float
-        switch rule.condition.metric {
+        switch rule.metric {
         case .maxTemp:
             current = context.maxTemp
         case .cpuTemp:
@@ -78,10 +88,10 @@ public final class RuleEngine {
         case .gpuTemp:
             current = context.gpuTemp
         }
-        return rule.condition.comparator.evaluate(lhs: current, rhs: rule.condition.valueCelsius)
+        return rule.comparator.evaluate(lhs: current, rhs: rule.threshold)
     }
 
-    private func makeDecision(rule: ThermalRule) -> RuleDecision {
+    private static func makeDecision(rule: ThermalRule) -> RuleDecision {
         let command: FanCommand?
         let profileID: String?
 
@@ -106,5 +116,22 @@ public final class RuleEngine {
             sourceRuleID: rule.id,
             sourceRuleName: rule.name
         )
+    }
+
+    private func rebuildCaches() {
+        sortedRules = rules.sorted(by: Self.ruleSort)
+        enabledRules = sortedRules
+            .filter(\.enabled)
+            .map { rule in
+                CompiledRule(rule: rule, decision: Self.makeDecision(rule: rule))
+            }
+        enabledRulesByID = Dictionary(uniqueKeysWithValues: enabledRules.map { ($0.id, $0) })
+    }
+
+    private static func ruleSort(_ lhs: ThermalRule, _ rhs: ThermalRule) -> Bool {
+        if lhs.priority == rhs.priority {
+            return lhs.name < rhs.name
+        }
+        return lhs.priority > rhs.priority
     }
 }
