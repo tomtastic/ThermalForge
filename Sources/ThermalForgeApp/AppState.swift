@@ -68,7 +68,23 @@ final class AppState: ObservableObject {
     init() {
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
 
-        // Clean state: reset fans to auto on every launch.
+        // Load all available profiles (built-in + custom)
+        let allProfiles = FanProfile.loadAll()
+
+        // Attempt to restore the last used profile ID from UserDefaults
+        let lastProfileID = UserDefaults.standard.string(forKey: "lastProfileID")
+
+        // Find the profile in the loaded list, or fallback to .silent if not found/invalid
+        if let lastID = lastProfileID, let savedProfile = allProfiles.first(where: { $0.id == lastID }) {
+            activeProfile = savedProfile
+            TFLogger.shared.info("Restored profile: \(savedProfile.name)")
+        } else {
+            activeProfile = .silent
+            if lastProfileID != nil {
+                TFLogger.shared.info("Stored profile ID '\(lastProfileID!)' was invalid. Falling back to .silent")
+            }
+        }
+
         runDaemonTask(
             action: { [executor] in try executor.execute(.resetAuto) },
             successMessage: "App launched — fans reset to auto",
@@ -168,6 +184,10 @@ final class AppState: ObservableObject {
         monitor?.switchProfile(profile)
         TFLogger.shared.profile("Selected: \(profile.name)")
 
+        // Persist the selection to UserDefaults
+        UserDefaults.standard.set(profile.id, forKey: "lastProfileID")
+
+        // All profiles use proportional curves — tick() handles fan engagement.
         if profile.curve.handsOff || profile.id == "silent" {
             runDaemonTask(
                 action: { [executor] in try executor.execute(.resetAuto) },
