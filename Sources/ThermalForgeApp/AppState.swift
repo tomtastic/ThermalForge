@@ -170,8 +170,7 @@ final class AppState: ObservableObject {
     }
 
     func resetAuto() {
-        activeProfile = .silent
-        monitor?.switchProfile(.silent)
+        selectProfile(.silent)
         runDaemonTask(
             action: { [executor] in try executor.execute(.resetAuto) },
             successMessage: "Reset to Default (Silent (Apple Default))",
