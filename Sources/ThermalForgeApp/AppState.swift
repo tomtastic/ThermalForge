@@ -80,8 +80,8 @@ final class AppState: ObservableObject {
             TFLogger.shared.info("Restored profile: \(savedProfile.name)")
         } else {
             activeProfile = .silent
-            if let invalidID = lastProfileID {
-                TFLogger.shared.info("Stored profile ID '\(invalidID)' was invalid. Falling back to .silent")
+            if let lastProfileID {
+                TFLogger.shared.info("Stored profile ID '\(lastProfileID)' was invalid. Falling back to .silent")
             }
         }
 
