@@ -62,9 +62,14 @@ public final class ThermalMonitor {
 
     /// Fast poll rate, from `start(interval:)`. Used while warm or active.
     private var activeInterval: Float = 0.25
-    /// Slow poll rate while idle. Idle CPU is dominated by per-key SMC reads
-    /// (~150µs each), so fewer ticks ≈ proportionally less idle CPU.
+    /// Slow poll rate while idle. Idle CPU is dominated by SMC reads, so fewer
+    /// ticks ≈ proportionally less idle CPU.
     private static let idleInterval: Float = 2.0
+    /// Hands-off profiles (Silent) never control fans — Apple's thermald does —
+    /// so we only poll for the menu-bar readout and the 95°C safety backup.
+    /// Both tolerate a much slower idle poll, which is the single biggest idle
+    /// CPU lever for the default profile.
+    private static let handsOffIdleInterval: Float = 5.0
     /// Stay fast at/above this temp regardless of profile, so the 95°C safety
     /// override reacts promptly. Apple Silicon idles ~45–60°C — overlapping the
     /// profile start temps — so a plain temp threshold can never relax. The real
@@ -181,8 +186,9 @@ public final class ThermalMonitor {
             consecutiveIdleTicks += 1
         }
 
+        let idleRate = activeProfile.curve.handsOff ? Self.handsOffIdleInterval : Self.idleInterval
         let wantFast = busy || consecutiveIdleTicks < Self.idleConfirmTicks
-        let desired = wantFast ? activeInterval : max(Self.idleInterval, activeInterval)
+        let desired = wantFast ? activeInterval : max(idleRate, activeInterval)
         guard desired != tickInterval, let timer else { return }
         tickInterval = desired
         scheduleTimer(timer, interval: desired)
