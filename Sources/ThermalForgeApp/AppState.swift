@@ -72,10 +72,13 @@ final class AppState: ObservableObject {
                     .values.max()
             }
         }
-        monitor.onFanCommand = { [weak self] command in
-            Task { @MainActor [weak self] in
-                try self?.executor.execute(command)
-            }
+        // Fan commands run off the main thread, coalesced. The ramp fires
+        // ~10×/s and each daemon round-trip can exceed 0.5s; routing this
+        // through the main actor (as before) starved the UI run loop and froze
+        // the app on profile switch.
+        let executor = self.executor
+        monitor.onFanCommand = { command in
+            executor.submit(command)
         }
         monitor.start()
         self.monitor = monitor

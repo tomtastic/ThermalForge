@@ -42,6 +42,7 @@ public enum ThermalForgeDaemon {
 public enum DaemonError: Error, CustomStringConvertible {
     case notRunning
     case connectionFailed
+    case timedOut
     case commandFailed(String)
 
     public var description: String {
@@ -50,6 +51,8 @@ public enum DaemonError: Error, CustomStringConvertible {
             return "ThermalForge daemon is not running. Run: sudo thermalforge install"
         case .connectionFailed:
             return "Failed to connect to daemon socket"
+        case .timedOut:
+            return "Daemon did not respond in time"
         case .commandFailed(let msg):
             return "Daemon error: \(msg)"
         }
@@ -57,7 +60,15 @@ public enum DaemonError: Error, CustomStringConvertible {
 }
 
 public final class DaemonClient {
-    public init() {}
+    private let socketPath: String
+    /// Hard ceiling on a single daemon round-trip. A misbehaving or busy daemon
+    /// (e.g. a slow SMC unlock) can never block the caller longer than this.
+    private let timeoutSeconds: Int
+
+    public init(socketPath: String = ThermalForgeDaemon.socketPath, timeoutSeconds: Int = 5) {
+        self.socketPath = socketPath
+        self.timeoutSeconds = timeoutSeconds
+    }
 
     /// Send a command to the daemon and return the response
     public func send(_ command: String) throws -> String {
@@ -65,9 +76,14 @@ public final class DaemonClient {
         guard fd >= 0 else { throw DaemonError.connectionFailed }
         defer { close(fd) }
 
+        // Bound send/recv so a stuck daemon can't block the caller forever.
+        var tv = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        setPath(&addr, ThermalForgeDaemon.socketPath)
+        setPath(&addr, socketPath)
 
         let connectResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -85,7 +101,13 @@ public final class DaemonClient {
         // Read response — 8KB handles status JSON on sensor-rich machines
         var buffer = [UInt8](repeating: 0, count: 8192)
         let n = read(fd, &buffer, buffer.count - 1)
-        guard n > 0 else { throw DaemonError.connectionFailed }
+        guard n > 0 else {
+            // read() == -1 with EAGAIN/EWOULDBLOCK means SO_RCVTIMEO fired.
+            if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                throw DaemonError.timedOut
+            }
+            throw DaemonError.connectionFailed
+        }
 
         let response = String(bytes: buffer[0..<n], encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

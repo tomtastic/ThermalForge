@@ -139,6 +139,13 @@ public final class FanControl {
     /// On M1-M4: writes Ftst=1, then polls until mode write succeeds.
     /// On M5+: Ftst doesn't exist, attempts direct mode write.
     private func unlockFans(count: Int) throws {
+        // Fast path: if every fan is already in manual mode the unlock happened
+        // on an earlier command — skip the Ftst write + 0.5s sleep + poll loop.
+        // (Ftst/mode stay set until resetAuto, so thermalmonitord stays off.)
+        if count > 0 && (0..<count).allSatisfy({ isManualMode($0) }) {
+            return
+        }
+
         if hasFtst {
             // M1-M4 path: Ftst unlock suppresses thermalmonitord
             guard smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
@@ -151,6 +158,7 @@ public final class FanControl {
 
         // Set each fan to manual mode
         for i in 0..<count {
+            if isManualMode(i) { continue }   // already manual — skip the poll loop
             let modeKey = SMCFanKey.key(modeKeyTemplate, fan: i)
             let deadline = Date().addingTimeInterval(10.0)
             var success = false
@@ -413,6 +421,13 @@ public final class FanControl {
         let result = smc.readKey(key)
         guard result.success else { return 0 }
         return smcBytesToFloat(result.bytes, size: result.size)
+    }
+
+    /// True if the fan is currently in manual mode (mode key == 1).
+    private func isManualMode(_ index: Int) -> Bool {
+        let modeKey = SMCFanKey.key(modeKeyTemplate, fan: index)
+        let result = smc.readKey(modeKey)
+        return result.success && !result.bytes.isEmpty && result.bytes[0] == 1
     }
 
     private func log(_ message: String) {
