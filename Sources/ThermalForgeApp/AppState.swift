@@ -70,10 +70,14 @@ final class AppState {
                 if self.activeProfile != profile { self.activeProfile = profile }
                 if self.monitorState != state { self.monitorState = state }
                 // Peak across all displayed CPU and GPU sensors for the menu bar.
+                // Quantize to whole degrees: the label shows an integer, so a
+                // jittering 0.1° fraction would otherwise force a relayout (CA
+                // transaction) every update for a number that never changes.
                 let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
                 let newMax = status.temperatures
                     .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
                     .values.max()
+                    .map { $0.rounded() }
                 if self.maxTemp != newMax { self.maxTemp = newMax }
             }
         }

@@ -58,6 +58,20 @@ public final class ThermalMonitor {
     /// sysctl sweep — skip process capture at idle. (°C)
     private static let processCaptureFloor: Float = 50.0
 
+    // MARK: - Adaptive cadence
+
+    /// Fast poll rate, from `start(interval:)`. Used while warm or active.
+    private var activeInterval: Float = 0.25
+    /// Slow poll rate while cool & idle. Idle CPU is dominated by per-key SMC
+    /// reads (~150µs each), so fewer ticks ≈ proportionally less idle CPU.
+    private static let idleInterval: Float = 2.0
+    /// Switch to fast polling at/above this temp; fall back to slow below the
+    /// exit threshold (hysteresis avoids flapping). Nothing engages below the
+    /// lowest profile startTemp (53°C), so slow polling here is safe.
+    private static let cadenceWarmEnter: Float = 48.0
+    private static let cadenceWarmExit: Float = 44.0
+    private var fastCadence = true
+
     private var tickCounter = 0
 
     // MARK: - Fan State
@@ -111,12 +125,12 @@ public final class ThermalMonitor {
     public func start(interval: TimeInterval = 0.25) {
         stop()
 
-        tickInterval = Float(interval)
+        activeInterval = Float(interval)
+        tickInterval = activeInterval
+        fastCadence = true
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        // Leeway lets the OS coalesce timer wakeups with other work — a big idle
-        // CPU win for a low-frequency poll, and ±20% is invisible to fan control.
-        timer.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(Int(interval * 200)))
+        scheduleTimer(timer, interval: tickInterval)
         timer.setEventHandler { [weak self] in
             self?.tick()
         }
@@ -127,6 +141,32 @@ public final class ThermalMonitor {
     public func stop() {
         timer?.cancel()
         timer = nil
+    }
+
+    /// (Re)schedule the repeating timer. Leeway lets the OS coalesce wakeups —
+    /// a big idle-CPU win for a low-frequency poll; ±20% is invisible to fans.
+    private func scheduleTimer(_ timer: DispatchSourceTimer, interval: Float) {
+        timer.schedule(
+            deadline: .now() + Double(interval),
+            repeating: Double(interval),
+            leeway: .milliseconds(Int(interval * 200))
+        )
+    }
+
+    /// Adjust the poll rate to match thermal activity. Fast while warm/active so
+    /// fan control and the 95°C override stay responsive; slow while cool & idle
+    /// to keep idle CPU near zero. Reschedules the timer only on a real change.
+    private func applyCadence(maxTemp: Float) {
+        if maxTemp >= Self.cadenceWarmEnter || fansCurrentlyRunning || state != .idle {
+            fastCadence = true
+        } else if maxTemp < Self.cadenceWarmExit {
+            fastCadence = false
+        }
+
+        let desired = fastCadence ? activeInterval : max(Self.idleInterval, activeInterval)
+        guard desired != tickInterval, let timer else { return }
+        tickInterval = desired
+        scheduleTimer(timer, interval: desired)
     }
 
     /// Update the active profile.
@@ -183,6 +223,7 @@ public final class ThermalMonitor {
                 TFLogger.shared.safety("Override triggered: \(String(format: "%.1f", maxTemp))°C — fans maxed")
             }
             if let status { onUpdate?(status, activeProfile, state) }
+            applyCadence(maxTemp: maxTemp)
             tickCounter += 1
             return
         }
@@ -214,6 +255,7 @@ public final class ThermalMonitor {
         // UI update at slower cadence (every 500ms)
         if let status { onUpdate?(status, activeProfile, state) }
 
+        applyCadence(maxTemp: maxTemp)
         tickCounter += 1
     }
 
