@@ -27,6 +27,11 @@ final class AppState {
     @ObservationIgnored private var monitor: ThermalMonitor?
     @ObservationIgnored private let executor = PrivilegedExecutor()
     @ObservationIgnored private var heartbeatTimer: Timer?
+    /// Whether the dropdown panel is currently shown. The panel's hosting view
+    /// stays alive while hidden and re-renders on any observed change, so we
+    /// only feed it the per-tick `latestStatus` while it's actually visible.
+    @ObservationIgnored private var menuOpen = false
+    @ObservationIgnored private var lastStatus: ThermalStatus?
 
     init() {
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
@@ -87,9 +92,12 @@ final class AppState {
         monitor.onUpdate = { [weak self] status, profile, state in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                // Publish-on-change: only assign when the value actually differs,
-                // so @Observable doesn't wake views for no-op updates.
-                if self.latestStatus != status { self.latestStatus = status }
+                self.lastStatus = status
+                // Publish-on-change, AND only while the panel is visible. The
+                // dropdown's hosting view stays alive when hidden and re-renders
+                // on every latestStatus change — so feeding it per-tick updates
+                // while closed drives full SwiftUI layout for nothing.
+                if self.menuOpen, self.latestStatus != status { self.latestStatus = status }
                 if self.activeProfile != profile { self.activeProfile = profile }
                 if self.monitorState != state { self.monitorState = state }
                 // Peak across all displayed CPU and GPU sensors for the menu bar.
@@ -114,6 +122,20 @@ final class AppState {
         }
         monitor.start()
         self.monitor = monitor
+    }
+
+    // MARK: - Menu visibility
+
+    /// Called when the dropdown panel becomes visible: resume live updates and
+    /// push the latest snapshot immediately so it isn't stale on open.
+    func menuDidOpen() {
+        menuOpen = true
+        if let status = lastStatus, latestStatus != status { latestStatus = status }
+    }
+
+    /// Called when the panel is dismissed: stop feeding the hidden hosting view.
+    func menuDidClose() {
+        menuOpen = false
     }
 
     // MARK: - Actions
