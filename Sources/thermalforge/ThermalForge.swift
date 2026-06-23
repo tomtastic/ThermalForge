@@ -514,6 +514,10 @@ struct Install: ParsableCommand {
                 <true/>
                 <key>KeepAlive</key>
                 <true/>
+                <key>ProcessType</key>
+                <string>Adaptive</string>
+                <key>LowPriorityIO</key>
+                <true/>
             </dict>
             </plist>
             """
