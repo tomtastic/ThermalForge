@@ -20,7 +20,7 @@ public final class CommandCoalescer<Command>: @unchecked Sendable {
     private var draining = false
 
     public init(label: String, handler: @escaping (Command) -> Void) {
-        self.queue = DispatchQueue(label: label)
+        self.queue = DispatchQueue(label: label, qos: .utility)
         self.handler = handler
     }
 

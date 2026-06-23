@@ -33,7 +33,7 @@ public enum MonitorState: Equatable {
 public final class ThermalMonitor {
     private let fanControl: FanControl
     private var timer: DispatchSourceTimer?
-    private let queue = DispatchQueue(label: "com.thermalforge.monitor")
+    private let queue = DispatchQueue(label: "com.thermalforge.monitor", qos: .utility)
 
     public private(set) var activeProfile: FanProfile
     public private(set) var state: MonitorState = .idle

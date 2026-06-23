@@ -39,7 +39,8 @@ final class AppState {
         ThermalLogger.cleanExpired()
 
         startMonitoring()
-        startHeartbeat()
+        // Heartbeat is started only when a fan-controlling profile is active
+        // (see syncHeartbeat). The default Silent profile needs none.
     }
 
     deinit {
@@ -48,11 +49,33 @@ final class AppState {
 
     // MARK: - Heartbeat
 
-    private func startHeartbeat() {
-        let client = DaemonClient()
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-            _ = try? client.send("heartbeat")
+    /// The daemon watchdog ignores heartbeats unless a manual fan command was
+    /// sent, so hands-off (Silent) needs no heartbeat — running it there is a
+    /// pure 5s wake on both processes for nothing. Run it only for fan-
+    /// controlling profiles.
+    private func syncHeartbeat(for profile: FanProfile) {
+        if profile.curve.handsOff {
+            stopHeartbeat()
+        } else {
+            startHeartbeat()
         }
+    }
+
+    private func startHeartbeat() {
+        guard heartbeatTimer == nil else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            // Off the main thread — a blocking daemon round-trip must never stall the UI.
+            DispatchQueue.global(qos: .utility).async {
+                _ = try? DaemonClient().send("heartbeat")
+            }
+        }
+        timer.tolerance = 1.0 // let the OS coalesce the wakeup
+        heartbeatTimer = timer
+    }
+
+    private func stopHeartbeat() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
     }
 
     // MARK: - Monitoring
@@ -98,6 +121,7 @@ final class AppState {
     func setSmart() {
         activeProfile = .smart
         monitor?.switchProfile(.smart)
+        syncHeartbeat(for: .smart)
         TFLogger.shared.profile("Smart activated")
     }
 
@@ -106,6 +130,7 @@ final class AppState {
             try executor.execute(.resetAuto)
             activeProfile = .silent
             monitor?.switchProfile(.silent)
+            stopHeartbeat()
             TFLogger.shared.profile("Reset to Default (Silent (Apple Default))")
         } catch {
             TFLogger.shared.error("Reset to Default failed: \(error)")
@@ -115,6 +140,7 @@ final class AppState {
     func selectProfile(_ profile: FanProfile) {
         activeProfile = profile
         monitor?.switchProfile(profile)
+        syncHeartbeat(for: profile)
         TFLogger.shared.profile("Selected: \(profile.name)")
 
         // All profiles use proportional curves — tick() handles fan engagement.
