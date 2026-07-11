@@ -130,7 +130,7 @@ struct DaemonClientTests {
         do {
             _ = try client.send("max")
             Issue.record("expected DaemonError.commandFailed")
-        } catch let DaemonError.commandFailed(message) {
+        } catch let DaemonError.commandFailed(_, message) {
             #expect(message == "boom")
         }
     }
@@ -144,10 +144,11 @@ struct DaemonClientTests {
         let start = Date()
         do {
             _ = try client.send("set 3000")
-            Issue.record("expected DaemonError.timedOut")
-        } catch DaemonError.timedOut {
+            Issue.record("expected an error from stuck daemon")
+        } catch DaemonError.timedOut, DaemonError.connectionFailed {
+            // Either the socket timeout fires (EAGAIN) or the daemon closes the
+            // connection before replying — both are bounded by the timeout.
             let elapsed = Date().timeIntervalSince(start)
-            // Bounded by the 1s timeout — must not block for the daemon's full stall.
             #expect(elapsed < 2.5, "send() took \(elapsed)s — timeout did not bound it")
         }
     }
@@ -171,6 +172,11 @@ struct DaemonClientTests {
         try client.execute(.setMax)
         try client.execute(.resetAuto)
 
-        #expect(daemon.received() == ["set 1500", "max", "auto"])
+        let cmds = daemon.received()
+        #expect(cmds.count == 3)
+        #expect(cmds[0].contains("\"command\":\"set\""))
+        #expect(cmds[0].contains("\"rpm\":1500"))
+        #expect(cmds[1].contains("\"command\":\"max\""))
+        #expect(cmds[2].contains("\"command\":\"auto\""))
     }
 }
