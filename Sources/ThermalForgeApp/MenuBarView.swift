@@ -9,9 +9,10 @@ import SwiftUI
 import ThermalForgeCore
 
 struct MenuBarView: View {
-    @EnvironmentObject var appState: AppState
+    @Environment(AppState.self) private var appState
 
     var body: some View {
+        @Bindable var appState = appState
         VStack(alignment: .leading, spacing: 0) {
             // Header
             HStack {
@@ -208,6 +209,8 @@ struct MenuBarView: View {
             .padding(.bottom, 10)
         }
         .frame(width: 320)
+        .onAppear { appState.menuDidOpen() }
+        .onDisappear { appState.menuDidClose() }
     }
 
     // MARK: - Helpers

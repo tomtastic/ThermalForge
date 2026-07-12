@@ -9,17 +9,36 @@ Low-level fan control for Apple Silicon macOS (14+), implemented in Swift.
 Original creator: **[ProducerGuy](https://github.com/ProducerGuy/ThermalForge)**.
 This repository is an actively maintained fork.
 
+### Fork History
+
+This fork was created from **[mileadev/ThermalForge](https://github.com/mileadev/ThermalForge)** and includes:
+- **Persistent fan profile** — selected profile survives app restarts
+- **Performance improvements** from [ProducerGuy/ThermalForge#16](https://github.com/ProducerGuy/ThermalForge/pull/16) by **[arttttt](https://github.com/arttttt)** — adaptive polling cadence, command coalescing, SMC read caching, and menu visibility gating (idle CPU ~9% → ~0.3%)
+
 ## Release
 
-Current fork release: **`v0.2.1`**
+Current fork release: **`v0.3.0`**
 
-- Release page: <https://github.com/d37atm/ThermalForge/releases/tag/v0.2.1>
+- Release page: <https://github.com/tomtastic/ThermalForge/releases/tag/v0.3.0>
 - Artifacts:
-  - `ThermalForge-v0.2.1-macos-arm64-app.zip`
-  - `ThermalForge-v0.2.1-macos-arm64-cli.tar.gz`
+  - `ThermalForge.app.zip`
+  - `thermalforge-cli-macos-arm64.tar.gz`
   - `checksums.txt`
 
-`v0.2.1` adds:
+`v0.3.0` adds:
+- adaptive polling cadence (1s active, 2s idle, 5s hands-off) — cuts idle CPU from ~9% to ~0.3%
+- command coalescing for daemon I/O — serializes and batches fan commands
+- SMC read caching and live key filtering — avoids redundant SMC reads
+- autoreleasepool fixes for daemon memory leak
+- @Observable migration from ObservableObject/@Published
+- menu visibility gating — prevents hidden SwiftUI re-renders
+- cheap controlTemps read path for non-UI ticks
+- scheduled timer with leeway for OS coalescing
+- process capture floor — skip below 50°C
+- persistent fan profile selection across app launches
+- socket timeout on legacy daemon fallback path
+
+`v0.2.1` added:
 - fix for menu bar freeze path caused by high-frequency repeated rule command dispatch
 - daemon client socket timeout hardening + non-blocking app-side daemon call path
 - runtime performance optimization: deduped rule-trigger events and reduced UI update cadence
@@ -106,7 +125,7 @@ sudo thermalforge install
 
 ### Source
 ```bash
-git clone https://github.com/d37atm/ThermalForge.git
+git clone https://github.com/tomtastic/ThermalForge.git
 cd ThermalForge
 ./setup.sh
 ```

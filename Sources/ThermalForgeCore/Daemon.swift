@@ -42,6 +42,7 @@ public enum ThermalForgeDaemon {
 public enum DaemonError: Error, CustomStringConvertible {
     case notRunning
     case connectionFailed
+    case timedOut
     case protocolError(String)
     case commandFailed(code: String, message: String)
 
@@ -51,6 +52,8 @@ public enum DaemonError: Error, CustomStringConvertible {
             return "ThermalForge daemon is not running. Run: sudo thermalforge install"
         case .connectionFailed:
             return "Failed to connect to daemon socket"
+        case .timedOut:
+            return "Daemon did not respond in time"
         case .protocolError(let msg):
             return "Daemon protocol error: \(msg)"
         case .commandFailed(let code, let message):
@@ -60,9 +63,15 @@ public enum DaemonError: Error, CustomStringConvertible {
 }
 
 public final class DaemonClient {
-    private let socketTimeoutSeconds: Int = 3
+    private let socketPath: String
+    /// Hard ceiling on a single daemon round-trip. A misbehaving or busy daemon
+    /// (e.g. a slow SMC unlock) can never block the caller longer than this.
+    private let timeoutSeconds: Int
 
-    public init() {}
+    public init(socketPath: String = ThermalForgeDaemon.socketPath, timeoutSeconds: Int = 5) {
+        self.socketPath = socketPath
+        self.timeoutSeconds = timeoutSeconds
+    }
 
     /// Backward-compatible string command transport.
     public func send(_ command: String) throws -> String {
@@ -101,9 +110,14 @@ public final class DaemonClient {
         defer { close(fd) }
         configureClientSocket(fd)
 
+        // Bound send/recv so a stuck daemon can't block the caller forever.
+        var tv = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        setPath(&addr, ThermalForgeDaemon.socketPath)
+        setPath(&addr, socketPath)
 
         let connectResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -119,6 +133,7 @@ public final class DaemonClient {
         }
         guard written >= 0 else { throw DaemonError.connectionFailed }
 
+        // Read response — 64KB handles status JSON on sensor-rich machines
         let responseData = try readResponse(fd)
         if let typedResponse = try? DaemonCodec.decodeResponse(responseData) {
             return typedResponse
@@ -137,6 +152,8 @@ public final class DaemonClient {
         switch error {
         case .commandFailed(let code, let message):
             return code == "legacy_error" && message.contains("unknown command")
+        case .timedOut:
+            return true
         default:
             return false
         }
@@ -179,9 +196,14 @@ public final class DaemonClient {
         defer { close(fd) }
         configureClientSocket(fd)
 
+        // Bound send/recv so a stuck daemon can't block the caller forever.
+        var tv = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        setPath(&addr, ThermalForgeDaemon.socketPath)
+        setPath(&addr, socketPath)
 
         let connectResult = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -206,15 +228,6 @@ public final class DaemonClient {
         withUnsafePointer(to: &noSigPipe) { ptr in
             _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, ptr, socklen_t(MemoryLayout<Int32>.size))
         }
-
-        var timeout = timeval(tv_sec: numericCast(socketTimeoutSeconds), tv_usec: 0)
-        let timeoutLen = socklen_t(MemoryLayout<timeval>.size)
-        withUnsafePointer(to: &timeout) { ptr in
-            _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, ptr, timeoutLen)
-        }
-        withUnsafePointer(to: &timeout) { ptr in
-            _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, ptr, timeoutLen)
-        }
     }
 
     private func readResponse(_ fd: Int32) throws -> Data {
@@ -229,7 +242,7 @@ public final class DaemonClient {
         }
 
         if errno == EAGAIN || errno == EWOULDBLOCK {
-            throw DaemonError.protocolError("timed out waiting for daemon response")
+            throw DaemonError.timedOut
         }
         throw DaemonError.connectionFailed
     }
@@ -352,10 +365,15 @@ public final class DaemonServer {
 
         DispatchQueue.global(qos: .utility).async { [self] in
             while true {
-                let clientFD = accept(socketFD, nil, nil)
-                guard clientFD >= 0 else { continue }
-                handleClient(clientFD)
-                close(clientFD)
+                // Drain per-iteration temporaries — this block never returns, so
+                // without an explicit pool every autoreleased object accumulates
+                // for the daemon's lifetime (multi-GB leak over days).
+                autoreleasepool {
+                    let clientFD = accept(socketFD, nil, nil)
+                    guard clientFD >= 0 else { return }
+                    handleClient(clientFD)
+                    close(clientFD)
+                }
             }
         }
 
@@ -367,33 +385,38 @@ public final class DaemonServer {
     private func startHeartbeatWatchdog() {
         DispatchQueue.global(qos: .utility).async { [self] in
             while true {
-                Thread.sleep(forTimeInterval: 5)
+                autoreleasepool {
+                    Thread.sleep(forTimeInterval: 2)
 
-                heartbeatLock.lock()
-                let lastBeat = lastHeartbeat
-                let hasManualControl = lastCommand != nil
-                heartbeatLock.unlock()
+                    heartbeatLock.lock()
+                    let lastBeat = lastHeartbeat
+                    let hasManualControl = lastCommand != nil
+                    heartbeatLock.unlock()
 
-                guard let beat = lastBeat, hasManualControl else { continue }
+                    // Only reset if: app has connected before (lastBeat != nil),
+                    // fans are in manual mode, and heartbeat is stale
+                    guard let beat = lastBeat, hasManualControl else { return }
 
-                if Date().timeIntervalSince(beat) > 15 {
-                    NSLog("ThermalForge daemon: heartbeat timeout — resetting fans to auto")
-                    smcLock.lock()
-                    let resetSucceeded: Bool
-                    do {
-                        try fanControl.resetAuto()
-                        resetSucceeded = true
-                    } catch {
-                        NSLog("ThermalForge daemon: watchdog reset failed: %@, will retry", "\(error)")
-                        resetSucceeded = false
-                    }
-                    smcLock.unlock()
+                    if Date().timeIntervalSince(beat) > 10 {
+                        NSLog("ThermalForge daemon: heartbeat stale — resetting fans to auto")
+                        smcLock.lock()
+                        let resetSucceeded: Bool
+                        do {
+                            try fanControl.resetAuto()
+                            resetSucceeded = true
+                        } catch {
+                            NSLog("ThermalForge daemon: watchdog reset failed: %@, will retry", "\(error)")
+                            resetSucceeded = false
+                        }
+                        smcLock.unlock()
 
-                    if resetSucceeded {
-                        heartbeatLock.lock()
-                        lastCommand = nil
-                        lastHeartbeat = nil
-                        heartbeatLock.unlock()
+                        // Only clear state if reset actually worked — otherwise retry next cycle
+                        if resetSucceeded {
+                            heartbeatLock.lock()
+                            lastCommand = nil
+                            lastHeartbeat = nil
+                            heartbeatLock.unlock()
+                        }
                     }
                 }
             }
