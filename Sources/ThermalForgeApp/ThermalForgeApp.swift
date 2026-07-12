@@ -23,9 +23,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Reset fans on quit so daemon doesn't hold stale manual settings
-        let client = DaemonClient()
-        try? client.execute(.resetAuto)
+        // Reset fans to Apple defaults on quit so the SMC resumes thermal
+        // management. The daemon has a 15s heartbeat watchdog as a fallback,
+        // but we want this to happen promptly. Block for up to 3s — applicationWillTerminate
+        // is called on the main thread before termination, so a short wait is fine.
+        let client = DaemonClient(timeoutSeconds: 3)
+        do {
+            try client.execute(.resetAuto)
+        } catch {
+            TFLogger.shared.error("On-quit fan reset failed: \(error) — daemon watchdog will retry")
+        }
     }
 }
 

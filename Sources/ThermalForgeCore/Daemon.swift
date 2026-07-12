@@ -386,7 +386,7 @@ public final class DaemonServer {
         DispatchQueue.global(qos: .utility).async { [self] in
             while true {
                 autoreleasepool {
-                    Thread.sleep(forTimeInterval: 5)
+                    Thread.sleep(forTimeInterval: 2)
 
                     heartbeatLock.lock()
                     let lastBeat = lastHeartbeat
@@ -397,8 +397,8 @@ public final class DaemonServer {
                     // fans are in manual mode, and heartbeat is stale
                     guard let beat = lastBeat, hasManualControl else { return }
 
-                    if Date().timeIntervalSince(beat) > 15 {
-                        NSLog("ThermalForge daemon: heartbeat timeout — resetting fans to auto")
+                    if Date().timeIntervalSince(beat) > 10 {
+                        NSLog("ThermalForge daemon: heartbeat stale — resetting fans to auto")
                         smcLock.lock()
                         let resetSucceeded: Bool
                         do {
