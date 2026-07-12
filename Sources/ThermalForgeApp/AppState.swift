@@ -5,65 +5,72 @@
 //  Observable bridge between ThermalMonitor and SwiftUI.
 //
 
+import Observation
 import ServiceManagement
 import SwiftUI
 @preconcurrency import ThermalForgeCore
 
 @MainActor
-final class AppState: ObservableObject {
-    @Published var latestStatus: ThermalStatus?
-    @Published var activeProfile: FanProfile = .silent
-    @Published var monitorState: MonitorState = .idle
-    @Published var maxTemp: Float?
+@Observable
+final class AppState {
+    var latestStatus: ThermalStatus?
+    var activeProfile: FanProfile = .silent
+    var monitorState: MonitorState = .idle
+    var maxTemp: Float?
 
-    @Published var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
+    var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
         didSet { UserDefaults.standard.set(useFahrenheit, forKey: "useFahrenheit") }
     }
 
-    @Published var launchAtLogin: Bool = false {
+    var launchAtLogin: Bool = false {
         didSet { updateLoginItem() }
     }
-    @Published var customRuleEnabled: Bool = UserDefaults.standard.bool(forKey: "customRuleEnabled") {
+    var customRuleEnabled: Bool = UserDefaults.standard.bool(forKey: "customRuleEnabled") {
         didSet { syncTemperatureRuleFromSettings() }
     }
-    @Published var customRuleTriggerTempC: Double = {
+    var customRuleTriggerTempC: Double = {
         let value = UserDefaults.standard.object(forKey: "customRuleTriggerTempC") as? Double
         return value ?? 55
     }() {
         didSet { syncTemperatureRuleFromSettings() }
     }
-    @Published var customRuleReleaseTempC: Double = {
+    var customRuleReleaseTempC: Double = {
         let value = UserDefaults.standard.object(forKey: "customRuleReleaseTempC") as? Double
         return value ?? 50
     }() {
         didSet { syncTemperatureRuleFromSettings() }
     }
-    @Published var customRuleFanPercent: Double = {
+    var customRuleFanPercent: Double = {
         let value = UserDefaults.standard.object(forKey: "customRuleFanPercent") as? Double
         return value ?? 100
     }() {
         didSet { syncTemperatureRuleFromSettings() }
     }
 
-    @Published var rulesEnabled: Bool = UserDefaults.standard.object(forKey: "rulesEnabled") as? Bool ?? true {
+    var rulesEnabled: Bool = UserDefaults.standard.object(forKey: "rulesEnabled") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(rulesEnabled, forKey: "rulesEnabled")
             pushRulesToMonitor()
         }
     }
 
-    @Published var rules: [ThermalRule] = [] {
+    var rules: [ThermalRule] = [] {
         didSet {
             persistRules()
             pushRulesToMonitor()
         }
     }
 
-    private var monitor: ThermalMonitor?
-    private let executor = PrivilegedExecutor()
-    private let daemonQueue = DispatchQueue(label: "com.thermalforge.app.daemon", qos: .utility)
-    private var heartbeatTimer: Timer?
-    private var syncingRuleSettings = false
+    @ObservationIgnored private var monitor: ThermalMonitor?
+    @ObservationIgnored private let executor = PrivilegedExecutor()
+    @ObservationIgnored private let daemonQueue = DispatchQueue(label: "com.thermalforge.app.daemon", qos: .utility)
+    @ObservationIgnored private var heartbeatTimer: Timer?
+    /// Whether the dropdown panel is currently shown. The panel's hosting view
+    /// stays alive while hidden and re-renders on any observed change, so we
+    /// only feed it the per-tick `latestStatus` while it's actually visible.
+    @ObservationIgnored private var menuOpen = false
+    @ObservationIgnored private var lastStatus: ThermalStatus?
+    @ObservationIgnored private var syncingRuleSettings = false
 
     init() {
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
@@ -97,7 +104,8 @@ final class AppState: ObservableObject {
         rules = RulePersistence.load()
 
         startMonitoring()
-        startHeartbeat()
+        // Heartbeat is started only when a fan-controlling profile is active
+        // (see syncHeartbeat). The default Silent profile needs none.
     }
 
     deinit {
@@ -106,44 +114,75 @@ final class AppState: ObservableObject {
 
     // MARK: - Heartbeat
 
+    /// The daemon watchdog ignores heartbeats unless a manual fan command was
+    /// sent, so hands-off (Silent) needs no heartbeat — running it there is a
+    /// pure 5s wake on both processes for nothing. Run it only for fan-
+    /// controlling profiles.
+    private func syncHeartbeat(for profile: FanProfile) {
+        if profile.curve.handsOff {
+            stopHeartbeat()
+        } else {
+            startHeartbeat()
+        }
+    }
+
     private func startHeartbeat() {
-        let daemonQueue = self.daemonQueue
-        let executor = self.executor
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-            daemonQueue.async {
-                do {
-                    try executor.heartbeat()
-                } catch {
-                    TFLogger.shared.error("Heartbeat failed: \(error)")
-                }
+        guard heartbeatTimer == nil else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            // Off the main thread — a blocking daemon round-trip must never stall the UI.
+            DispatchQueue.global(qos: .utility).async {
+                _ = try? DaemonClient().send("heartbeat")
             }
         }
+        timer.tolerance = 1.0 // let the OS coalesce the wakeup
+        heartbeatTimer = timer
+    }
+
+    private func stopHeartbeat() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
     }
 
     // MARK: - Monitoring
 
     func startMonitoring() {
         guard let fc = try? FanControl() else { return }
-        let executor = self.executor
 
         let ruleEngine = RuleEngine(rules: rules, isEnabled: rulesEnabled)
         let controlService = ControlService(ruleEngine: ruleEngine)
         let monitor = ThermalMonitor(fanControl: fc, profile: activeProfile, controlService: controlService)
 
         monitor.onUpdate = { [weak self] status, profile, state in
-            Task { @MainActor [weak self] in
-                self?.latestStatus = status
-                self?.activeProfile = profile
-                self?.monitorState = state
+            Task { @MainActor in
+                guard let self else { return }
+                self.lastStatus = status
+                // Publish-on-change, AND only while the panel is visible. The
+                // dropdown's hosting view stays alive when hidden and re-renders
+                // on every latestStatus change — so feeding it per-tick updates
+                // while closed drives full SwiftUI layout for nothing.
+                if self.menuOpen, self.latestStatus != status { self.latestStatus = status }
+                if self.activeProfile != profile { self.activeProfile = profile }
+                if self.monitorState != state { self.monitorState = state }
+                // Peak across all displayed CPU and GPU sensors for the menu bar.
+                // Quantize to whole degrees: the label shows an integer, so a
+                // jittering 0.1° fraction would otherwise force a relayout (CA
+                // transaction) every update for a number that never changes.
                 let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
-                self?.maxTemp = status.temperatures
+                let newMax = status.temperatures
                     .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
                     .values.max()
+                    .map { $0.rounded() }
+                if self.maxTemp != newMax { self.maxTemp = newMax }
             }
         }
 
+        // Fan commands run off the main thread, coalesced. The ramp fires
+        // ~10/s and each daemon round-trip can exceed 0.5s; routing this
+        // through the main actor (as before) starved the UI run loop and froze
+        // the app on profile switch.
+        let executor = self.executor
         monitor.onFanCommand = { command in
-            try executor.execute(command)
+            executor.submit(command)
         }
 
         monitor.start()
@@ -161,6 +200,20 @@ final class AppState: ObservableObject {
         } catch {
             TFLogger.shared.error("Failed to persist rules: \(error)")
         }
+    }
+
+    // MARK: - Menu visibility
+
+    /// Called when the dropdown panel becomes visible: resume live updates and
+    /// push the latest snapshot immediately so it isn't stale on open.
+    func menuDidOpen() {
+        menuOpen = true
+        if let status = lastStatus, latestStatus != status { latestStatus = status }
+    }
+
+    /// Called when the panel is dismissed: stop feeding the hidden hosting view.
+    func menuDidClose() {
+        menuOpen = false
     }
 
     // MARK: - Actions
@@ -181,6 +234,7 @@ final class AppState: ObservableObject {
     func selectProfile(_ profile: FanProfile) {
         activeProfile = profile
         monitor?.switchProfile(profile)
+        syncHeartbeat(for: profile)
         TFLogger.shared.profile("Selected: \(profile.name)")
 
         // Persist the selection to UserDefaults
