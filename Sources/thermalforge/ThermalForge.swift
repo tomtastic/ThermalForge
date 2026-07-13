@@ -305,8 +305,11 @@ struct Calibrate: ParsableCommand {
         // Reset doesn't need sudo — it's user data
         if reset {
             if CalibrationData.exists {
-                try? FileManager.default.removeItem(at: CalibrationData.filePath)
-                print("Calibration data cleared. Smart will use the default curve.")
+                // Remove all calibration files (both lid states + legacy)
+                try? FileManager.default.removeItem(at: CalibrationData.filePath(forLidClosed: false))
+                try? FileManager.default.removeItem(at: CalibrationData.filePath(forLidClosed: true))
+                try? FileManager.default.removeItem(at: CalibrationData.legacyFilePath)
+                print("Calibration data cleared (all lid states). Smart will use the default curve.")
                 TFLogger.shared.calibration("Calibration data reset by user")
             } else {
                 print("No calibration data to clear.")
@@ -317,6 +320,10 @@ struct Calibrate: ParsableCommand {
         guard geteuid() == 0 else {
             throw ValidationError("Run with sudo: sudo thermalforge calibrate")
         }
+
+        // Stop the ThermalForge daemon and menu bar app — they conflict with calibration fan control
+        let daemonWasRunning = thermalforgeDaemonWasStopped()
+        killThermalForgeApp()
 
         guard let calMode = CalibrationMode(rawValue: mode) else {
             throw ValidationError("Unknown mode '\(mode)'. Options: quick, standard, optimized")
@@ -368,24 +375,93 @@ struct Calibrate: ParsableCommand {
             print(message)
         }
 
-        let data = try runner.run()
-        try data.save()
+        do {
+            let data = try runner.run()
+            try data.save()
 
-        print("\nCalibration complete.")
-        print("\nSaved to:")
-        print("  \(CalibrationData.filePath.path)")
-        if let logPath = runner.logPath {
-            print("  \(logPath.path)")
+            print("\nCalibration complete.")
+            print("\nSaved to:")
+            print("  \(CalibrationData.filePath.path)")
+            if let logPath = runner.logPath {
+                print("  \(logPath.path)")
+            }
+            print("\nResults:")
+            for m in data.measurements {
+                print("  \(Int(m.targetTemp))°C → \(Int(m.holdingRPMPercent * 100))% fan speed")
+            }
+            print("\nThe Smart profile will now use these measurements for this machine.")
+            if runner.logPath != nil {
+                print("The CSV log contains every sensor reading taken during calibration.")
+            }
+        } catch {
+            // On failure, don't save — but still resume the daemon
+            print("\nCalibration failed: \(error.localizedDescription)")
         }
-        print("\nResults:")
-        for m in data.measurements {
-            print("  \(Int(m.targetTemp))°C → \(Int(m.holdingRPMPercent * 100))% fan speed")
-        }
-        print("\nThe Smart profile will now use these measurements for this machine.")
-        if runner.logPath != nil {
-            print("The CSV log contains every sensor reading taken during calibration.")
+
+        // Resume daemon if it was running before calibration (always run on exit)
+        if daemonWasRunning {
+            resumeThermalforgeDaemon()
         }
     }
+}
+
+// MARK: - Daemon Management for Calibration
+
+/// Check if the ThermalForge daemon is running, stop it if so, and return whether it was running.
+private func thermalforgeDaemonWasStopped() -> Bool {
+    let check = Process()
+    check.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    check.arguments = ["list", ThermalForgeDaemon.label]
+    let pipe = Pipe()
+    check.standardOutput = pipe
+    check.standardError = pipe
+    try? check.run()
+    check.waitUntilExit()
+
+    let outputData = try? pipe.fileHandleForReading.readToEnd()
+    let output = String(data: outputData ?? Data(), encoding: .utf8) ?? ""
+
+    // launchctl list output: PID column is non-zero when running
+    // Format: <PID>	0	com.thermalforge.daemon  (when running)
+    //         -	0	com.thermalforge.daemon      (when not running)
+    let lines = output.components(separatedBy: .newlines)
+    for line in lines where line.contains(ThermalForgeDaemon.label) {
+        let fields = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+        if fields.first == "-" {
+            return false // not running
+        }
+        if let pid = Int(fields.first ?? "") , pid > 0 {
+            // Daemon is running — stop it
+            print("Stopping ThermalForge daemon (PID \(pid)) — will resume after calibration...")
+            let stop = Process()
+            stop.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            stop.arguments = ["bootout", "system", ThermalForgeDaemon.label]
+            try? stop.run()
+            stop.waitUntilExit()
+            Thread.sleep(forTimeInterval: 1) // brief pause for daemon to release fan control
+            return true
+        }
+    }
+    return false
+}
+
+/// Resume the ThermalForge daemon after calibration.
+private func resumeThermalforgeDaemon() {
+    print("Resuming ThermalForge daemon...")
+    let start = Process()
+    start.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    start.arguments = ["bootstrap", "system", ThermalForgeDaemon.plistPath]
+    try? start.run()
+    start.waitUntilExit()
+}
+
+/// Kill the ThermalForge menu bar app if running.
+private func killThermalForgeApp() {
+    let kill = Process()
+    kill.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+    kill.arguments = ["ThermalForgeApp"]
+    try? kill.run()
+    kill.waitUntilExit()
 }
 
 // MARK: - Log

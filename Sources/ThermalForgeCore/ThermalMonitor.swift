@@ -145,6 +145,40 @@ public final class ThermalMonitor {
         return data
     }()
 
+    /// Track which lid state the current calibration was loaded for,
+    /// so we can reload when the lid state flips.
+    private var calibrationLidClosed: Bool = isClamshellMode()
+
+    /// How often (in seconds) to recheck lid state. Lid changes are rare —
+    /// checking every 60s is plenty and avoids NSScreen queries on every tick.
+    private let lidCheckInterval: Int = 60
+    private var lastLidCheckTimestamp: UInt64 = 0
+
+    /// Reload calibration data if the lid state has changed.
+    /// Throttled to `lidCheckInterval` seconds to avoid frequent NSScreen queries.
+    private func syncCalibration() {
+        let now = UInt64(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        guard now - lastLidCheckTimestamp >= lidCheckInterval else { return }
+        lastLidCheckTimestamp = now
+        let currentLidClosed = isClamshellMode()
+        guard currentLidClosed != calibrationLidClosed else { return }
+
+        TFLogger.shared.info("Lid state changed (clamshell: \(currentLidClosed)) — reloading calibration")
+        calibrationLidClosed = currentLidClosed
+
+        guard let data = CalibrationData.load(forLidClosed: currentLidClosed) else {
+            calibration = nil
+            TFLogger.shared.info("No calibration data for current lid state — using fallback curve")
+            return
+        }
+        if let error = data.validationError {
+            TFLogger.shared.error("Calibration data rejected on lid-state reload: \(error)")
+            calibration = nil
+            return
+        }
+        calibration = data
+    }
+
     /// Called on UI update cadence (every 500ms) with updated status.
     public var onUpdate: ((ThermalStatus, FanProfile, MonitorState) -> Void)?
     /// Called when a fan command needs to be executed (may require privilege).
@@ -250,9 +284,10 @@ public final class ThermalMonitor {
             lastRuleCommandAppliedAt = nil
 
             if profile.id == "smart" {
-                // Reset Smart state and reload calibration data.
+                // Reset Smart state and reload calibration data for current lid state.
                 tempHistory.removeAll()
-                let loaded = CalibrationData.load()
+                calibrationLidClosed = isClamshellMode()
+                let loaded = CalibrationData.load(forLidClosed: calibrationLidClosed)
                 if let error = loaded?.validationError {
                     TFLogger.shared.error("Calibration data rejected on reload: \(error)")
                     calibration = nil
@@ -287,6 +322,9 @@ public final class ThermalMonitor {
     // MARK: - Polling
 
     private func tick() {
+        // Check if lid state changed and reload calibration accordingly.
+        syncCalibration()
+
         // Build the full sensor snapshot only on the UI/monitor cadence (the UI
         // and 2s monitor tick consume it). On those ticks, derive the control
         // peak from it instead of re-reading the CPU/GPU sensors; on the other

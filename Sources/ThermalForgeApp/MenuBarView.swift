@@ -18,6 +18,9 @@ struct MenuBarView: View {
             HStack {
                 Text("ThermalForge")
                     .font(.headline)
+                Text(ThermalForgeVersion.current)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 stateIndicator
             }
