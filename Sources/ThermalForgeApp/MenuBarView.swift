@@ -28,6 +28,26 @@ struct MenuBarView: View {
             .padding(.top, 10)
             .padding(.bottom, 6)
 
+            // Daemon warning
+            if !appState.daemonAvailable {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                        Text("Fan control unavailable")
+                            .font(.caption)
+                            .foregroundStyle(.primary)
+                        Spacer()
+                    }
+                    Text("Install daemon: sudo thermalforge install")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+            }
+
             Divider()
 
             // Fan speeds

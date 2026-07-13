@@ -20,7 +20,24 @@ final class PrivilegedExecutor: @unchecked Sendable {
     init() {
         let client = DaemonClient()
         self.client = client
+
+        // Throttle "daemon not running" log to at most once per 30s
+        var lastLogTimestamp = Date(timeIntervalSince1970: 0)
+        let logLock = NSLock()
+
         self.coalescer = CommandCoalescer(label: "com.thermalforge.executor") { command in
+            guard ThermalForgeDaemon.isRunning else {
+                logLock.lock()
+                let now = Date()
+                if now.timeIntervalSince(lastLogTimestamp) >= 30 {
+                    lastLogTimestamp = now
+                    logLock.unlock()
+                    TFLogger.shared.info("Fan command dropped — daemon not running")
+                } else {
+                    logLock.unlock()
+                }
+                return
+            }
             do {
                 try client.execute(command)
             } catch {

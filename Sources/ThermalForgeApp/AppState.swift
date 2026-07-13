@@ -68,9 +68,12 @@ final class AppState {
     /// Whether the dropdown panel is currently shown. The panel's hosting view
     /// stays alive while hidden and re-renders on any observed change, so we
     /// only feed it the per-tick `latestStatus` while it's actually visible.
+    /// Whether the privileged daemon is running. Without it, fan commands fail.
+    var daemonAvailable: Bool = ThermalForgeDaemon.isRunning
     @ObservationIgnored private var menuOpen = false
     @ObservationIgnored private var lastStatus: ThermalStatus?
     @ObservationIgnored private var syncingRuleSettings = false
+    @ObservationIgnored private var daemonCheckTimer: Timer?
 
     init() {
         launchAtLogin = (SMAppService.mainApp.status == .enabled)
@@ -106,10 +109,14 @@ final class AppState {
         startMonitoring()
         // Heartbeat is started only when a fan-controlling profile is active
         // (see syncHeartbeat). The default Silent profile needs none.
+
+        // Periodically check if daemon became available or went away
+        startDaemonCheck()
     }
 
     deinit {
         heartbeatTimer?.invalidate()
+        daemonCheckTimer?.invalidate()
     }
 
     // MARK: - Heartbeat
@@ -141,6 +148,32 @@ final class AppState {
     private func stopHeartbeat() {
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
+    }
+
+    // MARK: - Daemon Availability
+
+    private func startDaemonCheck() {
+        // Check immediately, then poll every 30s to detect if daemon starts/stops
+        checkDaemonAvailability()
+        let timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
+            Task { @MainActor in
+                self.checkDaemonAvailability()
+            }
+        }
+        timer.tolerance = 5
+        daemonCheckTimer = timer
+    }
+
+    private func checkDaemonAvailability() {
+        let wasAvailable = daemonAvailable
+        daemonAvailable = ThermalForgeDaemon.isRunning
+        if daemonAvailable != wasAvailable {
+            if daemonAvailable {
+                TFLogger.shared.info("Daemon became available")
+            } else {
+                TFLogger.shared.info("Daemon not running — fan control unavailable")
+            }
+        }
     }
 
     // MARK: - Monitoring
