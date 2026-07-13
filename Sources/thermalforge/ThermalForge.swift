@@ -239,7 +239,7 @@ struct Watch: ParsableCommand {
             }
         }
 
-        monitor.onUpdate = { [json] status, activeProfile, state in
+        monitor.onUpdate = { [json] status, activeProfile, state, _ in
             if json {
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.sortedKeys]

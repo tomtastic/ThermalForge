@@ -16,6 +16,7 @@ final class AppState {
     var latestStatus: ThermalStatus?
     var activeProfile: FanProfile = .silent
     var monitorState: MonitorState = .idle
+    var calibrationState: CalibrationState = .none
     var maxTemp: Float?
 
     var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
@@ -185,7 +186,7 @@ final class AppState {
         let controlService = ControlService(ruleEngine: ruleEngine)
         let monitor = ThermalMonitor(fanControl: fc, profile: activeProfile, controlService: controlService)
 
-        monitor.onUpdate = { [weak self] status, profile, state in
+        monitor.onUpdate = { [weak self] status, profile, state, calState in
             Task { @MainActor in
                 guard let self else { return }
                 self.lastStatus = status
@@ -196,6 +197,7 @@ final class AppState {
                 if self.menuOpen, self.latestStatus != status { self.latestStatus = status }
                 if self.activeProfile != profile { self.activeProfile = profile }
                 if self.monitorState != state { self.monitorState = state }
+                if self.calibrationState != calState { self.calibrationState = calState }
                 // Peak across all displayed CPU and GPU sensors for the menu bar.
                 // Quantize to whole degrees: the label shows an integer, so a
                 // jittering 0.1° fraction would otherwise force a relayout (CA

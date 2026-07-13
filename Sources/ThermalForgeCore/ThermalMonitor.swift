@@ -28,6 +28,23 @@ public enum MonitorState: Equatable {
     case safetyOverride
 }
 
+// MARK: - Calibration State
+
+/// Lightweight snapshot of calibration status reported to the UI.
+public struct CalibrationState: Equatable {
+    /// Whether a calibration curve is loaded for the current lid state.
+    public let active: Bool
+    /// True if the calibration was generated in clamshell (lid-closed) mode.
+    public let lidClosed: Bool
+
+    public static let none = CalibrationState(active: false, lidClosed: false)
+
+    public init(active: Bool, lidClosed: Bool) {
+        self.active = active
+        self.lidClosed = lidClosed
+    }
+}
+
 // MARK: - Custom Rule
 
 /// User-defined IF/THEN/ELSE fan rule.
@@ -149,6 +166,14 @@ public final class ThermalMonitor {
     /// so we can reload when the lid state flips.
     private var calibrationLidClosed: Bool = isClamshellMode()
 
+    /// Snapshot of calibration status for the UI.
+    private var calibrationState: CalibrationState {
+        if let cal = calibration {
+            return CalibrationState(active: true, lidClosed: cal.lidClosed)
+        }
+        return .none
+    }
+
     /// How often (in seconds) to recheck lid state. Lid changes are rare —
     /// checking every 60s is plenty and avoids NSScreen queries on every tick.
     private let lidCheckInterval: Int = 60
@@ -180,7 +205,7 @@ public final class ThermalMonitor {
     }
 
     /// Called on UI update cadence (every 500ms) with updated status.
-    public var onUpdate: ((ThermalStatus, FanProfile, MonitorState) -> Void)?
+    public var onUpdate: ((ThermalStatus, FanProfile, MonitorState, CalibrationState) -> Void)?
     /// Called when a fan command needs to be executed (may require privilege).
     public var onFanCommand: ((FanCommand) throws -> Void)?
 
@@ -363,7 +388,7 @@ public final class ThermalMonitor {
                 TFLogger.shared.safety("Override triggered: \(String(format: "%.1f", maxTemp))°C — fans maxed")
                 TFLogger.shared.event(ThermalEvent(type: .safetyOverrideTriggered, details: "maxTemp=\(String(format: "%.1f", maxTemp))"))
             }
-            if let status { onUpdate?(status, activeProfile, state) }
+            if let status { onUpdate?(status, activeProfile, state, calibrationState) }
             applyCadence(maxTemp: maxTemp, fanChanged: true)
             tickCounter += 1
             return
@@ -382,7 +407,7 @@ public final class ThermalMonitor {
             lastRuleCommandAppliedAt = nil
             tickTemperatureRule(status: status, peakTemp: maxTemp, rule: rule)
             if tickCounter % uiUpdateCadence == 0 {
-                if let status { onUpdate?(status, activeProfile, state) }
+                if let status { onUpdate?(status, activeProfile, state, calibrationState) }
             }
             tickCounter += 1
             return
@@ -462,7 +487,7 @@ public final class ThermalMonitor {
                     }
                     lastRuleDecision = decision
                     if tickCounter % uiUpdateCadence == 0 {
-                        onUpdate?(status, activeProfile, state)
+                        onUpdate?(status, activeProfile, state, calibrationState)
                     }
                     tickCounter += 1
                     return
@@ -489,7 +514,7 @@ public final class ThermalMonitor {
         let fanChanged = lastAppliedRPMPercent != appliedBefore || fansCurrentlyRunning != runningBefore
 
         // UI update at slower cadence (every 500ms)
-        if let status { onUpdate?(status, activeProfile, state) }
+        if let status { onUpdate?(status, activeProfile, state, calibrationState) }
 
         applyCadence(maxTemp: maxTemp, fanChanged: fanChanged)
         tickCounter += 1

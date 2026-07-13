@@ -122,6 +122,21 @@ struct MenuBarView: View {
             .labelsHidden()
             .padding(.horizontal, 12)
 
+            // Calibration indicator
+            if appState.calibrationState.active {
+                HStack(spacing: 4) {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .foregroundStyle(.orange)
+                        .font(.caption2)
+                    Text(appState.calibrationState.lidClosed ? "Calibrated (lid closed)" : "Calibrated (lid open)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 2)
+            }
+
             Divider().padding(.vertical, 4)
 
             SectionHeader(title: "RULES")
