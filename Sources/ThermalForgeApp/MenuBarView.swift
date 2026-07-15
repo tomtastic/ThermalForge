@@ -30,7 +30,7 @@ struct MenuBarView: View {
 
             // Daemon warning
             if !appState.daemonAvailable {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.red)
@@ -40,9 +40,12 @@ struct MenuBarView: View {
                             .foregroundStyle(.primary)
                         Spacer()
                     }
-                    Text("Install daemon: sudo thermalforge install")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    Button("Install Daemon") {
+                        appState.installDaemon()
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                    .controlSize(.small)
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 4)

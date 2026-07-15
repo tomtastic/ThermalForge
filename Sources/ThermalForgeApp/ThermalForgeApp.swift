@@ -46,7 +46,7 @@ struct ThermalForgeApp: App {
             MenuBarView()
                 .environment(appState)
         } label: {
-            MenuBarLabel(state: appState.monitorState, maxTemp: appState.maxTemp, fahrenheit: appState.useFahrenheit)
+            MenuBarLabel(state: appState.monitorState, maxTemp: appState.maxTemp, fahrenheit: appState.useFahrenheit, daemonAvailable: appState.daemonAvailable)
         }
         .menuBarExtraStyle(.window)
     }
@@ -58,10 +58,16 @@ struct MenuBarLabel: View {
     let state: MonitorState
     let maxTemp: Float?
     var fahrenheit: Bool = false
+    var daemonAvailable: Bool = true
 
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: iconName)
+            if !daemonAvailable {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .font(.system(.caption2))
+            }
             if let tempC = maxTemp {
                 let display = fahrenheit ? tempC * 9 / 5 + 32 : tempC
                 Text("\(Int(display))°")

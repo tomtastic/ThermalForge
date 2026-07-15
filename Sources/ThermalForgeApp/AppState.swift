@@ -177,6 +177,47 @@ final class AppState {
         }
     }
 
+    // MARK: - Install Daemon
+
+    func installDaemon() {
+        // Locate the bundled CLI binary
+        guard let bundledURL = Bundle.main.url(forResource: "thermalforge", withExtension: nil) else {
+            TFLogger.shared.error("Install failed: bundled CLI not found")
+            return
+        }
+
+        let targetPath = "/usr/local/bin/thermalforge"
+
+        // Use osascript to request elevation and copy the binary, then install the daemon
+        let script = """
+do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPath)' && '\(targetPath)' install" with administrator privileges
+"""
+        // Run the blocking Process on a background queue to avoid
+        // "semaphore.wait unavailable from async contexts" warning.
+        DispatchQueue.global(qos: .utility).async {
+            let task = Process()
+            task.launchPath = "/usr/bin/osascript"
+            task.arguments = ["-e", script]
+            let semaphore = DispatchSemaphore(value: 0)
+            task.terminationHandler = { _ in semaphore.signal() }
+            do {
+                try task.run()
+                semaphore.wait()
+
+                if task.terminationStatus == 0 {
+                    TFLogger.shared.info("Daemon installed successfully")
+                    DispatchQueue.main.async {
+                        self.checkDaemonAvailability()
+                    }
+                } else {
+                    TFLogger.shared.error("Install failed with code \(task.terminationStatus)")
+                }
+            } catch {
+                TFLogger.shared.error("Install failed: \(error)")
+            }
+        }
+    }
+
     // MARK: - Monitoring
 
     func startMonitoring() {

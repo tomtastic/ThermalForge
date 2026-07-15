@@ -13,6 +13,15 @@ mkdir -p "$APP_CONTENTS/MacOS" "$APP_CONTENTS/Resources"
 cp "$APP_BIN" "$APP_CONTENTS/MacOS/ThermalForgeApp"
 chmod +x "$APP_CONTENTS/MacOS/ThermalForgeApp"
 
+# Bundle the CLI/daemon binary so the app can offer one-click installation
+CLI_BIN="$ROOT_DIR/.build/release/thermalforge"
+if [ -f "$CLI_BIN" ]; then
+  cp "$CLI_BIN" "$APP_CONTENTS/Resources/thermalforge"
+  chmod +x "$APP_CONTENTS/Resources/thermalforge"
+else
+  echo "WARNING: CLI binary not found at $CLI_BIN — daemon install will not work"
+fi
+
 if [ -f "$ICON_PATH" ]; then
   cp "$ICON_PATH" "$APP_CONTENTS/Resources/AppIcon.icns"
 fi
