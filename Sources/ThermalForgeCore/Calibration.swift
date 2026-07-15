@@ -8,6 +8,7 @@
 import Foundation
 import Metal
 import AppKit
+import Darwin
 
 // MARK: - Data Model
 
@@ -168,6 +169,32 @@ extension CalibrationData {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(self)
         try data.write(to: path)
+
+        // If running as root (daemon/CLI), also copy to the console user's
+        // home directory so the app (running as the user) can find it.
+        if geteuid() == 0 {
+            try copyToConsoleUser(data: data, lidClosed: lidClosed)
+        }
+    }
+
+    /// Copy calibration JSON to the console user's home directory.
+    /// When calibration runs as root (via sudo or the daemon), the app
+    /// (running as the logged-in user) can't read root's home directory.
+    private func copyToConsoleUser(data: Data, lidClosed: Bool) throws {
+        // Get console user UID from /dev/console
+        var st = stat()
+        guard stat("/dev/console", &st) == 0, st.st_uid != 0 else { return }
+
+        // Get home directory from passwd
+        guard let pw = getpwuid(st.st_uid), let home = String(validatingUTF8: pw.pointee.pw_dir) else { return }
+
+        let userPath = URL(fileURLWithPath: home)
+            .appendingPathComponent("Library/Application Support/ThermalForge/")
+            .appendingPathComponent("calibration_\(lidClosed ? "lid_closed" : "lid_open").json")
+        let userDir = userPath.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: userDir, withIntermediateDirectories: true)
+        try data.write(to: userPath)
+        TFLogger.shared.info("Copied calibration to console user: \(userPath.path)")
     }
 
     /// Load calibration data matching the current lid state.
