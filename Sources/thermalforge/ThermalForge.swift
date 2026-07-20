@@ -448,8 +448,9 @@ struct Calibrate: ParsableCommand {
                 print("The CSV log contains every sensor reading taken during calibration.")
             }
         } catch {
-            // On failure, don't save — but still resume the daemon
-            print("\nCalibration failed: \(error.localizedDescription)")
+            // Propagate failure so scripts and shells receive a non-zero exit
+            // status. The defer above still resumes the daemon.
+            throw ValidationError("Calibration failed: \(error.localizedDescription)")
         }
 
     }
