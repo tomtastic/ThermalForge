@@ -105,6 +105,22 @@ public final class DaemonClient {
     }
 
     private func sendTyped(_ request: DaemonRequest) throws -> DaemonResponse {
+        let payload = try DaemonCodec.encodeRequest(request)
+        let responseData = try roundTrip(payload)
+
+        if let typedResponse = try? DaemonCodec.decodeResponse(responseData) {
+            return typedResponse
+        }
+
+        // Fallback for old daemon responses.
+        let fallback = String(decoding: responseData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        if fallback.hasPrefix("error:") {
+            throw DaemonError.commandFailed(code: "legacy_error", message: String(fallback.dropFirst(6)).trimmingCharacters(in: .whitespaces))
+        }
+        return DaemonResponse(requestID: request.requestID, ok: true, message: fallback)
+    }
+
+    private func roundTrip(_ payload: Data) throws -> Data {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.connectionFailed }
         defer { close(fd) }
@@ -126,25 +142,27 @@ public final class DaemonClient {
         }
         guard connectResult == 0 else { throw DaemonError.notRunning }
 
-        let payload = try DaemonCodec.encodeRequest(request)
         let bytes = [UInt8](payload + [0x0A])
-        let written = bytes.withUnsafeBufferPointer { buf in
-            write(fd, buf.baseAddress!, buf.count)
-        }
-        guard written >= 0 else { throw DaemonError.connectionFailed }
+        try writeAll(bytes, to: fd)
 
         // Read response — 64KB handles status JSON on sensor-rich machines
-        let responseData = try readResponse(fd)
-        if let typedResponse = try? DaemonCodec.decodeResponse(responseData) {
-            return typedResponse
-        }
+        return try readResponse(fd)
+    }
 
-        // Fallback for old daemon responses.
-        let fallback = String(decoding: responseData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        if fallback.hasPrefix("error:") {
-            throw DaemonError.commandFailed(code: "legacy_error", message: String(fallback.dropFirst(6)).trimmingCharacters(in: .whitespaces))
+    private func writeAll(_ bytes: [UInt8], to fd: Int32) throws {
+        var offset = 0
+        while offset < bytes.count {
+            let written = bytes.withUnsafeBufferPointer { buffer in
+                write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+            }
+            if written > 0 {
+                offset += written
+            } else if written < 0, errno == EINTR {
+                continue
+            } else {
+                throw DaemonError.connectionFailed
+            }
         }
-        return DaemonResponse(requestID: request.requestID, ok: true, message: fallback)
     }
 
     private func shouldRetryLegacy(error: DaemonError, for request: DaemonRequest) -> Bool {
@@ -191,34 +209,7 @@ public final class DaemonClient {
     }
 
     private func sendLegacyRaw(_ command: String) throws -> String {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw DaemonError.connectionFailed }
-        defer { close(fd) }
-        configureClientSocket(fd)
-
-        // Bound send/recv so a stuck daemon can't block the caller forever.
-        var tv = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        setPath(&addr, socketPath)
-
-        let connectResult = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard connectResult == 0 else { throw DaemonError.notRunning }
-
-        let cmdData = Array((command + "\n").utf8)
-        let written = cmdData.withUnsafeBufferPointer { buf in
-            write(fd, buf.baseAddress!, buf.count)
-        }
-        guard written >= 0 else { throw DaemonError.connectionFailed }
-
-        let responseData = try readResponse(fd)
+        let responseData = try roundTrip(Data(command.utf8))
         return String(decoding: responseData, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
