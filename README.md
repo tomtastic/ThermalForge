@@ -111,6 +111,7 @@ Choose a mode or isolate the stress source when needed:
 ```bash
 sudo thermalforge calibrate --mode optimized
 sudo thermalforge calibrate --mode optimized --intensity 0.00221
+sudo thermalforge calibrate --mode optimized --rediscover-intensity
 sudo thermalforge calibrate --stress cpu
 sudo thermalforge calibrate --stress gpu
 ```
@@ -136,7 +137,12 @@ known-safe intensity and skip Phase 1 automatically when ambient is within 3°C.
 Use `--intensity` to supply a previously verified value explicitly; the 100% fan
 stage still validates it against the temperature ceiling before the curve is
 saved. Workload intensity is machine- and environment-specific; do not copy a
-value from another Mac.
+value from another Mac. Use `--rediscover-intensity` to ignore a saved workload
+and rerun Phase 1.
+
+A calibration is saved only when its converged sweep reaches at least 80°C,
+providing measured coverage for the Smart control range. Underpowered sweeps and
+all-maximum curves are rejected, leaving the previous calibration untouched.
 
 Lid-open and clamshell operation are calibrated independently. Run calibration
 once in each configuration you use; the result is stored in:

@@ -128,6 +128,13 @@ public struct CalibrationData: Codable {
             }
         }
 
+        // An all-maximum curve is produced when the calibration workload never
+        // heats the machine into the control range. It is safe but contains no
+        // useful fan-response information, so Smart must fall back instead.
+        if measurements.allSatisfy({ $0.holdingRPMPercent >= 0.999 }) {
+            return "All calibration points require maximum fan speed — temperature coverage was insufficient"
+        }
+
         return nil
     }
 
@@ -482,7 +489,7 @@ public final class CalibrationRunner {
     static let phase1MinimumDecisionDuration: TimeInterval = 60
     static let phase1IntensityLow: Float = 0.001
     static let phase1IntensityHigh: Float = 0.50
-    static let phase1MaxRatio: Float = 1.5
+    static let phase1UsefulEquilibriumMinimum: Float = 59.0
     /// Apple Silicon MacBook cooling time constant at max fans (60-90s per research).
     /// Used to estimate equilibrium temperature from finite observations.
     /// After time t, system reaches (1 - exp(-t/τ)) of equilibrium delta.
@@ -498,6 +505,10 @@ public final class CalibrationRunner {
 
         var isSafe: Bool {
             !hitCeiling && estimatedEquilTemp < CalibrationRunner.targetEquilTemp
+        }
+
+        var isUseful: Bool {
+            isSafe && estimatedEquilTemp >= CalibrationRunner.phase1UsefulEquilibriumMinimum
         }
     }
 
@@ -532,6 +543,7 @@ public final class CalibrationRunner {
 
         var probe = Self.phase1InitialIntensity
         var safeIntensity: Float?
+        var safeEquilibrium: Float?
         var unsafeIntensity: Float?
         var lastTestedIntensity: Float?
 
@@ -542,15 +554,16 @@ public final class CalibrationRunner {
 
             if result.isSafe {
                 safeIntensity = probe
+                safeEquilibrium = result.estimatedEquilTemp
 
-                // The useful sweep target is roughly 59–65°C at maximum fans. Do not
-                // spend more trials finding a mathematically maximal workload.
-                if result.estimatedEquilTemp >= Self.targetEquilTemp - 6 {
+                // Stop only when the safe probe is also hot enough to produce
+                // useful coverage. A narrow safe/unsafe bracket alone is not
+                // sufficient: the safe edge can still be badly underpowered.
+                if result.isUseful {
                     break
                 }
 
                 if let high = unsafeIntensity {
-                    if high / probe < Self.phase1MaxRatio { break }
                     probe = sqrt(probe * high)
                 } else if probe >= Self.phase1IntensityHigh {
                     break
@@ -560,7 +573,6 @@ public final class CalibrationRunner {
             } else {
                 unsafeIntensity = probe
                 if let low = safeIntensity {
-                    if probe / low < Self.phase1MaxRatio { break }
                     probe = sqrt(low * probe)
                 } else if probe <= Self.phase1IntensityLow {
                     return nil
@@ -572,16 +584,22 @@ public final class CalibrationRunner {
 
         guard let safeIntensity else { return nil }
         let requiresCooldown = lastTestedIntensity.map { abs($0 - safeIntensity) > 0.000_001 } ?? false
+        if let safeEquilibrium, safeEquilibrium < Self.phase1UsefulEquilibriumMinimum {
+            log("  No safe probe reached 59–65°C; sweeping with the strongest safe candidate and validating coverage")
+        }
         log("  Selected safe intensity: \(String(format: "%.5f", safeIntensity))")
         return IntensitySelection(intensity: safeIntensity, requiresCooldown: requiresCooldown)
     }
 
     private func logIntensityResult(_ result: IntensityCheckResult, intensity: Float, attempt: Int) {
+        let verdict = result.isUseful
+            ? "✓ useful and safe"
+            : result.isSafe ? "△ safe but underpowered" : "✗ too hot"
         log("  Step \(attempt): intensity \(String(format: "%.5f", intensity)) → " +
             "max \(String(format: "%.1f", result.maxTemp))°C, " +
             "est. equil \(String(format: "%.1f", result.estimatedEquilTemp))°C, " +
             "slope \(String(format: "%+.3f", result.slope))°C/s, " +
-            "\(result.isSafe ? "✓ safe" : "✗ too hot") (\(Int(result.duration))s)")
+            "\(verdict) (\(Int(result.duration))s)")
     }
 
     /// Equilibrium check: observe temperature at a given intensity and 100% fans.
@@ -997,6 +1015,14 @@ public final class CalibrationRunner {
             throw CalibrationError.insufficientData(reason: "Only \(rawData.count) fan levels produced converged data; at least 3 are required.\(unstable)")
         }
 
+        if let coverageError = Self.temperatureCoverageError(rawData: rawData) {
+            log("")
+            log("CALIBRATION FAILED: \(coverageError)")
+            log("The workload was too weak to measure the Smart control range.")
+            log("No calibration data was saved. Rerun with --rediscover-intensity.")
+            throw CalibrationError.insufficientData(reason: coverageError)
+        }
+
         let measurements = Self.buildControlCurve(rawData: rawData, minPct: minPct)
 
         // Validate we got something useful
@@ -1105,7 +1131,7 @@ public final class CalibrationRunner {
     /// Control curve: (targetTemp, holdingRPMPercent) — higher temp = higher fan (for Smart).
     /// Formula: fan_control(T) = (1.0 + minPct) - F_equil(T)
     static func buildControlCurve(rawData: [(fanPct: Float, equilTemp: Float)], minPct: Float) -> [CalibrationData.Measurement] {
-        guard rawData.count >= 2 else { return [] }
+        guard rawData.count >= 2, temperatureCoverageError(rawData: rawData) == nil else { return [] }
 
         // Sort raw data by equilibrium temp ascending
         let sorted = rawData.sorted { $0.equilTemp < $1.equilTemp }
@@ -1134,6 +1160,21 @@ public final class CalibrationRunner {
         }
 
         return measurements
+    }
+
+    /// A fitted curve must include measured behavior through 80°C. The 85°C
+    /// point remains the hard maximum-fan anchor, but extrapolating every target
+    /// from a sweep that stayed below the control range only produces an
+    /// all-maximum curve with no useful machine-specific information.
+    static func temperatureCoverageError(rawData: [(fanPct: Float, equilTemp: Float)]) -> String? {
+        guard let maximum = rawData.map(\.equilTemp).max() else {
+            return "No equilibrium temperatures were measured"
+        }
+        let requiredMaximum = controlCurveTemps.dropLast().last ?? 80
+        guard maximum >= requiredMaximum else {
+            return "Sweep reached only \(String(format: "%.1f", maximum))°C; at least \(Int(requiredMaximum))°C is required"
+        }
+        return nil
     }
 
     /// Interpolate the equilibrium fan speed for a given temperature from raw data.

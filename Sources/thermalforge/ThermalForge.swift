@@ -301,6 +301,9 @@ struct Calibrate: ParsableCommand {
     @Option(name: .long, help: "Reuse a known-safe workload intensity and skip Phase 1 (0.001-0.5)")
     var intensity: Float?
 
+    @Flag(name: .long, help: "Ignore a saved workload intensity and run Phase 1 again")
+    var rediscoverIntensity: Bool = false
+
     @Flag(name: .long, help: "Clear calibration data and start fresh")
     var reset: Bool = false
 
@@ -335,6 +338,9 @@ struct Calibrate: ParsableCommand {
         if let intensity, !(0.001 ... 0.5).contains(intensity) {
             throw ValidationError("Intensity must be between 0.001 and 0.5")
         }
+        if intensity != nil && rediscoverIntensity {
+            throw ValidationError("Use either --intensity or --rediscover-intensity, not both")
+        }
 
         // Prevent downgrade
         if CalibrationRunner.wouldDowngrade(mode: calMode) {
@@ -365,6 +371,8 @@ struct Calibrate: ParsableCommand {
         let existingCalibration = CalibrationData.load()
         let reusableIntensity: Float?
         if intensity == nil,
+           !rediscoverIntensity,
+           existingCalibration?.isValid == true,
            existingCalibration?.stressType == calStress.rawValue,
            let previous = existingCalibration?.workloadIntensity,
            (0.001 ... 0.5).contains(previous),
@@ -385,6 +393,8 @@ struct Calibrate: ParsableCommand {
         if let selectedIntensity {
             let source = intensity == nil ? "saved calibration" : "command line"
             print("Workload: \(String(format: "%.5f", selectedIntensity)) (reused from \(source); Phase 1 skipped)")
+        } else if rediscoverIntensity {
+            print("Workload: rediscovering intensity (saved value ignored)")
         }
         print("")
         print("This will stress your \(calStress == .combined ? "CPU and GPU" : calStress == .cpu ? "CPU" : "GPU") and measure thermal response at 5 fan speed levels.")

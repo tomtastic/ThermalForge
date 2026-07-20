@@ -90,6 +90,38 @@ struct CalibrationConvergenceTests {
         #expect(abs(higher.fractionalDutyCycle - 0.6) < 0.0001)
     }
 
+    @Test("All-maximum calibration curves are rejected")
+    func allMaximumCurveIsInvalid() {
+        let calibration = CalibrationData(
+            machine: "TestMac",
+            fans: 2,
+            maxRPM: 7800,
+            minRPM: 2300,
+            calibratedAt: "2026-07-20T00:00:00Z",
+            mode: "optimized",
+            measurements: [60, 65, 70, 75, 80, 85].map {
+                .init(targetTemp: Float($0), holdingRPMPercent: 1)
+            }
+        )
+
+        #expect(!calibration.isValid)
+        #expect(calibration.validationError?.contains("maximum fan speed") == true)
+    }
+
+    @Test("A sweep below the Smart control range is rejected")
+    func insufficientTemperatureCoverageIsRejected() {
+        let rawData: [(fanPct: Float, equilTemp: Float)] = [
+            (1.0, 50.8),
+            (0.8, 51.6),
+            (0.6, 52.7),
+            (0.45, 54.4),
+            (0.29, 58.1),
+        ]
+
+        #expect(CalibrationRunner.temperatureCoverageError(rawData: rawData) != nil)
+        #expect(CalibrationRunner.buildControlCurve(rawData: rawData, minPct: 0.29).isEmpty)
+    }
+
     @Test("Calibration selects temperatures that match the stress source")
     func stressSpecificTemperatureSelection() {
         let temperatures: [String: Float] = [
