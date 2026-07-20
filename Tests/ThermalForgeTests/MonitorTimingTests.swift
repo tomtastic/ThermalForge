@@ -2,6 +2,12 @@ import Testing
 
 @testable import ThermalForgeCore
 
+private struct UnusedSensorProvider: SensorProvider {
+    func status() throws -> ThermalStatus {
+        ThermalStatus(fans: [], temperatures: [:])
+    }
+}
+
 @Suite("Monitor timing")
 struct MonitorTimingTests {
     @Test("Elapsed cadence is due initially and at its deadline")
@@ -31,5 +37,17 @@ struct MonitorTimingTests {
         #expect(history.ratePerSecond == 10)
         history.removeAll()
         #expect(history.ratePerSecond == 0)
+    }
+
+    @Test("Synchronous stop drains queued monitor work")
+    func synchronousStopDrainsQueue() throws {
+        let initial = try #require(FanProfile.builtIn.first { $0.id == "silent" })
+        let replacement = try #require(FanProfile.builtIn.first { $0.id == "performance" })
+        let monitor = ThermalMonitor(sensorProvider: UnusedSensorProvider(), profile: initial)
+
+        monitor.switchProfile(replacement)
+        monitor.stopAndWait()
+
+        #expect(monitor.activeProfile.id == replacement.id)
     }
 }

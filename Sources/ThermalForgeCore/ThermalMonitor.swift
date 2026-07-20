@@ -287,6 +287,13 @@ public final class ThermalMonitor {
         timer = nil
     }
 
+    /// Stop polling and wait for any monitor callback already queued to finish.
+    /// Callers can safely perform final fan cleanup after this returns.
+    public func stopAndWait() {
+        stop()
+        queue.sync {}
+    }
+
     /// (Re)schedule the repeating timer. Leeway lets the OS coalesce wakeups —
     /// a big idle-CPU win for a low-frequency poll; ±20% is invisible to fans.
     private func scheduleTimer(_ timer: DispatchSourceTimer, interval: Float) {

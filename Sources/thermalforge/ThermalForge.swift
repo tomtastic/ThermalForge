@@ -265,19 +265,32 @@ struct Watch: ParsableCommand {
             }
         }
 
-        // Set up signal handler for clean shutdown
-        signal(SIGINT) { _ in
-            print("\nResetting fans to auto...")
-            if let resetFC = try? FanControl() {
-                try? resetFC.resetAuto()
+        let cancellationToken = CancellationToken()
+        let interruptSource = InterruptSignalSource {
+            if cancellationToken.cancel() {
+                print("\nStopping monitor...")
+                DispatchQueue.main.async {
+                    CFRunLoopStop(CFRunLoopGetMain())
+                }
             }
-            Darwin.exit(0)
         }
+        defer { interruptSource.cancel() }
 
         monitor.start(interval: interval)
 
-        // Keep the process alive
-        RunLoop.main.run()
+        while !cancellationToken.isCancelled {
+            RunLoop.main.run(mode: .default, before: .distantFuture)
+        }
+
+        monitor.stopAndWait()
+        print("Resetting fans to auto...")
+        do {
+            try fc.resetAuto()
+            print("Fans reset to Apple defaults.")
+        } catch {
+            print("Warning: unable to reset fans: \(error)")
+        }
+        throw ExitCode(130)
     }
 }
 
