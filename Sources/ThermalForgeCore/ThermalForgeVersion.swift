@@ -1,5 +1,5 @@
 import Foundation
 
 public enum ThermalForgeVersion {
-    public static let current = "0.8.5"
+    public static let current = "0.9.0"
 }

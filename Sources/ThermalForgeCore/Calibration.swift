@@ -20,16 +20,36 @@ public struct CalibrationData: Codable {
     public let minRPM: Int
     public let calibratedAt: String
     public let mode: String?
+    /// Stress source and workload selected for the equilibrium sweep. Optional
+    /// for backward compatibility with older calibration files.
+    public let stressType: String?
+    public let workloadIntensity: Float?
+    public let ambientTemperature: Float?
     public let lidClosed: Bool  // true = clamshell mode, false = lid open
     public let measurements: [Measurement]
 
-    public init(machine: String, fans: Int, maxRPM: Int, minRPM: Int, calibratedAt: String, mode: String? = nil, lidClosed: Bool = false, measurements: [Measurement]) {
+    public init(
+        machine: String,
+        fans: Int,
+        maxRPM: Int,
+        minRPM: Int,
+        calibratedAt: String,
+        mode: String? = nil,
+        stressType: String? = nil,
+        workloadIntensity: Float? = nil,
+        ambientTemperature: Float? = nil,
+        lidClosed: Bool = false,
+        measurements: [Measurement]
+    ) {
         self.machine = machine
         self.fans = fans
         self.maxRPM = maxRPM
         self.minRPM = minRPM
         self.calibratedAt = calibratedAt
         self.mode = mode
+        self.stressType = stressType
+        self.workloadIntensity = workloadIntensity
+        self.ambientTemperature = ambientTemperature
         self.lidClosed = lidClosed
         self.measurements = measurements
     }
@@ -165,7 +185,9 @@ extension CalibrationData {
             .appendingPathComponent("calibration_\(lidClosed ? "lid_closed" : "lid_open").json")
     }
 
-    public func save() throws {
+    /// Save calibration and return every path written.
+    @discardableResult
+    public func save() throws -> [URL] {
         let path = Self.filePath(forLidClosed: lidClosed)
         let dir = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -176,21 +198,25 @@ extension CalibrationData {
 
         // If running as root (daemon/CLI), also copy to the console user's
         // home directory so the app (running as the user) can find it.
-        if geteuid() == 0 {
-            try copyToConsoleUser(data: data, lidClosed: lidClosed)
+        var savedPaths = [path]
+        if geteuid() == 0,
+           let userPath = try copyToConsoleUser(data: data, lidClosed: lidClosed)
+        {
+            savedPaths.append(userPath)
         }
+        return savedPaths
     }
 
     /// Copy calibration JSON to the console user's home directory.
     /// When calibration runs as root (via sudo or the daemon), the app
     /// (running as the logged-in user) can't read root's home directory.
-    private func copyToConsoleUser(data: Data, lidClosed: Bool) throws {
+    private func copyToConsoleUser(data: Data, lidClosed: Bool) throws -> URL? {
         // Get console user UID from /dev/console
         var st = stat()
-        guard stat("/dev/console", &st) == 0, st.st_uid != 0 else { return }
+        guard stat("/dev/console", &st) == 0, st.st_uid != 0 else { return nil }
 
         // Get home directory from passwd
-        guard let pw = getpwuid(st.st_uid), let home = String(validatingUTF8: pw.pointee.pw_dir) else { return }
+        guard let pw = getpwuid(st.st_uid), let home = String(validatingUTF8: pw.pointee.pw_dir) else { return nil }
 
         let userPath = URL(fileURLWithPath: home)
             .appendingPathComponent("Library/Application Support/ThermalForge/")
@@ -198,7 +224,14 @@ extension CalibrationData {
         let userDir = userPath.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: userDir, withIntermediateDirectories: true)
         try data.write(to: userPath)
+        // Files created by a sudo calibration otherwise remain root-owned in
+        // the user's config directory. Give both the file and any newly-created
+        // directory back to the active console user.
+        _ = chown(userDir.path, st.st_uid, pw.pointee.pw_gid)
+        _ = chown(userPath.path, st.st_uid, pw.pointee.pw_gid)
+        _ = chmod(userPath.path, 0o644)
         TFLogger.shared.info("Copied calibration to console user: \(userPath.path)")
+        return userPath
     }
 
     /// Load calibration data matching the current lid state.
@@ -268,23 +301,20 @@ extension CalibrationData {
 ///   ~20-50 J/K × 0.3-0.8 K/W = 60-180s for laptop heatsink assemblies
 /// - 3 time constants = 95% of steady state, 5 time constants = 99.3%
 public enum CalibrationMode: String, CaseIterable {
-    /// 5 fan levels × up to 2.5 min each + intensity finding + cooldowns
-    /// 60-second stabilization window (~80% accuracy)
+    /// Fastest convergence tolerances; still requires 60 seconds of evidence.
     case quick
 
-    /// 5 fan levels × up to 4 min each + overhead
-    /// 90-second window (near one time constant, ~90% accuracy)
+    /// Moderate convergence tolerances and a longer timeout.
     case standard
 
-    /// 5 fan levels × up to 6 min each + overhead
-    /// 120-second window (full time constant, ~95% accuracy)
+    /// Tightest convergence tolerances and the longest timeout.
     case optimized
 
     public var description: String {
         switch self {
-        case .quick: return "Quick (up to 17 min)"
-        case .standard: return "Standard (up to 25 min)"
-        case .optimized: return "Optimized (up to 35 min)"
+        case .quick: return "Quick (fast convergence)"
+        case .standard: return "Standard (balanced convergence)"
+        case .optimized: return "Optimized (tight convergence)"
         }
     }
 
@@ -297,17 +327,43 @@ public enum CalibrationMode: String, CaseIterable {
         }
     }
 
-    /// Number of readings in stabilization window (2s per reading)
-    /// Based on thermal time constant research (90-120s):
-    /// - Quick: 60s ≈ ~80% of steady state
-    /// - Standard: 90s ≈ near one time constant
-    /// - Optimized: 120s ≈ one full time constant, ~95% accuracy
+    /// All modes begin evaluating after 60 seconds. Accuracy comes from the
+    /// convergence tolerances below rather than an arbitrary longer minimum.
     public var stabilizationWindowSize: Int {
+        30 // 60 seconds at one reading every 2 seconds
+    }
+
+    /// Maximum accepted temperature trend over the stabilization window.
+    var maximumSlopePerSecond: Float {
         switch self {
-        case .quick: return 30      // 60 seconds
-        case .standard: return 45   // 90 seconds
-        case .optimized: return 60  // 120 seconds
+        case .quick: return 0.008
+        case .standard: return 0.005
+        case .optimized: return 0.003
         }
+    }
+
+    /// Maximum difference between the means of the first and second half.
+    var maximumHalfMeanDelta: Float {
+        switch self {
+        case .quick: return 0.9
+        case .standard: return 0.6
+        case .optimized: return 0.4
+        }
+    }
+
+    /// Maximum 95% confidence radius of the detrended mean.
+    var maximumConfidenceRadius: Float {
+        switch self {
+        case .quick: return 0.90
+        case .standard: return 0.65
+        case .optimized: return 0.45
+        }
+    }
+
+    func acceptsStability(_ metrics: CalibrationStabilityMetrics) -> Bool {
+        abs(metrics.slopePerSecond) <= maximumSlopePerSecond
+            && metrics.halfMeanDelta <= maximumHalfMeanDelta
+            && metrics.confidenceRadius95 <= maximumConfidenceRadius
     }
 
     /// Maximum seconds to wait at each fan level for stabilization
@@ -351,12 +407,33 @@ public enum CalibrationStressType: String, CaseIterable {
     }
 }
 
+struct CalibrationTemperatureSample: Equatable {
+    let selected: Float
+    let cpu: Float
+    let gpu: Float
+}
+
+struct CalibrationStabilityMetrics: Equatable {
+    let mean: Float
+    let slopePerSecond: Float
+    let rawStandardDeviation: Float
+    let residualStandardDeviation: Float
+    let halfMeanDelta: Float
+    let confidenceRadius95: Float
+}
+
+struct CalibrationCPUStressPlan: Equatable {
+    let fullThreads: Int
+    let fractionalDutyCycle: Float
+}
+
 // MARK: - Calibration Runner
 
 public final class CalibrationRunner {
     private let fanControl: FanControl
     private let mode: CalibrationMode
     private let stressType: CalibrationStressType
+    private let workloadIntensityOverride: Float?
     private var stressThreads: [Thread] = []
     private let stressLock = NSLock()
     private var _stressRunning = false
@@ -374,10 +451,16 @@ public final class CalibrationRunner {
     // CSV log handle — written to in real time during calibration
     private var csvHandle: FileHandle?
 
-    public init(fanControl: FanControl, mode: CalibrationMode = .standard, stressType: CalibrationStressType = .combined) {
+    public init(
+        fanControl: FanControl,
+        mode: CalibrationMode = .standard,
+        stressType: CalibrationStressType = .combined,
+        workloadIntensity: Float? = nil
+    ) {
         self.fanControl = fanControl
         self.mode = mode
         self.stressType = stressType
+        self.workloadIntensityOverride = workloadIntensity
     }
 
     /// Check if running this mode would downgrade existing calibration
@@ -393,11 +476,13 @@ public final class CalibrationRunner {
     /// it finds the maximum stress that still produces a stable equilibrium below
     /// `targetEquilTemp` at 100% fans — naturally adapting to the environment.
     static let targetEquilTemp: Float = 65.0 // target equilibrium at 100% fans during Phase 1
-    static let phase1MaxIterations: Int = 8 // 8 steps covers 500x range with ratio < 2.0
+    static let phase1MaxIterations: Int = 8
+    static let phase1InitialIntensity: Float = 0.05
     static let phase1CheckDuration: TimeInterval = 120 // seconds to observe each candidate
-    static let phase1IntensityLow: Float = 0.001 // GPU-only below 0.01 — finer granularity
+    static let phase1MinimumDecisionDuration: TimeInterval = 60
+    static let phase1IntensityLow: Float = 0.001
     static let phase1IntensityHigh: Float = 0.50
-    static let phase1MaxRatio: Float = 2.0 // stop when high/low < 2.0 (ratio-based convergence)
+    static let phase1MaxRatio: Float = 1.5
     /// Apple Silicon MacBook cooling time constant at max fans (60-90s per research).
     /// Used to estimate equilibrium temperature from finite observations.
     /// After time t, system reaches (1 - exp(-t/τ)) of equilibrium delta.
@@ -409,24 +494,32 @@ public final class CalibrationRunner {
         let estimatedEquilTemp: Float // estimated equilibrium from observation + time constant
         let slope: Float             // °C/s over last third of observation
         let hitCeiling: Bool
+        let duration: TimeInterval
+
+        var isSafe: Bool {
+            !hitCeiling && estimatedEquilTemp < CalibrationRunner.targetEquilTemp
+        }
     }
 
-    /// Find the maximum stress intensity that still produces a safe equilibrium
-    /// at 100% fans.
+    private struct IntensitySelection {
+        let intensity: Float
+        /// True when the final trial was a hotter rejected probe rather than
+        /// the selected workload, so its residual heat must not contaminate the
+        /// first fan-level measurement.
+        let requiresCooldown: Bool
+    }
+
+    /// Find a stress intensity that produces a useful, safe equilibrium at
+    /// 100% fans.
     ///
-    /// Instead of targeting a fixed heating rate (which varies with ambient),
-    /// this finds the intensity that produces an equilibrium below `targetEquilTemp`
-    /// (~65°C) at 100% fans. This naturally adapts:
-    /// - High ambient (35°C): returns ~0.005-0.015 (low stress)
-    /// - Low ambient (22°C): returns ~0.03-0.08 (moderate stress)
-    ///
-    /// Returns nil if even minimum stress is too hot for the environment.
-    private func findMaxSafeIntensity(maxRPM: Float) -> Float? {
+    /// Start at 5%, move geometrically toward a safe bracket, then refine only
+    /// when necessary. This avoids always running both the 0.1% and 50% probes.
+    private func findSafeSweepIntensity(maxRPM: Float) -> IntensitySelection? {
         log("Finding max safe stress intensity (equilibrium < \(Int(Self.targetEquilTemp))°C at 100% fans)...")
 
-        // Establish a stable baseline temperature
-        waitForCooldown(below: 45)
-        let baselineTemp = peakCPUTemp()
+        // Phase 0 immediately before this call established the baseline. Do
+        // not repeat the same up-to-two-minute cooldown here.
+        let baselineTemp = calibrationTemperature()?.selected ?? 0
         guard baselineTemp > 0 else {
             log("  Can't read temperature")
             return nil
@@ -437,56 +530,58 @@ public final class CalibrationRunner {
         // this is the worst-case cooling scenario and provides fastest cooldown
         try? fanControl.setAllFans(rpm: maxRPM)
 
-        // Feasibility check: can minimum intensity stabilize below target?
-        log("  Checking minimum intensity (\(Self.phase1IntensityLow))...")
-        let minCheck = checkIntensity(at: Self.phase1IntensityLow, baselineTemp: baselineTemp)
-        if minCheck.hitCeiling || minCheck.estimatedEquilTemp >= Self.targetEquilTemp + 10 {
-            log("  Minimum stress too hot (est. equil \(String(format: "%.1f", minCheck.estimatedEquilTemp))°C) — calibration impossible")
-            return nil
-        }
-        log("  Minimum: max \(String(format: "%.1f", minCheck.maxTemp))°C, est. equil \(String(format: "%.1f", minCheck.estimatedEquilTemp))°C, slope \(String(format: "%.3f", minCheck.slope))°C/s")
+        var probe = Self.phase1InitialIntensity
+        var safeIntensity: Float?
+        var unsafeIntensity: Float?
+        var lastTestedIntensity: Float?
 
-        // Check if max intensity is safe (cool machine / excellent cooling)
-        log("  Checking maximum intensity (\(Self.phase1IntensityHigh))...")
-        let maxCheck = checkIntensity(at: Self.phase1IntensityHigh, baselineTemp: baselineTemp)
-        if !maxCheck.hitCeiling && maxCheck.estimatedEquilTemp < Self.targetEquilTemp - 5 {
-            log("  Maximum safe: est. equil \(String(format: "%.1f", maxCheck.estimatedEquilTemp))°C — using \(Self.phase1IntensityHigh)")
-            return Self.phase1IntensityHigh
-        }
-        log("  Maximum too hot: max \(String(format: "%.1f", maxCheck.maxTemp))°C, est. equil \(String(format: "%.1f", maxCheck.estimatedEquilTemp))°C")
+        for attempt in 1...Self.phase1MaxIterations {
+            let result = checkIntensity(at: probe, baselineTemp: baselineTemp)
+            lastTestedIntensity = probe
+            logIntensityResult(result, intensity: probe, attempt: attempt)
 
-        // Logarithmic bisection between known-safe (min) and known-unsafe (max)
-        var low: Float = Self.phase1IntensityLow
-        var high: Float = Self.phase1IntensityHigh
+            if result.isSafe {
+                safeIntensity = probe
 
-        for iteration in 0..<Self.phase1MaxIterations {
-            let ratio = high / low
-            if ratio < Self.phase1MaxRatio {
-                log("  Bracket ratio converged (\(String(format: "%.1f", ratio))) — stopping")
-                break
-            }
+                // The useful sweep target is roughly 59–65°C at maximum fans. Do not
+                // spend more trials finding a mathematically maximal workload.
+                if result.estimatedEquilTemp >= Self.targetEquilTemp - 6 {
+                    break
+                }
 
-            let mid = sqrt(low * high)  // logarithmic midpoint
-            let result = checkIntensity(at: mid, baselineTemp: baselineTemp)
-
-            let isSafe = !result.hitCeiling &&
-                         result.estimatedEquilTemp < Self.targetEquilTemp
-
-            if isSafe {
-                low = mid  // safe, try higher
+                if let high = unsafeIntensity {
+                    if high / probe < Self.phase1MaxRatio { break }
+                    probe = sqrt(probe * high)
+                } else if probe >= Self.phase1IntensityHigh {
+                    break
+                } else {
+                    probe = min(probe * 2, Self.phase1IntensityHigh)
+                }
             } else {
-                high = mid // too hot, try lower
+                unsafeIntensity = probe
+                if let low = safeIntensity {
+                    if probe / low < Self.phase1MaxRatio { break }
+                    probe = sqrt(low * probe)
+                } else if probe <= Self.phase1IntensityLow {
+                    return nil
+                } else {
+                    probe = max(probe / 2, Self.phase1IntensityLow)
+                }
             }
-
-            log("  Step \(iteration + 1): intensity \(String(format: "%.3f", mid)) → " +
-                "max \(String(format: "%.1f", result.maxTemp))°C, " +
-                "est. equil \(String(format: "%.1f", result.estimatedEquilTemp))°C, " +
-                "\(isSafe ? "✓ safe" : "✗ too hot") " +
-                "→ bracket [\(String(format: "%.3f", low)), \(String(format: "%.3f", high))]")
         }
 
-        log("  Max safe intensity: \(String(format: "%.3f", low))")
-        return low  // last known safe intensity
+        guard let safeIntensity else { return nil }
+        let requiresCooldown = lastTestedIntensity.map { abs($0 - safeIntensity) > 0.000_001 } ?? false
+        log("  Selected safe intensity: \(String(format: "%.5f", safeIntensity))")
+        return IntensitySelection(intensity: safeIntensity, requiresCooldown: requiresCooldown)
+    }
+
+    private func logIntensityResult(_ result: IntensityCheckResult, intensity: Float, attempt: Int) {
+        log("  Step \(attempt): intensity \(String(format: "%.5f", intensity)) → " +
+            "max \(String(format: "%.1f", result.maxTemp))°C, " +
+            "est. equil \(String(format: "%.1f", result.estimatedEquilTemp))°C, " +
+            "slope \(String(format: "%+.3f", result.slope))°C/s, " +
+            "\(result.isSafe ? "✓ safe" : "✗ too hot") (\(Int(result.duration))s)")
     }
 
     /// Equilibrium check: observe temperature at a given intensity and 100% fans.
@@ -503,27 +598,19 @@ public final class CalibrationRunner {
         // Cooldown to baseline (fans already at 100% from caller)
         waitForTempReturn(to: baselineTemp, tolerance: 3.0)
 
-        let actualStartTemp = peakCPUTemp()
+        let actualStartTemp = calibrationTemperature()?.selected ?? 0
 
-        // Log stress mode so we know what's active
-        let stressModeLabel: String
-        if intensity < 0.01 {
-            stressModeLabel = "GPU-only"
-        } else {
-            stressModeLabel = stressType == .combined ? "CPU+GPU" : stressType == .cpu ? "CPU" : "GPU"
-        }
-        log("  → intensity \(String(format: "%.3f", intensity)) (\(stressModeLabel))...")
+        log("  → intensity \(String(format: "%.5f", intensity)) (\(stressType.description))...")
 
         startStress(intensity: intensity)
 
         // Observe, sampling every 2s
-        let samples = Int(Self.phase1CheckDuration / 2)
         var readings: [(time: Double, temp: Float)] = []
         let startUptime = DispatchTime.now().uptimeNanoseconds
 
-        for _ in 0..<samples {
+        while true {
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startUptime) / 1_000_000_000.0
-            let temp = peakCPUTemp()
+            let temp = calibrationTemperature()?.selected ?? 0
             readings.append((elapsed, temp))
 
             // Early exit: ceiling hit
@@ -533,15 +620,35 @@ public final class CalibrationRunner {
                     maxTemp: temp,
                     estimatedEquilTemp: temp,
                     slope: .infinity,
-                    hitCeiling: true
+                    hitCeiling: true,
+                    duration: elapsed
                 )
+            }
+
+            let result = intensityResult(readings: readings, actualStartTemp: actualStartTemp)
+            if elapsed >= Self.phase1MinimumDecisionDuration {
+                let clearlyUnsafe = result.estimatedEquilTemp >= Self.targetEquilTemp + 5
+                let clearlySafe = result.estimatedEquilTemp <= Self.targetEquilTemp - 3
+                    && abs(result.slope) <= 0.01
+                if clearlyUnsafe || clearlySafe {
+                    stopStress()
+                    return result
+                }
+            }
+
+            if elapsed >= Self.phase1CheckDuration {
+                stopStress()
+                return result
             }
 
             Thread.sleep(forTimeInterval: 2)
         }
+    }
 
-        stopStress()
-
+    private func intensityResult(
+        readings: [(time: Double, temp: Float)],
+        actualStartTemp: Float
+    ) -> IntensityCheckResult {
         // Compute slope over last third of readings
         let tailStart = readings.count * 2 / 3
         let tail = Array(readings.suffix(from: tailStart))
@@ -572,7 +679,8 @@ public final class CalibrationRunner {
             maxTemp: readings.map { $0.temp }.max()!,
             estimatedEquilTemp: estimatedEquilTemp,
             slope: slope,
-            hitCeiling: false
+            hitCeiling: false,
+            duration: readings.last?.time ?? 0
         )
     }
 
@@ -600,14 +708,16 @@ public final class CalibrationRunner {
         let deadline = Date().addingTimeInterval(maxWait)
 
         while Date() < deadline {
-            let temp = peakCPUTemp()
+            let temp = calibrationTemperature()?.selected ?? 0
             guard temp > 0 else { return }
 
-            if abs(temp - target) <= tolerance {
+            // Starting cooler than the original baseline is safe and useful;
+            // do not wait for a max-fan cooldown to warm back up to the target.
+            if temp <= target + tolerance {
                 // Verify stability: 3 quick samples within 0.5°C of each other
                 var stable = true
                 for _ in 0..<3 {
-                    let t = peakCPUTemp()
+                    let t = calibrationTemperature()?.selected ?? 0
                     if abs(t - temp) > 0.5 {
                         stable = false
                         break
@@ -620,15 +730,39 @@ public final class CalibrationRunner {
             }
             Thread.sleep(forTimeInterval: 2)
         }
-        log("  Cooldown timeout: \(String(format: "%.1f", peakCPUTemp()))°C vs target \(String(format: "%.1f", target))°C — proceeding anyway")
+        let finalTemp = calibrationTemperature()?.selected ?? 0
+        log("  Cooldown timeout: \(String(format: "%.1f", finalTemp))°C vs target \(String(format: "%.1f", target))°C — proceeding anyway")
     }
 
-    /// Read peak CPU temperature right now
-    private func peakCPUTemp() -> Float {
-        guard let status = try? fanControl.status() else { return 0 }
-        return status.temperatures
-            .filter { k, _ in k.hasPrefix("TC") || k.hasPrefix("Tp") }
+    /// Select the sensor family that matches the generated workload. Combined
+    /// calibration follows the hotter CPU/GPU family, matching Smart's input.
+    private func calibrationTemperature() -> CalibrationTemperatureSample? {
+        guard let status = try? fanControl.status() else { return nil }
+        return Self.calibrationTemperature(from: status.temperatures, stressType: stressType)
+    }
+
+    static func calibrationTemperature(
+        from temperatures: [String: Float],
+        stressType: CalibrationStressType
+    ) -> CalibrationTemperatureSample? {
+        let cpu = temperatures
+            .filter { key, _ in key.hasPrefix("TC") || key.hasPrefix("Tp") }
             .values.max() ?? 0
+        let gpu = temperatures
+            .filter { key, _ in key.hasPrefix("TG") || key.hasPrefix("Tg") }
+            .values.max() ?? 0
+
+        let selected: Float
+        switch stressType {
+        case .cpu:
+            selected = cpu
+        case .gpu:
+            selected = gpu > 0 ? gpu : cpu
+        case .combined:
+            selected = max(cpu, gpu)
+        }
+        guard selected > 0 else { return nil }
+        return CalibrationTemperatureSample(selected: selected, cpu: cpu, gpu: gpu)
     }
 
     /// Cleanup: always stop stress, reset fans, close CSV on any exit path
@@ -678,7 +812,7 @@ public final class CalibrationRunner {
         log("Stress: \(stressType.description)")
         log("Approach: fan-first with stabilization (set fan speed, wait for equilibrium)")
         log("Fan levels: \(levels.map { "\(Int($0 * 100))%" }.joined(separator: " → "))")
-        log("Stabilization window: \(mode.stabilizationWindowSize * 2)s, max wait: \(mode.maxWaitPerLevel)s/level")
+        log("Stabilization evidence: \(mode.stabilizationWindowSize * 2)s minimum, max wait: \(mode.maxWaitPerLevel)s/level")
 
         // Record ambient temperature
         var ambientTemp: Float = 0
@@ -695,32 +829,44 @@ public final class CalibrationRunner {
         log("Phase 0: Cooling to baseline...")
         waitForCooldown(below: 45)
 
-        // Phase 1: Find max safe stress intensity
-        log("Phase 1: Finding max safe stress intensity...")
-        guard let baselineIntensity = findMaxSafeIntensity(maxRPM: Float(maxRPM)) else {
-            // Even minimum stress is too hot for this environment
-            if ambientTemp > 0 {
-                log("At \(String(format: "%.1f", ambientTemp))°C ambient, even minimum stress at 100% fans")
-                log("exceeded safe temperature. Calibration cannot proceed.")
-            } else {
-                log("Even minimum stress at 100% fans exceeded safe temperature.")
+        let baselineIntensity: Float
+        if let workloadIntensityOverride {
+            baselineIntensity = workloadIntensityOverride
+            log("Phase 1: Using supplied/reused safe workload intensity \(String(format: "%.5f", baselineIntensity))")
+            try fanControl.setMax()
+        } else {
+            // Phase 1: Find max safe stress intensity
+            log("Phase 1: Finding max safe stress intensity...")
+            guard let intensitySelection = findSafeSweepIntensity(maxRPM: Float(maxRPM)) else {
+                // Even minimum stress is too hot for this environment
+                if ambientTemp > 0 {
+                    log("At \(String(format: "%.1f", ambientTemp))°C ambient, even minimum stress at 100% fans")
+                    log("exceeded safe temperature. Calibration cannot proceed.")
+                } else {
+                    log("Even minimum stress at 100% fans exceeded safe temperature.")
+                }
+                log("")
+                log("Options:")
+                log("  1. Wait for ambient temperature to drop below 30°C and retry.")
+                log("  2. Run in a cooler environment (air-conditioned room).")
+                log("  3. Use the default Smart profile (built-in conservative curve).")
+                throw CalibrationError.insufficientData(
+                    reason: "Even minimum stress at 100% fans exceeded safe temperature. " +
+                            "Ambient too high for calibration. Wait for cooler conditions or use default Smart profile."
+                )
             }
-            log("")
-            log("Options:")
-            log("  1. Wait for ambient temperature to drop below 30°C and retry.")
-            log("  2. Run in a cooler environment (air-conditioned room).")
-            log("  3. Use the default Smart profile (built-in conservative curve).")
-            throw CalibrationError.insufficientData(
-                reason: "Even minimum stress at 100% fans exceeded safe temperature. " +
-                        "Ambient too high for calibration. Wait for cooler conditions or use default Smart profile."
-            )
-        }
-        log("Baseline intensity: \(String(format: "%.3f", baselineIntensity))")
+            baselineIntensity = intensitySelection.intensity
+            log("Baseline intensity: \(String(format: "%.5f", baselineIntensity))")
 
-        // Phase 1.5: Cool again after intensity finding
-        stopStress()
-        try fanControl.resetAuto()
-        waitForCooldown(below: 45)
+            if intensitySelection.requiresCooldown {
+                log("Cooling after rejected hotter probe before the sweep...")
+                waitForCooldown(below: 45)
+            } else {
+                // Preserve the useful final safe-probe state instead of resetting
+                // to Apple auto and paying for an unnecessary cooldown/reheat.
+                try fanControl.setMax()
+            }
+        }
 
         // Set up CSV log
         let logDir = CalibrationData.filePath.deletingLastPathComponent()
@@ -731,14 +877,15 @@ public final class CalibrationRunner {
         FileManager.default.createFile(atPath: csvURL.path, contents: nil)
         csvHandle = try FileHandle(forWritingTo: csvURL)
         logPath = csvURL
-        csvWrite("timestamp,fan_pct,actual_temp,fan0_rpm,fan1_rpm,phase")
+        csvWrite("timestamp,fan_pct,selected_temp,cpu_temp,gpu_temp,fan0_rpm,fan1_rpm,phase")
 
         // Phase 2: Fan-level stabilization sweep (high to low)
-        log("Phase 2: Starting fan-level sweep (intensity: \(String(format: "%.3f", baselineIntensity)))...")
+        log("Phase 2: Starting fan-level sweep (intensity: \(String(format: "%.5f", baselineIntensity)))...")
         startStress(intensity: baselineIntensity)
 
         var rawData: [(fanPct: Float, equilTemp: Float)] = []
         var abortLowerLevels = false
+        var unstableFanLevels: [Int] = []
 
         for (_, fanPct) in levels.enumerated() {
             guard !abortLowerLevels else { break }
@@ -749,18 +896,26 @@ public final class CalibrationRunner {
             try fanControl.setAllFans(rpm: targetRPM)
 
             var readings: [Float] = []
+            let levelStart = DispatchTime.now().uptimeNanoseconds
             let deadline = Date().addingTimeInterval(TimeInterval(mode.maxWaitPerLevel))
             var stabilized = false
 
             while Date() < deadline {
-                let temp = peakCPUTemp()
+                let elapsedSeconds = Int(
+                    (DispatchTime.now().uptimeNanoseconds - levelStart) / 1_000_000_000
+                )
+                guard let temperature = calibrationTemperature() else {
+                    Thread.sleep(forTimeInterval: 2)
+                    continue
+                }
+                let temp = temperature.selected
                 readings.append(temp)
 
                 // CSV logging
                 let fan0rpm = (try? fanControl.fanInfo(0))?.actualRPM ?? 0
                 let fan1rpm = fanCount > 1 ? ((try? fanControl.fanInfo(1))?.actualRPM ?? 0) : 0
                 let ts = isoFormatter.string(from: Date())
-                csvWrite("\(ts),\(String(format: "%.2f", fanPct)),\(String(format: "%.1f", temp)),\(Int(fan0rpm)),\(Int(fan1rpm)),stabilizing")
+                csvWrite("\(ts),\(String(format: "%.2f", fanPct)),\(String(format: "%.1f", temp)),\(String(format: "%.1f", temperature.cpu)),\(String(format: "%.1f", temperature.gpu)),\(Int(fan0rpm)),\(Int(fan1rpm)),stabilizing")
 
                 // Safety: abort if too hot
                 if temp >= Self.safetyTemp {
@@ -781,25 +936,36 @@ public final class CalibrationRunner {
                 }
 
                 // Check stabilization
-                if isStabilized(readings: readings) {
-                    let window = readings.suffix(mode.stabilizationWindowSize)
-                    let equilTemp = window.reduce(0, +) / Float(window.count)
-                    log("[\(Int(fanPct * 100))%] Stabilized at \(String(format: "%.1f", equilTemp))°C (\(readings.count * 2)s)")
+                if let metrics = stabilityMetrics(readings: readings), isStabilized(metrics: metrics) {
+                    let equilTemp = metrics.mean
+                    log("[\(Int(fanPct * 100))%] Stabilized at \(String(format: "%.1f", equilTemp))°C (\(elapsedSeconds)s)")
+                    log("  \(formatStability(metrics))")
                     rawData.append((fanPct: fanPct, equilTemp: equilTemp))
                     stabilized = true
                     break
                 }
 
+                if readings.count >= mode.stabilizationWindowSize,
+                   readings.count % 15 == 0,
+                   let metrics = stabilityMetrics(readings: readings)
+                {
+                    log("[\(Int(fanPct * 100))%] Still converging (\(elapsedSeconds)s): \(formatStability(metrics))")
+                }
+
                 Thread.sleep(forTimeInterval: 2)
             }
 
-            // Timeout: use best estimate
+            // Never turn an arbitrary timeout average into calibration data.
             if !stabilized && !abortLowerLevels {
-                let windowSize = min(readings.count, mode.stabilizationWindowSize)
-                let window = readings.suffix(windowSize)
-                let equilTemp = window.isEmpty ? peakCPUTemp() : window.reduce(0, +) / Float(window.count)
-                log("[\(Int(fanPct * 100))%] Timeout — best estimate: \(String(format: "%.1f", equilTemp))°C (\(readings.count * 2)s)")
-                rawData.append((fanPct: fanPct, equilTemp: equilTemp))
+                unstableFanLevels.append(Int(fanPct * 100))
+                let elapsedSeconds = Int(
+                    (DispatchTime.now().uptimeNanoseconds - levelStart) / 1_000_000_000
+                )
+                if let metrics = stabilityMetrics(readings: readings) {
+                    log("[\(Int(fanPct * 100))%] Timeout — excluded unstable level (\(elapsedSeconds)s): \(formatStability(metrics))")
+                } else {
+                    log("[\(Int(fanPct * 100))%] Timeout — excluded level with insufficient readings")
+                }
             }
         }
 
@@ -808,10 +974,10 @@ public final class CalibrationRunner {
         // Phase 3: Build control curve from raw equilibrium data
         log("Phase 3: Building control curve...")
 
-        // Check if we have enough data — need at least 2 distinct equilibrium points
-        if rawData.count < 2 {
+        // Three converged points are the minimum for a useful fitted curve.
+        if rawData.count < 3 {
             log("")
-            log("CALIBRATION FAILED: Insufficient data (\(rawData.count) point(s) needed 2+).")
+            log("CALIBRATION FAILED: Insufficient converged data (\(rawData.count) point(s), need 3+).")
             if rawData.first?.equilTemp ?? 0 >= Self.ceilingTemp {
                 log("Even 100% fans + minimum stress hit the \(Int(Self.ceilingTemp))°C ceiling.")
                 if ambientTemp > 0 {
@@ -827,10 +993,11 @@ public final class CalibrationRunner {
                 log("  3. Use the default Smart profile (built-in conservative curve).")
             }
             // Don't save — empty measurements would break the Smart profile.
-            throw CalibrationError.insufficientData(reason: "Only \(rawData.count) fan level(s) produced data before hitting \(Int(Self.ceilingTemp))°C ceiling. High ambient temperature prevents calibration.")
+            let unstable = unstableFanLevels.isEmpty ? "" : " Unstable levels: \(unstableFanLevels.map { "\($0)%" }.joined(separator: ", "))."
+            throw CalibrationError.insufficientData(reason: "Only \(rawData.count) fan levels produced converged data; at least 3 are required.\(unstable)")
         }
 
-        let measurements = buildControlCurve(rawData: rawData, minPct: minPct)
+        let measurements = Self.buildControlCurve(rawData: rawData, minPct: minPct)
 
         // Validate we got something useful
         if measurements.isEmpty {
@@ -852,24 +1019,31 @@ public final class CalibrationRunner {
             minRPM: Int(minRPM),
             calibratedAt: isoFormatter.string(from: Date()),
             mode: mode.rawValue,
+            stressType: stressType.rawValue,
+            workloadIntensity: baselineIntensity,
+            ambientTemperature: ambientTemp > 0 ? ambientTemp : nil,
             lidClosed: clamshell,
             measurements: measurements
         )
     }
 
-    /// Check if temperature readings have stabilized.
-    /// Stable = stdev < 0.5°C AND slope < 0.05°C/sec over the window.
-    private func isStabilized(readings: [Float]) -> Bool {
-        guard readings.count >= mode.stabilizationWindowSize else { return false }
-        let window = Array(readings.suffix(mode.stabilizationWindowSize))
+    /// Measure convergence over the most recent 60 seconds. Raw standard
+    /// deviation is diagnostic only: it mixes real drift with sensor noise and
+    /// previously caused flat-but-noisy levels to wait forever. Acceptance uses
+    /// trend, half-window movement, and uncertainty after detrending.
+    static func stabilityMetrics(
+        readings: [Float],
+        windowSize: Int = 30,
+        sampleInterval: Float = 2
+    ) -> CalibrationStabilityMetrics? {
+        guard readings.count >= windowSize, windowSize >= 4 else { return nil }
+        let window = Array(readings.suffix(windowSize))
         let n = Float(window.count)
 
-        // Standard deviation
         let mean = window.reduce(0, +) / n
         let variance = window.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / n
-        let stdev = sqrt(variance)
+        let rawStandardDeviation = sqrt(variance)
 
-        // Linear regression slope (least squares)
         let xMean = (n - 1) / 2
         var numerator: Float = 0
         var denominator: Float = 0
@@ -879,23 +1053,65 @@ public final class CalibrationRunner {
             numerator += x * y
             denominator += x * x
         }
-        let slope = denominator > 0 ? numerator / denominator : 0
-        let slopePerSecond = slope / 2.0 // readings are 2 seconds apart
+        let slopePerSample = denominator > 0 ? numerator / denominator : 0
+        let slopePerSecond = slopePerSample / sampleInterval
 
-        return stdev < 0.5 && abs(slopePerSecond) < 0.05
+        let residualVariance = window.enumerated().reduce(Float(0)) { partial, item in
+            let predicted = mean + slopePerSample * (Float(item.offset) - xMean)
+            let residual = item.element - predicted
+            return partial + residual * residual
+        } / n
+        let residualStandardDeviation = sqrt(residualVariance)
+
+        let half = window.count / 2
+        let firstMean = window.prefix(half).reduce(0, +) / Float(half)
+        let secondCount = window.count - half
+        let secondMean = window.suffix(secondCount).reduce(0, +) / Float(secondCount)
+        let halfMeanDelta = abs(secondMean - firstMean)
+        // Thermal samples are autocorrelated. Treat each five-sample (10s)
+        // block as one effective observation instead of claiming all 30 samples
+        // are independent.
+        let effectiveSampleCount = max(Float(window.count / 5), 2)
+        let confidenceRadius95 = 1.96 * residualStandardDeviation / sqrt(effectiveSampleCount)
+
+        return CalibrationStabilityMetrics(
+            mean: mean,
+            slopePerSecond: slopePerSecond,
+            rawStandardDeviation: rawStandardDeviation,
+            residualStandardDeviation: residualStandardDeviation,
+            halfMeanDelta: halfMeanDelta,
+            confidenceRadius95: confidenceRadius95
+        )
+    }
+
+    private func stabilityMetrics(readings: [Float]) -> CalibrationStabilityMetrics? {
+        Self.stabilityMetrics(readings: readings, windowSize: mode.stabilizationWindowSize)
+    }
+
+    private func isStabilized(metrics: CalibrationStabilityMetrics) -> Bool {
+        mode.acceptsStability(metrics)
+    }
+
+    private func formatStability(_ metrics: CalibrationStabilityMetrics) -> String {
+        "mean \(String(format: "%.2f", metrics.mean))°C, " +
+            "slope \(String(format: "%+.4f", metrics.slopePerSecond))°C/s, " +
+            "half Δ \(String(format: "%.2f", metrics.halfMeanDelta))°C, " +
+            "noise σ \(String(format: "%.2f", metrics.residualStandardDeviation))°C, " +
+            "95% ±\(String(format: "%.2f", metrics.confidenceRadius95))°C"
     }
 
     /// Build monotonically increasing control curve from raw equilibrium data.
     /// Raw data: (fanPct, equilTemp) — higher fan = lower equilibrium (physically correct).
     /// Control curve: (targetTemp, holdingRPMPercent) — higher temp = higher fan (for Smart).
     /// Formula: fan_control(T) = (1.0 + minPct) - F_equil(T)
-    private func buildControlCurve(rawData: [(fanPct: Float, equilTemp: Float)], minPct: Float) -> [CalibrationData.Measurement] {
+    static func buildControlCurve(rawData: [(fanPct: Float, equilTemp: Float)], minPct: Float) -> [CalibrationData.Measurement] {
         guard rawData.count >= 2 else { return [] }
 
         // Sort raw data by equilibrium temp ascending
         let sorted = rawData.sorted { $0.equilTemp < $1.equilTemp }
 
         var measurements: [CalibrationData.Measurement] = []
+        var previousControlFan = minPct
 
         for target in Self.controlCurveTemps {
             // Interpolate equilibrium fan speed for this target temp
@@ -904,6 +1120,12 @@ public final class CalibrationRunner {
             // Flip: control fan speed = (1.0 + minPct) - equilibrium fan speed
             var controlFan = (1.0 + minPct) - fEquil
             controlFan = min(max(controlFan, minPct), 1.0)
+
+            // Sensor noise can slightly invert adjacent equilibrium points. A
+            // calibrated control curve must never slow the fans as temperature
+            // rises, so retain the previous (more conservative) percentage.
+            controlFan = max(controlFan, previousControlFan)
+            previousControlFan = controlFan
 
             measurements.append(CalibrationData.Measurement(
                 targetTemp: target,
@@ -915,7 +1137,7 @@ public final class CalibrationRunner {
     }
 
     /// Interpolate the equilibrium fan speed for a given temperature from raw data.
-    private func interpolateEquilFanSpeed(temp: Float, data: [(fanPct: Float, equilTemp: Float)]) -> Float {
+    private static func interpolateEquilFanSpeed(temp: Float, data: [(fanPct: Float, equilTemp: Float)]) -> Float {
         guard !data.isEmpty else { return 0.5 }
         if temp <= data.first!.equilTemp { return data.first!.fanPct }
         if temp >= data.last!.equilTemp { return data.last!.fanPct }
@@ -930,14 +1152,40 @@ public final class CalibrationRunner {
     }
 
     private func waitForCooldown(below threshold: Float) {
+        // Calibration owns fan control while the app/daemon are stopped. Use
+        // maximum cooling instead of Apple auto to reach the baseline quickly.
+        try? fanControl.setMax()
+        var readings: [Float] = []
         for _ in 0..<60 {
-            let temp = peakCPUTemp()
-            if temp > 0 && temp < threshold {
-                log("Cooled to \(String(format: "%.1f", temp))°C")
-                return
+            let temp = calibrationTemperature()?.selected ?? 0
+            if temp > 0 {
+                readings.append(temp)
+
+                // Preserve the fast path when the requested baseline is
+                // reachable, but ensure it is not just a single sensor dip.
+                let recent = readings.suffix(3)
+                if recent.count == 3,
+                   recent.max()! - recent.min()! <= 0.5,
+                   temp < threshold
+                {
+                    log("Cooled to \(String(format: "%.1f", temp))°C")
+                    return
+                }
+
+                // In warm rooms the fixed 45°C target may be unreachable. A
+                // stable baseline is what the equilibrium model actually needs.
+                if let metrics = Self.stabilityMetrics(readings: readings, windowSize: 15),
+                   abs(metrics.slopePerSecond) <= 0.005,
+                   metrics.halfMeanDelta <= 0.5
+                {
+                    log("Baseline stabilized at \(String(format: "%.1f", metrics.mean))°C")
+                    return
+                }
             }
             Thread.sleep(forTimeInterval: 2)
         }
+        let temp = calibrationTemperature()?.selected ?? 0
+        log("Cooldown limit reached at \(String(format: "%.1f", temp))°C — continuing with maximum fans")
     }
 
     // MARK: - Stress (CPU + GPU combined)
@@ -947,37 +1195,20 @@ public final class CalibrationRunner {
     // This is the Notebookcheck standard (Prime95 + FurMark simultaneously).
 
     /// Start stress at a given intensity (0.0–1.0).
-    /// CPU: intensity * coreCount threads active.
+    /// CPU: intensity * coreCount, including a duty-cycled fractional thread.
     /// GPU: intensity * 4M grid size.
-    ///
-    /// At very low intensities (< 0.01), CPU stress is skipped because
-    /// `max(Int(cores * intensity), 1)` always gives 1 fully busy core —
-    /// too much heat for fine-grained control. GPU stress scales continuously
-    /// by element count and provides sufficient granular heat on its own.
     private func startStress(intensity: Float = 1.0) {
         guard !stressRunning else { return }
         stressRunning = true
 
-        // CPU stress: use intensity * cores.
-        // Skip at very low intensities — 1 busy core is too much heat
-        // when we need granular control (GPU stress handles this range).
-        let cpuThreshold: Float = 0.01 // below this, cores would round to 1 regardless
-        if (stressType == .combined || stressType == .cpu) && intensity >= cpuThreshold {
+        if stressType == .combined || stressType == .cpu {
             let coreCount = ProcessInfo.processInfo.activeProcessorCount
-            let activeCores = Swift.max(Int(Float(coreCount) * intensity), 1)
-            for _ in 0..<activeCores {
-                let thread = Thread {
-                    while self.stressRunning {
-                        var x: Double = 1.0
-                        for i in 1...10000 {
-                            x = sin(x) * cos(Double(i))
-                        }
-                        _ = x
-                    }
-                }
-                thread.qualityOfService = .userInteractive
-                thread.start()
-                stressThreads.append(thread)
+            let plan = Self.cpuStressPlan(intensity: intensity, coreCount: coreCount)
+            for _ in 0..<plan.fullThreads {
+                startCPUStressThread(dutyCycle: 1)
+            }
+            if plan.fractionalDutyCycle > 0 {
+                startCPUStressThread(dutyCycle: plan.fractionalDutyCycle)
             }
         }
 
@@ -985,6 +1216,53 @@ public final class CalibrationRunner {
         if stressType == .combined || stressType == .gpu {
             startGPUStress(intensity: intensity)
         }
+    }
+
+    static func cpuStressPlan(intensity: Float, coreCount: Int) -> CalibrationCPUStressPlan {
+        let clampedIntensity = min(max(intensity, 0), 1)
+        let desiredCoreLoad = clampedIntensity * Float(max(coreCount, 1))
+        let fullThreads = Int(desiredCoreLoad.rounded(.down))
+        let fractionalDutyCycle = desiredCoreLoad - Float(fullThreads)
+        return CalibrationCPUStressPlan(
+            fullThreads: fullThreads,
+            fractionalDutyCycle: fractionalDutyCycle
+        )
+    }
+
+    private func startCPUStressThread(dutyCycle: Float) {
+        let clampedDuty = min(max(dutyCycle, 0), 1)
+        // Fractional work must be fine-grained: a 100ms cycle with a large
+        // minimum batch created short full-power single-core bursts that peak
+        // CPU sensors reported as 65–76°C even at ~0.15% total intensity.
+        // A 10ms period and small batches distribute the same average work much
+        // more evenly. Full workers retain large batches for efficiency.
+        let isFullWorker = clampedDuty >= 0.999
+        let period: TimeInterval = isFullWorker ? 0.1 : 0.01
+        let activeDuration = period * Double(clampedDuty)
+        let workIterations = isFullWorker ? 10_000 : 250
+
+        let thread = Thread {
+            while self.stressRunning {
+                let cycleStart = Date()
+                repeat {
+                    var x: Double = 1.0
+                    for i in 1...workIterations {
+                        x = sin(x) * cos(Double(i))
+                    }
+                    _ = x
+                } while self.stressRunning
+                    && Date().timeIntervalSince(cycleStart) < activeDuration
+
+                let elapsed = Date().timeIntervalSince(cycleStart)
+                let remaining = period - elapsed
+                if remaining > 0 {
+                    Thread.sleep(forTimeInterval: remaining)
+                }
+            }
+        }
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        stressThreads.append(thread)
     }
 
     private func startGPUStress(intensity: Float = 1.0) {
@@ -1080,8 +1358,12 @@ public final class CalibrationRunner {
 
     private func stopStress() {
         stressRunning = false
-        // Wait for threads to notice the flag and exit
-        Thread.sleep(forTimeInterval: 2)
+        // Most workers exit within one 100ms duty-cycle period. Poll briefly
+        // instead of imposing a fixed two-second delay on every Phase 1 trial.
+        let deadline = Date().addingTimeInterval(2)
+        while stressThreads.contains(where: { !$0.isFinished }), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
         stressThreads.removeAll()
         // Release Metal resources — stops GPU dispatches
         gpuBuffer = nil

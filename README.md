@@ -95,27 +95,48 @@ Run the default Standard calibration with combined CPU and GPU stress:
 sudo thermalforge calibrate
 ```
 
-Available modes trade time for stabilization accuracy:
+Available modes use the same 60-second minimum evidence window but increasingly
+strict convergence limits. A level finishes as soon as its trend, half-window
+movement, and detrended uncertainty pass; uncertain levels can continue up to
+the mode-specific limit:
 
-| Mode | Stabilization window | Maximum per fan level | Estimated total |
-| --- | ---: | ---: | ---: |
-| `quick` | 60s | 2.5 min | up to 17 min |
-| `standard` | 90s | 4 min | up to 25 min |
-| `optimized` | 120s | 6 min | up to 35 min |
+| Mode | Minimum evidence | Maximum per fan level | Convergence |
+| --- | ---: | ---: | --- |
+| `quick` | 60s | 2.5 min | Fastest |
+| `standard` | 60s | 4 min | Balanced |
+| `optimized` | 60s | 6 min | Tightest |
 
 Choose a mode or isolate the stress source when needed:
 
 ```bash
 sudo thermalforge calibrate --mode optimized
+sudo thermalforge calibrate --mode optimized --intensity 0.00221
 sudo thermalforge calibrate --stress cpu
 sudo thermalforge calibrate --stress gpu
 ```
 
 Calibration stops the menu bar app and temporarily stops a running daemon to
-avoid competing fan commands. It finds a safe workload, tests five fan levels,
-and always stops the stress workload and returns fans to Apple auto when the run
-ends. `Ctrl-C` also resets the fans and exits without saving calibration data.
+avoid competing fan commands. It begins workload discovery at 5%, adjusts the
+intensity geometrically, and makes early decisions when the result is clearly
+safe or unsafe. Low CPU intensities use fractional duty cycling instead of
+jumping directly to one fully loaded core. CPU, GPU, and combined runs use their
+matching temperature sensors.
+
+The sweep tests five fan levels. Unstable timeouts are excluded rather than
+saved as equilibrium measurements, at least three converged points are required,
+and the generated curve cannot reduce fan speed as temperature rises. The CSV
+records selected, CPU, and GPU temperatures plus convergence diagnostics in the
+console output. Calibration always stops the workload and returns fans to Apple
+auto when the run ends. `Ctrl-C` also resets the fans and exits without saving.
 An existing calibration cannot be replaced by a lower-ranked mode.
+
+The selected stress type, workload intensity, and ambient temperature are saved
+with the result. Later calibrations using the same stress type reuse that
+known-safe intensity and skip Phase 1 automatically when ambient is within 3°C.
+Use `--intensity` to supply a previously verified value explicitly; the 100% fan
+stage still validates it against the temperature ceiling before the curve is
+saved. Workload intensity is machine- and environment-specific; do not copy a
+value from another Mac.
 
 Lid-open and clamshell operation are calibrated independently. Run calibration
 once in each configuration you use; the result is stored in:
@@ -127,7 +148,9 @@ The embedded lid state must match the filename. A missing or mismatched file is
 treated as uncalibrated rather than falling back to the legacy
 `calibration.json`. The monitor checks for a lid-state change every 60 seconds
 and reloads the matching curve. Calibration run as root also copies its result
-to the active console user's application-support directory.
+to the active console user's application-support directory, gives the file back
+to that user, and prints both paths. Smart uses the matching lid-state file the
+next time the app starts.
 
 To delete all lid-specific and legacy calibration data:
 

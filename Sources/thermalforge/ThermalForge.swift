@@ -292,11 +292,14 @@ struct Calibrate: ParsableCommand {
         abstract: "Measure this machine's thermal characteristics for the Smart profile"
     )
 
-    @Option(name: .shortAndLong, help: "Calibration mode: quick (~14 min), standard (~32 min), optimized (until stable)")
+    @Option(name: .shortAndLong, help: "Calibration mode: quick, standard, optimized (increasing convergence strictness)")
     var mode: String = "standard"
 
     @Option(name: .shortAndLong, help: "Stress type: combined (CPU+GPU, default), cpu, gpu")
     var stress: String = "combined"
+
+    @Option(name: .long, help: "Reuse a known-safe workload intensity and skip Phase 1 (0.001-0.5)")
+    var intensity: Float?
 
     @Flag(name: .long, help: "Clear calibration data and start fresh")
     var reset: Bool = false
@@ -321,16 +324,16 @@ struct Calibrate: ParsableCommand {
             throw ValidationError("Run with sudo: sudo thermalforge calibrate")
         }
 
-        // Stop the ThermalForge daemon and menu bar app — they conflict with calibration fan control
-        let daemonWasRunning = thermalforgeDaemonWasStopped()
-        killThermalForgeApp()
-
         guard let calMode = CalibrationMode(rawValue: mode) else {
             throw ValidationError("Unknown mode '\(mode)'. Options: quick, standard, optimized")
         }
 
         guard let calStress = CalibrationStressType(rawValue: stress) else {
             throw ValidationError("Unknown stress type '\(stress)'. Options: combined, cpu, gpu")
+        }
+
+        if let intensity, !(0.001 ... 0.5).contains(intensity) {
+            throw ValidationError("Intensity must be between 0.001 and 0.5")
         }
 
         // Prevent downgrade
@@ -344,10 +347,45 @@ struct Calibrate: ParsableCommand {
             )
         }
 
+        // Stop the ThermalForge daemon and menu bar app — they conflict with calibration fan control.
+        // Resume the daemon on every normal exit, including validation or setup failures below.
+        let daemonWasRunning = thermalforgeDaemonWasStopped()
+        defer {
+            if daemonWasRunning {
+                resumeThermalforgeDaemon()
+            }
+        }
+        killThermalForgeApp()
+
+        let fc = try FanControl()
+        let currentAmbient = (try? fc.status())?.temperatures
+            .filter { key, _ in key.hasPrefix("TA") }
+            .values.first
+
+        let existingCalibration = CalibrationData.load()
+        let reusableIntensity: Float?
+        if intensity == nil,
+           existingCalibration?.stressType == calStress.rawValue,
+           let previous = existingCalibration?.workloadIntensity,
+           (0.001 ... 0.5).contains(previous),
+           let previousAmbient = existingCalibration?.ambientTemperature,
+           let currentAmbient,
+           abs(previousAmbient - currentAmbient) <= 3
+        {
+            reusableIntensity = previous
+        } else {
+            reusableIntensity = nil
+        }
+        let selectedIntensity = intensity ?? reusableIntensity
+
         print("ThermalForge Calibration")
         print("========================")
         print("Mode: \(calMode.description)")
         print("Stress: \(calStress.description)")
+        if let selectedIntensity {
+            let source = intensity == nil ? "saved calibration" : "command line"
+            print("Workload: \(String(format: "%.5f", selectedIntensity)) (reused from \(source); Phase 1 skipped)")
+        }
         print("")
         print("This will stress your \(calStress == .combined ? "CPU and GPU" : calStress == .cpu ? "CPU" : "GPU") and measure thermal response at 5 fan speed levels.")
         print("Fans will be loud during the test.")
@@ -358,8 +396,12 @@ struct Calibrate: ParsableCommand {
         print("")
         print("Press Ctrl-C at any time to stop. Fans will reset to Apple defaults.\n")
 
-        let fc = try FanControl()
-        let runner = CalibrationRunner(fanControl: fc, mode: calMode, stressType: calStress)
+        let runner = CalibrationRunner(
+            fanControl: fc,
+            mode: calMode,
+            stressType: calStress,
+            workloadIntensity: selectedIntensity
+        )
 
         // Kill switch: Ctrl-C resets fans and exits cleanly
         signal(SIGINT) { _ in
@@ -377,11 +419,13 @@ struct Calibrate: ParsableCommand {
 
         do {
             let data = try runner.run()
-            try data.save()
+            let savedPaths = try data.save()
 
             print("\nCalibration complete.")
             print("\nSaved to:")
-            print("  \(CalibrationData.filePath.path)")
+            for path in savedPaths {
+                print("  \(path.path)")
+            }
             if let logPath = runner.logPath {
                 print("  \(logPath.path)")
             }
@@ -398,10 +442,6 @@ struct Calibrate: ParsableCommand {
             print("\nCalibration failed: \(error.localizedDescription)")
         }
 
-        // Resume daemon if it was running before calibration (always run on exit)
-        if daemonWasRunning {
-            resumeThermalforgeDaemon()
-        }
     }
 }
 
@@ -460,6 +500,8 @@ private func killThermalForgeApp() {
     let kill = Process()
     kill.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
     kill.arguments = ["ThermalForgeApp"]
+    // No running app is the expected case for many CLI calibrations.
+    kill.standardError = FileHandle.nullDevice
     try? kill.run()
     kill.waitUntilExit()
 }
