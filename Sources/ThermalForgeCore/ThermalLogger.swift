@@ -46,21 +46,23 @@ public final class ThermalLogger {
     private let duration: TimeInterval?
     private let outputDir: URL
     private let noExpire: Bool
+    private let cancellationToken: CancellationToken
 
     private var csvHandle: FileHandle?
     private var metadata: LogSessionMetadata
     private var sampleCount = 0
-    private var running = true
     private let isoFormatter = ISO8601DateFormatter()
 
     public var onSample: ((String) -> Void)?
 
     public init(fanControl: FanControl, rateHz: Double = 1.0, duration: TimeInterval? = nil,
-                outputDir: URL? = nil, noExpire: Bool = false) throws {
+                outputDir: URL? = nil, noExpire: Bool = false,
+                cancellationToken: CancellationToken = CancellationToken()) throws {
         self.fanControl = fanControl
         self.sampleInterval = 1.0 / rateHz
         self.duration = duration
         self.noExpire = noExpire
+        self.cancellationToken = cancellationToken
 
         // Machine info
         var sysSize = 0
@@ -99,7 +101,7 @@ public final class ThermalLogger {
     }
 
     public func stop() {
-        running = false
+        cancellationToken.cancel()
     }
 
     /// Run the logging loop. Blocks until duration expires, stop() is called, or interrupted.
@@ -121,7 +123,7 @@ public final class ThermalLogger {
 
         let startTime = Date()
 
-        while running {
+        while !cancellationToken.isCancelled {
             // Check duration
             if let dur = duration, Date().timeIntervalSince(startTime) >= dur {
                 break
@@ -131,7 +133,9 @@ public final class ThermalLogger {
 
             // Read thermal status
             guard let status = try? fanControl.status() else {
-                Thread.sleep(forTimeInterval: sampleInterval)
+                if cancellationToken.waitUntilCancelled(for: sampleInterval) {
+                    break
+                }
                 continue
             }
 
@@ -178,7 +182,9 @@ public final class ThermalLogger {
             let fan0 = status.fans.first.map { $0.actualRPM } ?? 0
             onSample?("[\(timestamp)] CPU: \(String(format: "%.0f", cpuTemp))°C  Fan: \(fan0) RPM  Samples: \(sampleCount)")
 
-            Thread.sleep(forTimeInterval: sampleInterval)
+            if cancellationToken.waitUntilCancelled(for: sampleInterval) {
+                break
+            }
         }
 
         // Finalize

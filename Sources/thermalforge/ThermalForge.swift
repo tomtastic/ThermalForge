@@ -551,9 +551,6 @@ struct Log: ParsableCommand {
         abstract: "Record thermal data to CSV for research and analysis"
     )
 
-    /// Static reference for SIGINT handler (can't capture context in C function pointer)
-    nonisolated(unsafe) static var activeLogger: ThermalLogger?
-
     @Option(name: .shortAndLong, help: "Sample rate in Hz (default: 1)")
     var rate: Double = 1.0
 
@@ -571,13 +568,15 @@ struct Log: ParsableCommand {
 
         let durationSec: TimeInterval? = duration.flatMap { parseDuration($0) }
         let outputURL = output.map { URL(fileURLWithPath: $0) }
+        let cancellationToken = CancellationToken()
 
         let logger = try ThermalLogger(
             fanControl: fc,
             rateHz: rate,
             duration: durationSec,
             outputDir: outputURL,
-            noExpire: noExpire
+            noExpire: noExpire,
+            cancellationToken: cancellationToken
         )
 
         // Clean expired sessions on startup
@@ -591,14 +590,12 @@ struct Log: ParsableCommand {
         print("  Auto-delete: \(noExpire ? "off" : "after 24h")")
         print("\nLogging... Ctrl-C to stop.\n")
 
-        // Clean shutdown on Ctrl-C
-        Log.activeLogger = logger
-        signal(SIGINT) { _ in
-            print("\n\nStopping...")
-            Log.activeLogger?.stop()
-            Thread.sleep(forTimeInterval: 1)
-            Darwin.exit(0)
+        let interruptSource = InterruptSignalSource {
+            if cancellationToken.cancel() {
+                print("\n\nStopping and finalizing log...")
+            }
         }
+        defer { interruptSource.cancel() }
 
         logger.onSample = { line in
             print(line)
@@ -610,6 +607,10 @@ struct Log: ParsableCommand {
         print("  thermal.csv   — sensor readings + fan state")
         print("  processes.csv — top processes by CPU")
         print("  metadata.json — session info + data dictionary")
+
+        if cancellationToken.isCancelled {
+            throw ExitCode(130)
+        }
     }
 
     private func parseDuration(_ s: String) -> TimeInterval? {
