@@ -99,6 +99,36 @@ struct CalibrationSelectionTests {
 
 @Suite("Calibration workload and convergence")
 struct CalibrationConvergenceTests {
+    @Test("A pre-cancelled calibration exits before hardware access")
+    func preCancelledCalibrationStopsImmediately() {
+        let token = CancellationToken()
+        token.cancel()
+        let runner = CalibrationRunner(
+            fanControl: FanControl(smc: FakeSMC()),
+            cancellationToken: token
+        )
+
+        do {
+            _ = try runner.run()
+            Issue.record("Expected calibration cancellation")
+        } catch CalibrationError.cancelled {
+            // Expected.
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test("Interrupted calibration artifacts are deleted")
+    func partialCalibrationLogIsDeleted() throws {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString).csv")
+        try Data("partial".utf8).write(to: path)
+
+        CalibrationRunner.discardPartialLog(at: path)
+
+        #expect(!FileManager.default.fileExists(atPath: path.path))
+    }
+
     @Test("Calibration metadata preserves reusable workload intensity")
     func reusableWorkloadMetadataRoundTrips() throws {
         let original = CalibrationData(

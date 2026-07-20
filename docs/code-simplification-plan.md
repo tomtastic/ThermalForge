@@ -30,11 +30,13 @@ can leave the daemon stopped.
 
 Plan:
 
-- Move calibration cleanup and daemon restoration into one idempotent lifecycle
-  coordinator.
-- Make normal completion, thrown errors, and interruption use the same cleanup
-  path.
-- Keep the direct emergency fan reset as the first interruption action.
+- Convert SIGINT into cooperative cancellation using a dispatch signal source;
+  never run SMC, logging, or process operations inside a POSIX signal handler.
+- Make normal completion, thrown errors, and interruption unwind through the
+  same cleanup and daemon-restoration path.
+- Make calibration waits interruptible so stress and fan cleanup begin promptly.
+- Delete partial CSV output on interruption without touching the last completed
+  calibration profile.
 - Add tests for success, failure, and interruption cleanup decisions without
   requiring real SMC hardware or launchd.
 

@@ -260,11 +260,14 @@ public enum CalibrationMode: String, CaseIterable {
 /// Errors that can occur during calibration
 public enum CalibrationError: LocalizedError {
     case insufficientData(reason: String)
+    case cancelled
 
     public var errorDescription: String? {
         switch self {
         case .insufficientData(let reason):
             return reason
+        case .cancelled:
+            return "Calibration was interrupted"
         }
     }
 }
@@ -314,6 +317,7 @@ public final class CalibrationRunner {
     private let mode: CalibrationMode
     private let stressType: CalibrationStressType
     private let workloadIntensityOverride: Float?
+    private let cancellationToken: CancellationToken
     private var stressThreads: [Thread] = []
     private let stressLock = NSLock()
     private var _stressRunning = false
@@ -335,12 +339,14 @@ public final class CalibrationRunner {
         fanControl: FanControl,
         mode: CalibrationMode = .standard,
         stressType: CalibrationStressType = .combined,
-        workloadIntensity: Float? = nil
+        workloadIntensity: Float? = nil,
+        cancellationToken: CancellationToken = CancellationToken()
     ) {
         self.fanControl = fanControl
         self.mode = mode
         self.stressType = stressType
         self.workloadIntensityOverride = workloadIntensity
+        self.cancellationToken = cancellationToken
     }
 
     /// Check if running this mode would downgrade existing calibration
@@ -398,7 +404,7 @@ public final class CalibrationRunner {
     ///
     /// Start at 5%, move geometrically toward a safe bracket, then refine only
     /// when necessary. This avoids always running both the 0.1% and 50% probes.
-    private func findSafeSweepIntensity(maxRPM: Float) -> IntensitySelection? {
+    private func findSafeSweepIntensity(maxRPM: Float) throws -> IntensitySelection? {
         log("Finding max safe stress intensity (equilibrium < \(Int(Self.targetEquilTemp))°C at 100% fans)...")
 
         // Phase 0 immediately before this call established the baseline. Do
@@ -421,7 +427,8 @@ public final class CalibrationRunner {
         var lastTestedIntensity: Float?
 
         for attempt in 1...Self.phase1MaxIterations {
-            let result = checkIntensity(at: probe, baselineTemp: baselineTemp)
+            try throwIfCancelled()
+            let result = try checkIntensity(at: probe, baselineTemp: baselineTemp)
             lastTestedIntensity = probe
             logIntensityResult(result, intensity: probe, attempt: attempt)
 
@@ -485,9 +492,9 @@ public final class CalibrationRunner {
     ///
     /// Formula: T_eq ≈ T_baseline + (T_final - T_baseline) / (1 - exp(-t/τ))
     /// This assumes exponential approach to equilibrium (Newton's law of cooling).
-    private func checkIntensity(at intensity: Float, baselineTemp: Float) -> IntensityCheckResult {
+    private func checkIntensity(at intensity: Float, baselineTemp: Float) throws -> IntensityCheckResult {
         // Cooldown to baseline (fans already at 100% from caller)
-        waitForTempReturn(to: baselineTemp, tolerance: 3.0)
+        try waitForTempReturn(to: baselineTemp, tolerance: 3.0)
 
         let actualStartTemp = calibrationTemperature()?.selected ?? 0
 
@@ -500,6 +507,7 @@ public final class CalibrationRunner {
         let startUptime = DispatchTime.now().uptimeNanoseconds
 
         while true {
+            try throwIfCancelled()
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startUptime) / 1_000_000_000.0
             let temp = calibrationTemperature()?.selected ?? 0
             readings.append((elapsed, temp))
@@ -532,7 +540,7 @@ public final class CalibrationRunner {
                 return result
             }
 
-            Thread.sleep(forTimeInterval: 2)
+            try wait(for: 2)
         }
     }
 
@@ -594,11 +602,12 @@ public final class CalibrationRunner {
     /// Wait until temperature returns close to a target baseline.
     /// Verifies stability (3 consecutive samples within 0.5°C) before returning.
     /// Caps at 120s — cooling time constant is 60-90s (one τ ≈ 63% of delta).
-    private func waitForTempReturn(to target: Float, tolerance: Float) {
+    private func waitForTempReturn(to target: Float, tolerance: Float) throws {
         let maxWait: TimeInterval = 120
         let deadline = Date().addingTimeInterval(maxWait)
 
         while Date() < deadline {
+            try throwIfCancelled()
             let temp = calibrationTemperature()?.selected ?? 0
             guard temp > 0 else { return }
 
@@ -613,13 +622,13 @@ public final class CalibrationRunner {
                         stable = false
                         break
                     }
-                    Thread.sleep(forTimeInterval: 1)
+                    try wait(for: 1)
                 }
                 if stable {
                     return
                 }
             }
-            Thread.sleep(forTimeInterval: 2)
+            try wait(for: 2)
         }
         let finalTemp = calibrationTemperature()?.selected ?? 0
         log("  Cooldown timeout: \(String(format: "%.1f", finalTemp))°C vs target \(String(format: "%.1f", target))°C — proceeding anyway")
@@ -659,6 +668,27 @@ public final class CalibrationRunner {
         try? fanControl.resetAuto()
         csvHandle?.closeFile()
         csvHandle = nil
+        if cancellationToken.isCancelled {
+            Self.discardPartialLog(at: logPath)
+            logPath = nil
+        }
+    }
+
+    static func discardPartialLog(at url: URL?) {
+        guard let url else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func throwIfCancelled() throws {
+        if cancellationToken.isCancelled {
+            throw CalibrationError.cancelled
+        }
+    }
+
+    private func wait(for interval: TimeInterval) throws {
+        if cancellationToken.waitUntilCancelled(for: interval) {
+            throw CalibrationError.cancelled
+        }
     }
 
     /// Fan levels to test (high to low). 5 levels cover the useful cooling range.
@@ -678,6 +708,7 @@ public final class CalibrationRunner {
     /// Run full calibration. Blocks until complete.
     public func run() throws -> CalibrationData {
         defer { cleanup() }
+        try throwIfCancelled()
 
         let fanCount = try fanControl.fanCount()
         let fan0 = try fanControl.fanInfo(0)
@@ -715,7 +746,7 @@ public final class CalibrationRunner {
 
         // Phase 0: Cooldown to baseline
         log("Phase 0: Cooling to baseline...")
-        waitForCooldown(below: 45)
+        try waitForCooldown(below: 45)
 
         let baselineIntensity: Float
         if let workloadIntensityOverride {
@@ -725,7 +756,7 @@ public final class CalibrationRunner {
         } else {
             // Phase 1: Find max safe stress intensity
             log("Phase 1: Finding max safe stress intensity...")
-            guard let intensitySelection = findSafeSweepIntensity(maxRPM: Float(maxRPM)) else {
+            guard let intensitySelection = try findSafeSweepIntensity(maxRPM: Float(maxRPM)) else {
                 // Even minimum stress is too hot for this environment
                 if ambientTemp > 0 {
                     log("At \(String(format: "%.1f", ambientTemp))°C ambient, even minimum stress at 100% fans")
@@ -748,7 +779,7 @@ public final class CalibrationRunner {
 
             if intensitySelection.requiresCooldown {
                 log("Cooling after rejected hotter probe before the sweep...")
-                waitForCooldown(below: 45)
+                try waitForCooldown(below: 45)
             } else {
                 // Preserve the useful final safe-probe state instead of resetting
                 // to Apple auto and paying for an unnecessary cooldown/reheat.
@@ -776,6 +807,7 @@ public final class CalibrationRunner {
         var unstableFanLevels: [Int] = []
 
         for (_, fanPct) in levels.enumerated() {
+            try throwIfCancelled()
             guard !abortLowerLevels else { break }
 
             let targetRPM = Swift.max(maxRPM * fanPct, minRPM)
@@ -789,11 +821,12 @@ public final class CalibrationRunner {
             var stabilized = false
 
             while Date() < deadline {
+                try throwIfCancelled()
                 let elapsedSeconds = Int(
                     (DispatchTime.now().uptimeNanoseconds - levelStart) / 1_000_000_000
                 )
                 guard let temperature = calibrationTemperature() else {
-                    Thread.sleep(forTimeInterval: 2)
+                    try wait(for: 2)
                     continue
                 }
                 let temp = temperature.selected
@@ -809,7 +842,7 @@ public final class CalibrationRunner {
                 if temp >= Self.safetyTemp {
                     log("[\(Int(fanPct * 100))%] Safety at \(String(format: "%.0f", temp))°C — maxing fans, skipping lower levels")
                     try fanControl.setMax()
-                    Thread.sleep(forTimeInterval: 30)
+                    try wait(for: 30)
                     rawData.append((fanPct: fanPct, equilTemp: Self.ceilingTemp))
                     abortLowerLevels = true
                     break
@@ -840,7 +873,7 @@ public final class CalibrationRunner {
                     log("[\(Int(fanPct * 100))%] Still converging (\(elapsedSeconds)s): \(formatStability(metrics))")
                 }
 
-                Thread.sleep(forTimeInterval: 2)
+                try wait(for: 2)
             }
 
             // Never turn an arbitrary timeout average into calibration data.
@@ -858,6 +891,7 @@ public final class CalibrationRunner {
         }
 
         stopStress()
+        try throwIfCancelled()
 
         // Phase 3: Build control curve from raw equilibrium data
         log("Phase 3: Building control curve...")
@@ -907,6 +941,8 @@ public final class CalibrationRunner {
         if clamshell {
             log("  (calibrated in clamshell / lid-closed mode)")
         }
+
+        try throwIfCancelled()
 
         return CalibrationData(
             machine: machine,
@@ -1062,12 +1098,13 @@ public final class CalibrationRunner {
         return data.last!.fanPct
     }
 
-    private func waitForCooldown(below threshold: Float) {
+    private func waitForCooldown(below threshold: Float) throws {
         // Calibration owns fan control while the app/daemon are stopped. Use
         // maximum cooling instead of Apple auto to reach the baseline quickly.
         try? fanControl.setMax()
         var readings: [Float] = []
         for _ in 0..<60 {
+            try throwIfCancelled()
             let temp = calibrationTemperature()?.selected ?? 0
             if temp > 0 {
                 readings.append(temp)
@@ -1093,7 +1130,7 @@ public final class CalibrationRunner {
                     return
                 }
             }
-            Thread.sleep(forTimeInterval: 2)
+            try wait(for: 2)
         }
         let temp = calibrationTemperature()?.selected ?? 0
         log("Cooldown limit reached at \(String(format: "%.1f", temp))°C — continuing with maximum fans")

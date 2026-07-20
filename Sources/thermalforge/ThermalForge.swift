@@ -408,22 +408,21 @@ struct Calibrate: ParsableCommand {
         print("")
         print("Press Ctrl-C at any time to stop. Fans will reset to Apple defaults.\n")
 
+        let cancellationToken = CancellationToken()
         let runner = CalibrationRunner(
             fanControl: fc,
             mode: calMode,
             stressType: calStress,
-            workloadIntensity: selectedIntensity
+            workloadIntensity: selectedIntensity,
+            cancellationToken: cancellationToken
         )
 
-        // Kill switch: Ctrl-C resets fans and exits cleanly
-        signal(SIGINT) { _ in
-            print("\n\nCalibration interrupted. Resetting fans to Apple defaults...")
-            if let resetFC = try? FanControl() {
-                try? resetFC.resetAuto()
+        let interruptSource = InterruptSignalSource {
+            if cancellationToken.cancel() {
+                print("\n\nCalibration interruption requested; cleaning up...")
             }
-            print("Fans reset. No calibration data was saved.")
-            Darwin.exit(0)
         }
+        defer { interruptSource.cancel() }
 
         runner.onProgress = { message in
             print(message)
@@ -431,6 +430,12 @@ struct Calibrate: ParsableCommand {
 
         do {
             let data = try runner.run()
+            if cancellationToken.isCancelled {
+                if let logPath = runner.logPath {
+                    try? FileManager.default.removeItem(at: logPath)
+                }
+                throw CalibrationError.cancelled
+            }
             let savedPaths = try data.save()
 
             print("\nCalibration complete.")
@@ -449,6 +454,12 @@ struct Calibrate: ParsableCommand {
             if runner.logPath != nil {
                 print("The CSV log contains every sensor reading taken during calibration.")
             }
+        } catch CalibrationError.cancelled {
+            if let logPath = runner.logPath {
+                try? FileManager.default.removeItem(at: logPath)
+            }
+            print("Fans reset to Apple defaults. No calibration data was saved.")
+            throw ExitCode(130)
         } catch {
             // Propagate failure so scripts and shells receive a non-zero exit
             // status. The defer above still resumes the daemon.
