@@ -304,17 +304,31 @@ public final class DaemonClient {
 
 // MARK: - Daemon Server
 
+enum HeartbeatWatchdog {
+    static let timeout: TimeInterval = 10
+
+    static func shouldReset(
+        lastHeartbeat: Date?,
+        hasManualControl: Bool,
+        now: Date = Date()
+    ) -> Bool {
+        guard let lastHeartbeat, hasManualControl else { return false }
+        return now.timeIntervalSince(lastHeartbeat) > timeout
+    }
+}
+
 public final class DaemonServer {
     private let socketFD: Int32
     private let fanControl: FanControl
 
     /// Serializes all SMC access — prevents data race between client handler and watchdog.
     private let smcLock = NSLock()
+    /// Manual-control state, shared by requests, wake handling, and the watchdog.
+    private let controlStateLock = NSLock()
     /// Last fan command — re-applied after sleep/wake.
     private var lastCommand: FanCommand?
     /// Heartbeat: last time the app checked in.
     private var lastHeartbeat: Date?
-    private let heartbeatLock = NSLock()
     private let authorizedUID: uid_t?
 
     public init(fanControl: FanControl) throws {
@@ -388,18 +402,26 @@ public final class DaemonServer {
                 autoreleasepool {
                     Thread.sleep(forTimeInterval: 2)
 
-                    heartbeatLock.lock()
-                    let lastBeat = lastHeartbeat
-                    let hasManualControl = lastCommand != nil
-                    heartbeatLock.unlock()
+                    let snapshot = controlStateSnapshot()
 
                     // Only reset if: app has connected before (lastBeat != nil),
                     // fans are in manual mode, and heartbeat is stale
-                    guard let beat = lastBeat, hasManualControl else { return }
-
-                    if Date().timeIntervalSince(beat) > 10 {
+                    if HeartbeatWatchdog.shouldReset(
+                        lastHeartbeat: snapshot.heartbeat,
+                        hasManualControl: snapshot.command != nil
+                    ) {
                         NSLog("ThermalForge daemon: heartbeat stale — resetting fans to auto")
                         smcLock.lock()
+                        defer { smcLock.unlock() }
+
+                        // A fresh request may have arrived while the watchdog was
+                        // waiting for SMC access. Recheck before overriding it.
+                        let current = controlStateSnapshot()
+                        guard HeartbeatWatchdog.shouldReset(
+                            lastHeartbeat: current.heartbeat,
+                            hasManualControl: current.command != nil
+                        ) else { return }
+
                         let resetSucceeded: Bool
                         do {
                             try fanControl.resetAuto()
@@ -408,19 +430,41 @@ public final class DaemonServer {
                             NSLog("ThermalForge daemon: watchdog reset failed: %@, will retry", "\(error)")
                             resetSucceeded = false
                         }
-                        smcLock.unlock()
 
                         // Only clear state if reset actually worked — otherwise retry next cycle
                         if resetSucceeded {
-                            heartbeatLock.lock()
-                            lastCommand = nil
-                            lastHeartbeat = nil
-                            heartbeatLock.unlock()
+                            clearControlState()
                         }
                     }
                 }
             }
         }
+    }
+
+    private func controlStateSnapshot() -> (command: FanCommand?, heartbeat: Date?) {
+        controlStateLock.lock()
+        defer { controlStateLock.unlock() }
+        return (lastCommand, lastHeartbeat)
+    }
+
+    private func recordManualControl(_ command: FanCommand) {
+        controlStateLock.lock()
+        lastCommand = command
+        lastHeartbeat = Date()
+        controlStateLock.unlock()
+    }
+
+    private func recordHeartbeat() {
+        controlStateLock.lock()
+        lastHeartbeat = Date()
+        controlStateLock.unlock()
+    }
+
+    private func clearControlState() {
+        controlStateLock.lock()
+        lastCommand = nil
+        lastHeartbeat = nil
+        controlStateLock.unlock()
     }
 
     // MARK: - Sleep/Wake
@@ -462,7 +506,7 @@ public final class DaemonServer {
     }
 
     private func handleWake() {
-        guard let command = lastCommand else {
+        guard controlStateSnapshot().command != nil else {
             NSLog("ThermalForge daemon: woke — no profile to re-apply")
             return
         }
@@ -472,6 +516,10 @@ public final class DaemonServer {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) { [self] in
             smcLock.lock()
             defer { smcLock.unlock() }
+            guard let command = controlStateSnapshot().command else {
+                NSLog("ThermalForge daemon: wake re-apply cancelled — fan control returned to auto")
+                return
+            }
             do {
                 switch command {
                 case .setMax:
@@ -502,9 +550,11 @@ public final class DaemonServer {
         let bytes = Data(buffer[0..<n])
         let request = decodeRequest(bytes)
 
-        smcLock.lock()
-        let response = handleRequest(request)
-        smcLock.unlock()
+        let response: DaemonResponse = {
+            smcLock.lock()
+            defer { smcLock.unlock() }
+            return handleRequest(request)
+        }()
 
         writeResponse(fd, typed: response, fallbackText: response.ok ? "ok" : "error: \(response.error?.message ?? "unknown")")
     }
@@ -531,20 +581,14 @@ public final class DaemonServer {
         case "max":
             return withErrorBoundary(requestID: request.requestID) {
                 try fanControl.setMax()
-                heartbeatLock.lock()
-                lastCommand = .setMax
-                lastHeartbeat = Date()
-                heartbeatLock.unlock()
+                recordManualControl(.setMax)
                 return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
             }
 
         case "auto":
             return withErrorBoundary(requestID: request.requestID) {
                 try fanControl.resetAuto()
-                heartbeatLock.lock()
-                lastCommand = nil
-                lastHeartbeat = nil
-                heartbeatLock.unlock()
+                clearControlState()
                 return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
             }
 
@@ -558,10 +602,7 @@ public final class DaemonServer {
             }
             return withErrorBoundary(requestID: request.requestID) {
                 try fanControl.setAllFans(rpm: Float(rpm))
-                heartbeatLock.lock()
-                lastCommand = .setRPM(Float(rpm))
-                lastHeartbeat = Date()
-                heartbeatLock.unlock()
+                recordManualControl(.setRPM(Float(rpm)))
                 return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
             }
 
@@ -572,9 +613,7 @@ public final class DaemonServer {
             }
 
         case "heartbeat":
-            heartbeatLock.lock()
-            lastHeartbeat = Date()
-            heartbeatLock.unlock()
+            recordHeartbeat()
             return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
 
         case "rules.list":
