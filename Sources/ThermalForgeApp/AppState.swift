@@ -252,8 +252,8 @@ do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPa
             }
         }
 
-        // Fan commands run off the main thread, coalesced. The ramp fires
-        // ~10/s and each daemon round-trip can exceed 0.5s; routing this
+        // Fan commands run off the main thread, coalesced. Each daemon
+        // round-trip can exceed 0.5s; routing this
         // through the main actor (as before) starved the UI run loop and froze
         // the app on profile switch.
         let executor = self.executor

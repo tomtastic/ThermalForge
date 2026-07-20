@@ -81,12 +81,12 @@ public final class ThermalMonitor {
     /// divides by it) always matches the real timer rate.
     private var tickInterval: Float = 1.0
 
-    /// Process capture + anomaly detection run every ~2 seconds, regardless of
-    /// the tick rate. Derived from tickInterval so the wall-clock cadence holds.
+    /// Process capture + anomaly detection target ~2 seconds, but cannot run
+    /// faster than the adaptive thermal poll.
     private var monitorCadence: Int { max(1, Int((2.0 / tickInterval).rounded())) }
 
-    /// onUpdate / full-status build run every ~500ms. monitorCadence is always
-    /// a multiple of this (2.0 / 0.5 == 4), so a full status exists on monitor ticks.
+    /// Full-status reads and UI updates target ~500ms, but cannot run faster
+    /// than the adaptive thermal poll.
     private var uiUpdateCadence: Int { max(1, Int((0.5 / tickInterval).rounded())) }
 
     /// Below this peak temperature the rolling process buffer isn't worth its
@@ -204,7 +204,7 @@ public final class ThermalMonitor {
         calibration = data
     }
 
-    /// Called on UI update cadence (every 500ms) with updated status.
+    /// Called on the UI cadence, targeting 500ms but bounded by the thermal poll.
     public var onUpdate: ((ThermalStatus, FanProfile, MonitorState, CalibrationState) -> Void)?
     /// Called when a fan command needs to be executed (may require privilege).
     public var onFanCommand: ((FanCommand) throws -> Void)?
@@ -371,7 +371,7 @@ public final class ThermalMonitor {
             return
         }
 
-        // Monitor cadence: process capture + anomaly detection (every 2 seconds)
+        // Monitor cadence: process capture + anomaly detection (target ~2 seconds)
         if tickCounter % monitorCadence == 0, let status {
             monitorTick(status: status, maxTemp: maxTemp)
         }
@@ -512,17 +512,17 @@ public final class ThermalMonitor {
         }
         let fanChanged = lastAppliedRPMPercent != appliedBefore || fansCurrentlyRunning != runningBefore
 
-        // UI update at slower cadence (every 500ms)
+        // Publish whenever this tick produced the full UI status snapshot.
         if let status { onUpdate?(status, activeProfile, state, calibrationState) }
 
         applyCadence(maxTemp: maxTemp, fanChanged: fanChanged)
         tickCounter += 1
     }
 
-    // MARK: - Monitor Cadence (every 2 seconds)
+    // MARK: - Monitor Cadence (target ~2 seconds)
 
     /// Heavy operations: process capture + anomaly detection.
-    /// Runs at 2-second intervals to avoid sysctl overhead at 100ms.
+    /// Targets 2-second intervals, bounded by the adaptive thermal poll.
     private func monitorTick(status: ThermalStatus, maxTemp: Float) {
         // Rolling process buffer — captures what was running BEFORE a spike, but
         // only while the machine is warm enough for one to matter. At true idle
@@ -540,7 +540,7 @@ public final class ThermalMonitor {
         if !isCalibrating {
             var spikeDetected = false
 
-            // Tier 1: instant spike — >5°C between consecutive 2-second readings.
+            // Tier 1: instant spike — >5°C between consecutive monitor readings.
             if let prevTemp = anomalyHistory.last {
                 let instantDelta = maxTemp - prevTemp
                 if abs(instantDelta) > 5 {

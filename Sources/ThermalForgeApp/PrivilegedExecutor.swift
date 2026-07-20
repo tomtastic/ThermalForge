@@ -13,8 +13,8 @@ final class PrivilegedExecutor: @unchecked Sendable {
     private let client: DaemonClient
 
     /// Serializes daemon I/O off the calling thread and coalesces bursts, so the
-    /// fan-control ramp (one command per ~100ms tick, each a >0.5s daemon
-    /// round-trip) can never pile up faster than the daemon drains it.
+    /// fan-control ramp (one command per active control tick, each potentially
+    /// a >0.5s daemon round-trip) can never pile up faster than the daemon drains it.
     private let coalescer: CommandCoalescer<FanCommand>
 
     init() {

@@ -7,7 +7,8 @@
 - `SensorProvider` and the injectable SMC backend for testability
 
 2. Control
-- `ThermalMonitor` runtime loop (100ms control cadence)
+- `ThermalMonitor` runtime loop with adaptive polling: 1s while active, 2s
+  while a fan-controlling profile is steady, and 5s while Silent is idle
 - `ControlService` and `ControlStateMachine`
 - `RuleEngine` and persistent rules
 
