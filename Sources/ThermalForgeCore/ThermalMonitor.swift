@@ -62,6 +62,40 @@ public struct TemperatureRule: Equatable {
     }
 }
 
+struct ElapsedCadence {
+    static func isDue(lastRun: TimeInterval?, now: TimeInterval, interval: TimeInterval) -> Bool {
+        guard let lastRun else { return true }
+        return now - lastRun >= interval
+    }
+}
+
+struct TemperatureRateHistory {
+    private let capacity: Int
+    private var samples: [(time: TimeInterval, temperature: Float)] = []
+
+    init(capacity: Int = 4) {
+        self.capacity = max(capacity, 2)
+    }
+
+    mutating func record(_ temperature: Float, at time: TimeInterval) {
+        samples.append((time, temperature))
+        if samples.count > capacity {
+            samples.removeFirst(samples.count - capacity)
+        }
+    }
+
+    mutating func removeAll() {
+        samples.removeAll()
+    }
+
+    var ratePerSecond: Float {
+        guard let oldest = samples.first, let newest = samples.last else { return 0 }
+        let elapsed = newest.time - oldest.time
+        guard elapsed > 0 else { return 0 }
+        return (newest.temperature - oldest.temperature) / Float(elapsed)
+    }
+}
+
 // MARK: - Thermal Monitor
 
 public final class ThermalMonitor {
@@ -81,13 +115,10 @@ public final class ThermalMonitor {
     /// divides by it) always matches the real timer rate.
     private var tickInterval: Float = 1.0
 
-    /// Process capture + anomaly detection target ~2 seconds, but cannot run
-    /// faster than the adaptive thermal poll.
-    private var monitorCadence: Int { max(1, Int((2.0 / tickInterval).rounded())) }
-
-    /// Full-status reads and UI updates target ~500ms, but cannot run faster
-    /// than the adaptive thermal poll.
-    private var uiUpdateCadence: Int { max(1, Int((0.5 / tickInterval).rounded())) }
+    private static let fullStatusInterval: TimeInterval = 0.5
+    private static let monitorInterval: TimeInterval = 2.0
+    private var lastFullStatusAt: TimeInterval?
+    private var lastMonitorTickAt: TimeInterval?
 
     /// Below this peak temperature the rolling process buffer isn't worth its
     /// sysctl sweep — skip process capture at idle. (°C)
@@ -119,8 +150,6 @@ public final class ThermalMonitor {
     /// Re-apply an active rule command periodically for resilience without saturating daemon I/O.
     private static let ruleCommandRefreshInterval: TimeInterval = 5
 
-    private var tickCounter = 0
-
     // MARK: - Fan State
 
     private var lastAppliedRPMPercent: Float = 0
@@ -133,18 +162,18 @@ public final class ThermalMonitor {
 
     // MARK: - Smart Profile State
 
-    private var tempHistory: [Float] = []
+    private var tempHistory = TemperatureRateHistory()
 
     // MARK: - Anomaly Detection
 
-    /// Tracks temps over 30 seconds (15 readings at 2s monitor cadence)
+    /// Tracks the 15 most recent monitor readings.
     private var anomalyHistory: [Float] = []
     private var isCalibrating = false
 
     // MARK: - Process Buffer
 
     /// Rolling buffer — captures what was running BEFORE a spike.
-    /// 15 snapshots × 2 seconds = 30 seconds of pre-spike history.
+    /// Retains the 15 most recent monitor snapshots.
     private var processBuffer: [(timestamp: String, processes: String)] = []
     private let isoFormatter = ISO8601DateFormatter()
 
@@ -241,6 +270,8 @@ public final class ThermalMonitor {
         activeInterval = Float(interval)
         tickInterval = activeInterval
         consecutiveIdleTicks = 0
+        lastFullStatusAt = nil
+        lastMonitorTickAt = nil
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
         scheduleTimer(timer, interval: tickInterval)
@@ -304,7 +335,8 @@ public final class ThermalMonitor {
             lastAppliedRPMPercent = 0
             fansCurrentlyRunning = false
             sustainedAboveCount = 0
-            tickCounter = 0
+            lastFullStatusAt = nil
+            lastMonitorTickAt = nil
             lastRuleDecision = nil
             lastRuleCommandAppliedAt = nil
 
@@ -350,15 +382,28 @@ public final class ThermalMonitor {
         // Check if lid state changed and reload calibration accordingly.
         syncCalibration()
 
-        // Build the full sensor snapshot only on the UI/monitor cadence (the UI
-        // and 2s monitor tick consume it). On those ticks, derive the control
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        let monitorDue = ElapsedCadence.isDue(
+            lastRun: lastMonitorTickAt,
+            now: now,
+            interval: Self.monitorInterval
+        )
+        let fullStatusDue = monitorDue || ElapsedCadence.isDue(
+            lastRun: lastFullStatusAt,
+            now: now,
+            interval: Self.fullStatusInterval
+        )
+
+        // Build the full sensor snapshot only when UI or monitor work is due.
+        // On those ticks, derive the control
         // peak from it instead of re-reading the CPU/GPU sensors; on the other
         // (control-only) ticks do the cheap CPU/GPU-only read.
         let status: ThermalStatus?
         let maxTemp: Float
-        if tickCounter % uiUpdateCadence == 0, let fullStatus = try? sensorProvider.status() {
+        if fullStatusDue, let fullStatus = try? sensorProvider.status() {
             status = fullStatus
             latestStatus = fullStatus
+            lastFullStatusAt = now
             maxTemp = fullStatus.temperatures
                 .filter { key, _ in
                     key.hasPrefix("TC") || key.hasPrefix("Tp") || key.hasPrefix("TG") || key.hasPrefix("Tg")
@@ -372,8 +417,12 @@ public final class ThermalMonitor {
         }
 
         // Monitor cadence: process capture + anomaly detection (target ~2 seconds)
-        if tickCounter % monitorCadence == 0, let status {
+        if monitorDue, let status {
             monitorTick(status: status, maxTemp: maxTemp)
+            lastMonitorTickAt = now
+            if activeProfile.id == "smart" {
+                tempHistory.record(maxTemp, at: now)
+            }
         }
 
         // Safety override: any CPU/GPU sensor > 95°C
@@ -390,7 +439,6 @@ public final class ThermalMonitor {
             }
             if let status { onUpdate?(status, activeProfile, state, calibrationState) }
             applyCadence(maxTemp: maxTemp, fanChanged: true)
-            tickCounter += 1
             return
         }
 
@@ -406,10 +454,7 @@ public final class ThermalMonitor {
             lastRuleDecision = nil
             lastRuleCommandAppliedAt = nil
             tickTemperatureRule(status: status, peakTemp: maxTemp, rule: rule)
-            if tickCounter % uiUpdateCadence == 0 {
-                if let status { onUpdate?(status, activeProfile, state, calibrationState) }
-            }
-            tickCounter += 1
+            if let status { onUpdate?(status, activeProfile, state, calibrationState) }
             return
         }
 
@@ -485,10 +530,7 @@ public final class ThermalMonitor {
                         TFLogger.shared.event(ThermalEvent(type: .ruleTriggered, details: "rule=\(decision.sourceRuleID) name=\(decision.sourceRuleName)"))
                     }
                     lastRuleDecision = decision
-                    if tickCounter % uiUpdateCadence == 0 {
-                        onUpdate?(status, activeProfile, state, calibrationState)
-                    }
-                    tickCounter += 1
+                    onUpdate?(status, activeProfile, state, calibrationState)
                     return
                 }
             }
@@ -516,7 +558,6 @@ public final class ThermalMonitor {
         if let status { onUpdate?(status, activeProfile, state, calibrationState) }
 
         applyCadence(maxTemp: maxTemp, fanChanged: fanChanged)
-        tickCounter += 1
     }
 
     // MARK: - Monitor Cadence (target ~2 seconds)
@@ -575,7 +616,7 @@ public final class ThermalMonitor {
             }
 
             if spikeDetected {
-                TFLogger.shared.info("Pre-spike process history (last \(processBuffer.count * 2)s):")
+                TFLogger.shared.info("Pre-spike process history (last \(processBuffer.count) samples):")
                 for entry in processBuffer {
                     TFLogger.shared.info("  \(entry.timestamp): \(entry.processes)")
                 }
@@ -593,12 +634,6 @@ public final class ThermalMonitor {
     private static let smartStopTemp: Float = 50.0
 
     private func tickSmart(peakTemp: Float, minRPM: Float, maxRPM: Float) {
-        // Sample temperature history at monitor cadence (2s) for stable rate-of-change
-        if tickCounter % monitorCadence == 0 {
-            tempHistory.append(peakTemp)
-            if tempHistory.count > 4 { tempHistory.removeFirst() }
-        }
-
         let minPct = minRPM / maxRPM
 
         if peakTemp < Self.smartStopTemp && fansCurrentlyRunning && rateOfChange() <= 0 {
@@ -679,14 +714,8 @@ public final class ThermalMonitor {
     }
 
     /// Temperature rate of change in °C per second (smoothed over history).
-    /// History is sampled at monitor cadence (2s), so this covers ~8 seconds.
     private func rateOfChange() -> Float {
-        guard tempHistory.count >= 2 else { return 0 }
-        let oldest = tempHistory.first!
-        let newest = tempHistory.last!
-        // tempHistory sampled at monitor cadence (2s intervals)
-        let seconds = Float(tempHistory.count - 1) * Float(monitorCadence) * tickInterval
-        return (newest - oldest) / seconds
+        tempHistory.ratePerSecond
     }
 
     // MARK: - Curve-Based Profiles
