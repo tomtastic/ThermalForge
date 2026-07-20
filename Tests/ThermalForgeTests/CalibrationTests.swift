@@ -45,6 +45,35 @@ struct CalibrationSelectionTests {
         #expect(CalibrationData.load(forLidClosed: true, from: path) == nil)
         #expect(CalibrationData.load(forLidClosed: false, from: path)?.lidClosed == false)
     }
+
+    @Test("Reset covers root and console-user calibration files")
+    func resetCoversBothHomes() throws {
+        let rootHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let userHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: rootHome)
+            try? FileManager.default.removeItem(at: userHome)
+        }
+
+        let paths = CalibrationData.resetFilePaths(currentHome: rootHome, consoleHome: userHome)
+        #expect(paths.count == 6)
+        #expect(paths.contains(CalibrationData.filePath(forLidClosed: false, homeDirectory: rootHome)))
+        #expect(paths.contains(CalibrationData.filePath(forLidClosed: true, homeDirectory: userHome)))
+
+        for path in paths {
+            try FileManager.default.createDirectory(
+                at: path.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("test".utf8).write(to: path)
+        }
+
+        let removed = try CalibrationData.removeCalibrationFiles(at: paths)
+        #expect(Set(removed) == Set(paths))
+        #expect(paths.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
 }
 
 @Suite("Calibration workload and convergence")

@@ -168,130 +168,6 @@ public func isClamshellMode() -> Bool {
     return !hasBuiltIn
 }
 
-// MARK: - Persistence
-
-extension CalibrationData {
-    /// Legacy file path (pre-lid-state support). Kept for backward compatibility.
-    public static var legacyFilePath: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/ThermalForge/calibration.json")
-    }
-
-    /// Lid-state-specific calibration file path.
-    /// Returns `~/Library/Application Support/ThermalForge/calibration_lid_open.json`
-    /// or `calibration_lid_closed.json` depending on `lidClosed`.
-    public static var filePath: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/ThermalForge/calibration.json")
-    }
-
-    /// File path for a given lid state.
-    public static func filePath(forLidClosed lidClosed: Bool) -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/ThermalForge/")
-            .appendingPathComponent("calibration_\(lidClosed ? "lid_closed" : "lid_open").json")
-    }
-
-    /// Save calibration and return every path written.
-    @discardableResult
-    public func save() throws -> [URL] {
-        let path = Self.filePath(forLidClosed: lidClosed)
-        let dir = path.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(self)
-        try data.write(to: path)
-
-        // If running as root (daemon/CLI), also copy to the console user's
-        // home directory so the app (running as the user) can find it.
-        var savedPaths = [path]
-        if geteuid() == 0,
-           let userPath = try copyToConsoleUser(data: data, lidClosed: lidClosed)
-        {
-            savedPaths.append(userPath)
-        }
-        return savedPaths
-    }
-
-    /// Copy calibration JSON to the console user's home directory.
-    /// When calibration runs as root (via sudo or the daemon), the app
-    /// (running as the logged-in user) can't read root's home directory.
-    private func copyToConsoleUser(data: Data, lidClosed: Bool) throws -> URL? {
-        // Get console user UID from /dev/console
-        var st = stat()
-        guard stat("/dev/console", &st) == 0, st.st_uid != 0 else { return nil }
-
-        // Get home directory from passwd
-        guard let pw = getpwuid(st.st_uid), let home = String(validatingUTF8: pw.pointee.pw_dir) else { return nil }
-
-        let userPath = URL(fileURLWithPath: home)
-            .appendingPathComponent("Library/Application Support/ThermalForge/")
-            .appendingPathComponent("calibration_\(lidClosed ? "lid_closed" : "lid_open").json")
-        let userDir = userPath.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: userDir, withIntermediateDirectories: true)
-        try data.write(to: userPath)
-        // Files created by a sudo calibration otherwise remain root-owned in
-        // the user's config directory. Give both the file and any newly-created
-        // directory back to the active console user.
-        _ = chown(userDir.path, st.st_uid, pw.pointee.pw_gid)
-        _ = chown(userPath.path, st.st_uid, pw.pointee.pw_gid)
-        _ = chmod(userPath.path, 0o644)
-        TFLogger.shared.info("Copied calibration to console user: \(userPath.path)")
-        return userPath
-    }
-
-    /// Load calibration data matching the current lid state.
-    public static func load() -> CalibrationData? {
-        load(forLidClosed: isClamshellMode())
-    }
-
-    /// Load calibration data for a specific lid state.
-    /// A missing state-specific file means that state is uncalibrated. Legacy
-    /// data is deliberately not substituted because it cannot reliably identify
-    /// the lid state in which it was recorded.
-    public static func load(forLidClosed lidClosed: Bool) -> CalibrationData? {
-        let specificPath = Self.filePath(forLidClosed: lidClosed)
-        return load(forLidClosed: lidClosed, from: specificPath)
-    }
-
-    /// Path-injectable loader used by tests and by the state-specific loader.
-    static func load(forLidClosed lidClosed: Bool, from specificPath: URL) -> CalibrationData? {
-        guard let calibration = loadFromFile(specificPath) else { return nil }
-        guard calibration.lidClosed == lidClosed else {
-            TFLogger.shared.error("Calibration file lid state does not match its filename — ignoring")
-            return nil
-        }
-        return calibration
-    }
-
-    /// Check if any calibration data exists (lid-state-specific or legacy).
-    public static var exists: Bool {
-        FileManager.default.fileExists(atPath: Self.filePath(forLidClosed: false).path)
-        || FileManager.default.fileExists(atPath: Self.filePath(forLidClosed: true).path)
-        || FileManager.default.fileExists(atPath: Self.legacyFilePath.path)
-    }
-
-    /// Decode and validate calibration data from a file.
-    static func loadFromFile(_ url: URL) -> CalibrationData? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-
-        guard let data = try? Data(contentsOf: url) else {
-            TFLogger.shared.error("Calibration file exists but couldn't be read — deleting")
-            try? FileManager.default.removeItem(at: url)
-            return nil
-        }
-
-        guard let calibration = try? JSONDecoder().decode(CalibrationData.self, from: data) else {
-            TFLogger.shared.error("Calibration file is corrupted (JSON decode failed) — deleting")
-            try? FileManager.default.removeItem(at: url)
-            return nil
-        }
-
-        return calibration
-    }
-}
-
 // MARK: - Calibration Mode
 
 /// Calibration modes based on thermal engineering research.
@@ -887,7 +763,7 @@ public final class CalibrationRunner {
         }
 
         // Set up CSV log
-        let logDir = CalibrationData.filePath.deletingLastPathComponent()
+        let logDir = CalibrationData.applicationSupportDirectory
         try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
         let timestamp = isoFormatter.string(from: Date())
             .replacingOccurrences(of: ":", with: "-")

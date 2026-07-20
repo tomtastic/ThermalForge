@@ -161,8 +161,11 @@ next time the app starts.
 To delete all lid-specific and legacy calibration data:
 
 ```bash
-thermalforge calibrate --reset
+sudo thermalforge calibrate --reset
 ```
+
+This removes the root-owned calibration used by the CLI and the matching files
+copied into the active console user's application-support directory.
 
 ## Profiles
 

@@ -308,14 +308,19 @@ struct Calibrate: ParsableCommand {
     var reset: Bool = false
 
     func run() throws {
-        // Reset doesn't need sudo — it's user data
         if reset {
-            if CalibrationData.exists {
-                // Remove all calibration files (both lid states + legacy)
-                try? FileManager.default.removeItem(at: CalibrationData.filePath(forLidClosed: false))
-                try? FileManager.default.removeItem(at: CalibrationData.filePath(forLidClosed: true))
-                try? FileManager.default.removeItem(at: CalibrationData.legacyFilePath)
+            guard geteuid() == 0 else {
+                throw ValidationError(
+                    "Run with sudo to clear both root and console-user data: " +
+                    "sudo thermalforge calibrate --reset"
+                )
+            }
+            let removedPaths = try CalibrationData.clearAllStoredCalibration()
+            if !removedPaths.isEmpty {
                 print("Calibration data cleared (all lid states). Smart will use the default curve.")
+                for path in removedPaths {
+                    print("  \(path.path)")
+                }
                 TFLogger.shared.calibration("Calibration data reset by user")
             } else {
                 print("No calibration data to clear.")
