@@ -4,7 +4,7 @@
 
 1. Hardware
 - `FanControl` for SMC reads/writes
-- `FanController` / `SensorProvider` protocols for testability
+- `SensorProvider` and the injectable SMC backend for testability
 
 2. Control
 - `ThermalMonitor` runtime loop (100ms control cadence)

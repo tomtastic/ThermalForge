@@ -74,6 +74,27 @@ struct CalibrationSelectionTests {
         #expect(Set(removed) == Set(paths))
         #expect(paths.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
     }
+
+    @Test("Legacy settle-time metadata remains decodable")
+    func legacySettleTimeIsIgnored() throws {
+        let json = """
+        {
+          "machine": "TestMac",
+          "fans": 2,
+          "maxRPM": 6000,
+          "minRPM": 2000,
+          "calibratedAt": "2026-07-20T00:00:00Z",
+          "lidClosed": false,
+          "measurements": [
+            {"targetTemp": 60, "holdingRPMPercent": 0.4, "settleTime": 120}
+          ]
+        }
+        """
+
+        let calibration = try JSONDecoder().decode(CalibrationData.self, from: Data(json.utf8))
+        #expect(calibration.measurements.first?.targetTemp == 60)
+        #expect(calibration.measurements.first?.holdingRPMPercent == 0.4)
+    }
 }
 
 @Suite("Calibration workload and convergence")

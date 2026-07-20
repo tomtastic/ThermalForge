@@ -18,11 +18,6 @@ extension CalibrationData {
         homeDirectory.appendingPathComponent("Library/Application Support/ThermalForge", isDirectory: true)
     }
 
-    /// Legacy file path (pre-lid-state support). Kept for cleanup and migration diagnostics.
-    public static var legacyFilePath: URL {
-        applicationSupportDirectory.appendingPathComponent("calibration.json")
-    }
-
     /// File path for a given lid state in the effective user's home directory.
     public static func filePath(forLidClosed lidClosed: Bool) -> URL {
         filePath(forLidClosed: lidClosed, homeDirectory: FileManager.default.homeDirectoryForCurrentUser)
@@ -136,12 +131,6 @@ extension CalibrationData {
             return nil
         }
         return calibration
-    }
-
-    /// Check if any calibration data exists for the effective user.
-    public static var exists: Bool {
-        allFilePaths(homeDirectory: FileManager.default.homeDirectoryForCurrentUser)
-            .contains { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     static func loadFromFile(_ url: URL) -> CalibrationData? {

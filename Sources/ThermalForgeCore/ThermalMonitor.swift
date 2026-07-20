@@ -432,8 +432,7 @@ public final class ThermalMonitor {
             let context = RuleEvaluationContext(
                 cpuTemp: cpuTemp,
                 gpuTemp: gpuTemp,
-                maxTemp: maxTemp,
-                profileID: activeProfile.id
+                maxTemp: maxTemp
             )
             if let decision = controlService.evaluateRules(context: context) {
                 let decisionChanged = decision != lastRuleDecision

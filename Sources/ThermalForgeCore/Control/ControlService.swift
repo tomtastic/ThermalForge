@@ -4,13 +4,11 @@ public struct RuleEvaluationContext: Equatable {
     public let cpuTemp: Float
     public let gpuTemp: Float
     public let maxTemp: Float
-    public let profileID: String
 
-    public init(cpuTemp: Float, gpuTemp: Float, maxTemp: Float, profileID: String) {
+    public init(cpuTemp: Float, gpuTemp: Float, maxTemp: Float) {
         self.cpuTemp = cpuTemp
         self.gpuTemp = gpuTemp
         self.maxTemp = maxTemp
-        self.profileID = profileID
     }
 }
 

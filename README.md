@@ -31,7 +31,7 @@ The main changes maintained by this fork are:
 
 1. **Hardware**
 - SMC adapter (`FanControl`)
-- test seams: `FanController`, `SensorProvider`
+- sensor test seam (`SensorProvider`) and injectable SMC backend
 
 2. **Control**
 - `ThermalMonitor` runtime loop
@@ -208,7 +208,7 @@ thermalforge rules add --trigger 55 --until 65 --max
 thermalforge rules enable <rule-id>
 thermalforge rules disable <rule-id>
 thermalforge rules remove <rule-id>
-thermalforge rules test --cpu 70 --gpu 62 --profile balanced
+thermalforge rules test --cpu 70 --gpu 62
 ```
 
 ## Install

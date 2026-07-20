@@ -24,7 +24,7 @@ struct RuleEngineTests {
         )
 
         let engine = RuleEngine(rules: [low, high], isEnabled: true)
-        let decision = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 56, gpuTemp: 52, maxTemp: 56, profileID: "balanced"))
+        let decision = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 56, gpuTemp: 52, maxTemp: 56))
 
         #expect(decision != nil)
         #expect(decision?.sourceRuleID == "high")
@@ -45,13 +45,13 @@ struct RuleEngineTests {
 
         let engine = RuleEngine(rules: [rule], isEnabled: true)
 
-        let hot = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 72, gpuTemp: 70, maxTemp: 72, profileID: "balanced"))
+        let hot = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 72, gpuTemp: 70, maxTemp: 72))
         #expect(hot?.command == .setMax)
 
-        let coolingButStillLatched = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 67, gpuTemp: 64, maxTemp: 67, profileID: "balanced"))
+        let coolingButStillLatched = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 67, gpuTemp: 64, maxTemp: 67))
         #expect(coolingButStillLatched?.command == .setMax)
 
-        let released = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 64, gpuTemp: 63, maxTemp: 64, profileID: "balanced"))
+        let released = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 64, gpuTemp: 63, maxTemp: 64))
         #expect(released == nil)
     }
 
@@ -67,7 +67,7 @@ struct RuleEngineTests {
         )
 
         let engine = RuleEngine(rules: [rule], isEnabled: false)
-        let decision = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 80, gpuTemp: 75, maxTemp: 80, profileID: "max"))
+        let decision = engine.evaluate(context: RuleEvaluationContext(cpuTemp: 80, gpuTemp: 75, maxTemp: 80))
         #expect(decision == nil)
     }
 
@@ -115,7 +115,7 @@ struct RuleEngineTests {
         )
 
         let engine = RuleEngine(rules: [rule], isEnabled: true)
-        let hot = RuleEvaluationContext(cpuTemp: 72, gpuTemp: 71, maxTemp: 72, profileID: "balanced")
+        let hot = RuleEvaluationContext(cpuTemp: 72, gpuTemp: 71, maxTemp: 72)
         #expect(engine.evaluate(context: hot)?.command == .setMax)
 
         rule.enabled = false

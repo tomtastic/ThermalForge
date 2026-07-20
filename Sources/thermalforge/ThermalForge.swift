@@ -756,14 +756,11 @@ struct RulesTest: ParsableCommand {
     @Option(name: .long, help: "GPU temperature in Celsius")
     var gpu: Float = 58
 
-    @Option(name: .long, help: "Profile ID")
-    var profile: String = "balanced"
-
     func run() throws {
         let rules = RulePersistence.load()
         let engine = RuleEngine(rules: rules, isEnabled: true)
         let maxTemp = max(cpu, gpu)
-        let context = RuleEvaluationContext(cpuTemp: cpu, gpuTemp: gpu, maxTemp: maxTemp, profileID: profile)
+        let context = RuleEvaluationContext(cpuTemp: cpu, gpuTemp: gpu, maxTemp: maxTemp)
         if let decision = engine.evaluate(context: context) {
             print("Matched rule: \(decision.sourceRuleName) [\(decision.sourceRuleID)]")
             if let command = decision.command {

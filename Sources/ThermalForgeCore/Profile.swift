@@ -148,22 +148,6 @@ public struct FanProfile: Codable, Identifiable, Equatable {
         self.name = name
         self.curve = curve
     }
-
-    // Legacy support — old profiles used triggers/fanBehavior
-    public struct Triggers: Codable, Equatable {
-        public let cpuTemp: Float?
-        public let gpuTemp: Float?
-        public let memPressure: Float?
-        public init(cpuTemp: Float? = nil, gpuTemp: Float? = nil, memPressure: Float? = nil) {
-            self.cpuTemp = cpuTemp; self.gpuTemp = gpuTemp; self.memPressure = memPressure
-        }
-    }
-    public struct FanBehavior: Codable, Equatable {
-        public let mode: Mode
-        public let rpmPercent: Float
-        public enum Mode: String, Codable, Equatable { case auto, manual }
-        public init(mode: Mode, rpmPercent: Float) { self.mode = mode; self.rpmPercent = rpmPercent }
-    }
 }
 
 // MARK: - Built-in Profiles

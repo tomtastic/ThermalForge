@@ -69,13 +69,10 @@ public struct CalibrationData: Codable {
         public let targetTemp: Float
         /// Fan speed (0.0–1.0 of max RPM) that held temp at targetTemp
         public let holdingRPMPercent: Float
-        /// How long (seconds) it took to find the holding speed
-        public let settleTime: Float?
 
-        public init(targetTemp: Float, holdingRPMPercent: Float, settleTime: Float? = nil) {
+        public init(targetTemp: Float, holdingRPMPercent: Float) {
             self.targetTemp = targetTemp
             self.holdingRPMPercent = holdingRPMPercent
-            self.settleTime = settleTime
         }
     }
 
