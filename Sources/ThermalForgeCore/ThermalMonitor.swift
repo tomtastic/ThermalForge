@@ -404,11 +404,7 @@ public final class ThermalMonitor {
             status = fullStatus
             latestStatus = fullStatus
             lastFullStatusAt = now
-            maxTemp = fullStatus.temperatures
-                .filter { key, _ in
-                    key.hasPrefix("TC") || key.hasPrefix("Tp") || key.hasPrefix("TG") || key.hasPrefix("Tg")
-                }
-                .values.max() ?? 0
+            maxTemp = TemperatureSummary(fullStatus.temperatures).controlPeak ?? 0
         } else if let fc = sensorProvider as? FanControl, let temps = fc.controlTemps() {
             status = nil
             maxTemp = max(temps.cpu, temps.gpu)
@@ -468,15 +464,10 @@ public final class ThermalMonitor {
 
         // Rule engine preemption (after safety, before profile curve).
         if let status {
-            let cpuTemp = status.temperatures
-                .filter { key, _ in key.hasPrefix("TC") || key.hasPrefix("Tp") }
-                .values.max() ?? 0
-            let gpuTemp = status.temperatures
-                .filter { key, _ in key.hasPrefix("TG") || key.hasPrefix("Tg") }
-                .values.max() ?? 0
+            let temperatures = TemperatureSummary(status.temperatures)
             let context = RuleEvaluationContext(
-                cpuTemp: cpuTemp,
-                gpuTemp: gpuTemp,
+                cpuTemp: temperatures.cpu ?? 0,
+                gpuTemp: temperatures.gpu ?? 0,
                 maxTemp: maxTemp
             )
             if let decision = controlService.evaluateRules(context: context) {

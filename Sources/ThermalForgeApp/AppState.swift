@@ -243,10 +243,8 @@ do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPa
                 // Quantize to whole degrees: the label shows an integer, so a
                 // jittering 0.1° fraction would otherwise force a relayout (CA
                 // transaction) every update for a number that never changes.
-                let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
-                let newMax = status.temperatures
-                    .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
-                    .values.max()
+                let newMax = TemperatureSummary(status.temperatures)
+                    .controlPeak
                     .map { $0.rounded() }
                 if self.maxTemp != newMax { self.maxTemp = newMax }
             }

@@ -250,12 +250,9 @@ struct Watch: ParsableCommand {
                     print(line)
                 }
             } else {
-                let cpuTemp = status.temperatures
-                    .filter { k, _ in k.hasPrefix("TC") || k.hasPrefix("Tp") }
-                    .values.max() ?? 0
-                let gpuTemp = status.temperatures
-                    .filter { k, _ in k.hasPrefix("TG") || k.hasPrefix("Tg") }
-                    .values.max() ?? 0
+                let temperatures = TemperatureSummary(status.temperatures)
+                let cpuTemp = temperatures.cpu ?? 0
+                let gpuTemp = temperatures.gpu ?? 0
                 let fan0 = status.fans.first.map { $0.actualRPM } ?? 0
                 let stateLabel: String
                 switch state {
@@ -369,9 +366,9 @@ struct Calibrate: ParsableCommand {
         killThermalForgeApp()
 
         let fc = try FanControl()
-        let currentAmbient = (try? fc.status())?.temperatures
-            .filter { key, _ in key.hasPrefix("TA") }
-            .values.first
+        let currentAmbient = (try? fc.status()).flatMap {
+            TemperatureSummary($0.temperatures).ambient
+        }
 
         let existingCalibration = CalibrationData.load()
         let reusableIntensity: Float?

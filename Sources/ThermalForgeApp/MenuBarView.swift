@@ -55,6 +55,7 @@ struct MenuBarView: View {
 
             // Fan speeds
             if let status = appState.latestStatus {
+                let temperatures = TemperatureSummary(status.temperatures)
                 SectionHeader(title: "FANS")
                 ForEach(status.fans, id: \.index) { fan in
                     HStack {
@@ -72,11 +73,11 @@ struct MenuBarView: View {
 
                 // Temperatures
                 SectionHeader(title: "TEMPERATURES")
-                TemperatureRow(label: "CPU", value: peakTemp(prefixes: ["TC", "Tp"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "GPU", value: peakTemp(prefixes: ["TG", "Tg"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "RAM", value: peakTemp(prefixes: ["TR", "Tm", "TM"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "SSD", value: peakTemp(prefixes: ["TH"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "Ambient", value: peakTemp(prefixes: ["TA"]), fahrenheit: appState.useFahrenheit)
+                TemperatureRow(label: "CPU", value: temperatures.cpu, fahrenheit: appState.useFahrenheit)
+                TemperatureRow(label: "GPU", value: temperatures.gpu, fahrenheit: appState.useFahrenheit)
+                TemperatureRow(label: "RAM", value: temperatures.ram, fahrenheit: appState.useFahrenheit)
+                TemperatureRow(label: "SSD", value: temperatures.ssd, fahrenheit: appState.useFahrenheit)
+                TemperatureRow(label: "Ambient", value: temperatures.ambient, fahrenheit: appState.useFahrenheit)
             } else {
                 Text("Reading sensors...")
                     .foregroundStyle(.secondary)
@@ -272,12 +273,6 @@ struct MenuBarView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-    }
-
-    private func peakTemp(prefixes: [String]) -> Float? {
-        guard let temps = appState.latestStatus?.temperatures else { return nil }
-        let values = temps.filter { key, _ in prefixes.contains(where: { key.hasPrefix($0) }) }.values
-        return values.max()
     }
 
     private func ruleBinding(_ ruleID: String) -> Binding<Bool> {

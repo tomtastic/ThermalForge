@@ -636,12 +636,9 @@ public final class CalibrationRunner {
         from temperatures: [String: Float],
         stressType: CalibrationStressType
     ) -> CalibrationTemperatureSample? {
-        let cpu = temperatures
-            .filter { key, _ in key.hasPrefix("TC") || key.hasPrefix("Tp") }
-            .values.max() ?? 0
-        let gpu = temperatures
-            .filter { key, _ in key.hasPrefix("TG") || key.hasPrefix("Tg") }
-            .values.max() ?? 0
+        let summary = TemperatureSummary(temperatures)
+        let cpu = summary.cpu ?? 0
+        let gpu = summary.gpu ?? 0
 
         let selected: Float
         switch stressType {
@@ -708,7 +705,7 @@ public final class CalibrationRunner {
         // Record ambient temperature
         var ambientTemp: Float = 0
         if let status = try? fanControl.status() {
-            ambientTemp = status.temperatures.filter { k, _ in k.hasPrefix("TA") }.values.first ?? 0
+            ambientTemp = TemperatureSummary(status.temperatures).ambient ?? 0
         }
         if ambientTemp > 0 {
             log("Ambient: \(String(format: "%.1f", ambientTemp))°C \(clamshell ? "(lid closed / clamshell)" : "(lid open)")")

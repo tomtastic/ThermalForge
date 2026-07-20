@@ -174,9 +174,7 @@ public final class ThermalLogger {
             sampleCount += 1
 
             // Callback
-            let cpuTemp = status.temperatures
-                .filter { k, _ in k.hasPrefix("TC") || k.hasPrefix("Tp") }
-                .values.max() ?? 0
+            let cpuTemp = TemperatureSummary(status.temperatures).cpu ?? 0
             let fan0 = status.fans.first.map { $0.actualRPM } ?? 0
             onSample?("[\(timestamp)] CPU: \(String(format: "%.0f", cpuTemp))°C  Fan: \(fan0) RPM  Samples: \(sampleCount)")
 
