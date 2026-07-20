@@ -8,6 +8,7 @@
 import Foundation
 import Metal
 import AppKit
+import CoreGraphics
 import Darwin
 
 // MARK: - Data Model
@@ -127,10 +128,13 @@ public func isClamshellMode() -> Bool {
     let screens = NSScreen.screens
     guard !screens.isEmpty else { return false }
 
-    let hasBuiltIn = screens.first { desc in
-        let dict = desc.deviceDescription as NSDictionary
-        return (dict.object(forKey: "com.apple.screenIsBuiltIn") as? NSNumber)?.boolValue == true
-    } != nil
+    let screenNumberKey = NSDeviceDescriptionKey("NSScreenNumber")
+    let hasBuiltIn = screens.contains { screen in
+        guard let number = screen.deviceDescription[screenNumberKey] as? NSNumber else {
+            return false
+        }
+        return CGDisplayIsBuiltin(CGDirectDisplayID(number.uint32Value)) != 0
+    }
 
     // If there are active screens but the built-in display is not among them,
     // the lid must be closed (clamshell mode with external display).
@@ -198,26 +202,27 @@ extension CalibrationData {
     }
 
     /// Load calibration data matching the current lid state.
-    /// Falls back to legacy `calibration.json` if no lid-state-specific file exists.
     public static func load() -> CalibrationData? {
         load(forLidClosed: isClamshellMode())
     }
 
     /// Load calibration data for a specific lid state.
-    /// Falls back to legacy `calibration.json` if no lid-state-specific file exists.
+    /// A missing state-specific file means that state is uncalibrated. Legacy
+    /// data is deliberately not substituted because it cannot reliably identify
+    /// the lid state in which it was recorded.
     public static func load(forLidClosed lidClosed: Bool) -> CalibrationData? {
-        // Try lid-state-specific file first
         let specificPath = Self.filePath(forLidClosed: lidClosed)
-        if let result = loadFromFile(specificPath) {
-            return result
-        }
+        return load(forLidClosed: lidClosed, from: specificPath)
+    }
 
-        // Fall back to legacy file (no lid state info, treat as lid-open)
-        if FileManager.default.fileExists(atPath: Self.legacyFilePath.path) {
-            return loadFromFile(Self.legacyFilePath)
+    /// Path-injectable loader used by tests and by the state-specific loader.
+    static func load(forLidClosed lidClosed: Bool, from specificPath: URL) -> CalibrationData? {
+        guard let calibration = loadFromFile(specificPath) else { return nil }
+        guard calibration.lidClosed == lidClosed else {
+            TFLogger.shared.error("Calibration file lid state does not match its filename — ignoring")
+            return nil
         }
-
-        return nil
+        return calibration
     }
 
     /// Check if any calibration data exists (lid-state-specific or legacy).

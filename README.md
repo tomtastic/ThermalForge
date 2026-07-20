@@ -17,15 +17,23 @@ This fork was created from **[mileadev/ThermalForge](https://github.com/mileadev
 
 ## Release
 
-Current fork release: **`v0.3.1`**
+Current fork release: **`v0.8.5`**
 
-- Release page: <https://github.com/tomtastic/ThermalForge/releases/tag/v0.3.1>
+- Release page: <https://github.com/tomtastic/ThermalForge/releases/tag/v0.8.5>
 - Artifacts:
   - `ThermalForge.app.zip`
   - `thermalforge-cli-macos-arm64.tar.gz`
   - `checksums.txt`
 
-`v0.3.1` adds:
+`v0.8.5` adds:
+- reliable open/closed lid detection using Core Graphics display metadata
+- exact calibration selection for the current lid state
+- uncalibrated status when the matching lid-state calibration file is absent
+- rejection of calibration files whose embedded lid state does not match their filename
+- menubar warning and one-click installation when the daemon is unavailable
+- bundled CLI/daemon binary inside the app release
+
+`v0.3.1` added:
 - hardened on-exit fan safety — explicit resetAuto with timeout on app quit
 - reduced daemon watchdog gap from ~25s to ~12s for faster fan recovery
 
