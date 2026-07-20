@@ -51,6 +51,8 @@ Questions to resolve during design:
 ### Code Simplification Audit
 
 Perform a focused codebase audit after this roadmap rewrite.
+The remaining remediation sequence and commit boundaries are tracked in the
+[code simplification plan](docs/code-simplification-plan.md).
 
 Initial targets:
 
