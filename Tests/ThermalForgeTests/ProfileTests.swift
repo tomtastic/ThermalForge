@@ -68,6 +68,15 @@ struct ProfileTests {
         #expect(ids.contains("smart"))
     }
 
+    @Test("Restored fan-controlling profiles require a daemon heartbeat")
+    func restoredProfileHeartbeatPolicy() {
+        #expect(!FanProfile.silent.requiresDaemonHeartbeat)
+        #expect(FanProfile.balanced.requiresDaemonHeartbeat)
+        #expect(FanProfile.performance.requiresDaemonHeartbeat)
+        #expect(FanProfile.max.requiresDaemonHeartbeat)
+        #expect(FanProfile.smart.requiresDaemonHeartbeat)
+    }
+
     @Test("Profile round-trips through JSON")
     func jsonRoundTrip() throws {
         for profile in FanProfile.builtIn {

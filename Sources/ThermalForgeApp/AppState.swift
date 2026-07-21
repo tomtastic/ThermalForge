@@ -108,8 +108,11 @@ final class AppState {
         rules = RulePersistence.load()
 
         startMonitoring()
-        // Heartbeat is started only when a fan-controlling profile is active
-        // (see syncHeartbeat). The default Silent profile needs none.
+        // A restored fan-controlling profile can issue its first command without
+        // passing through selectProfile(). Start its heartbeat immediately so
+        // the daemon watchdog does not mistake the live app for an abandoned
+        // controller and reset the fans every ten seconds.
+        syncHeartbeat(for: activeProfile)
 
         // Periodically check if daemon became available or went away
         startDaemonCheck()
@@ -127,10 +130,10 @@ final class AppState {
     /// pure 5s wake on both processes for nothing. Run it only for fan-
     /// controlling profiles.
     private func syncHeartbeat(for profile: FanProfile) {
-        if profile.curve.handsOff {
-            stopHeartbeat()
-        } else {
+        if profile.requiresDaemonHeartbeat {
             startHeartbeat()
+        } else {
+            stopHeartbeat()
         }
     }
 

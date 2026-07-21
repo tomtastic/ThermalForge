@@ -148,6 +148,12 @@ public struct FanProfile: Codable, Identifiable, Equatable {
         self.name = name
         self.curve = curve
     }
+
+    /// Manual fan control must be accompanied by the GUI heartbeat or the
+    /// daemon watchdog will safely return control to Apple defaults.
+    public var requiresDaemonHeartbeat: Bool {
+        !curve.handsOff
+    }
 }
 
 // MARK: - Built-in Profiles
