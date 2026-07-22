@@ -6,13 +6,13 @@ future work only.
 
 Current verified baseline:
 
-- 115 tests pass across 24 suites.
+- 120 tests pass across 25 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
   CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, and curve
-  construction have dedicated components or test seams. The CLI fan mutation
-  commands have moved out of the root entry file.
+  construction, and rule persistence mutations have dedicated components or
+  test seams. The CLI entry file now only registers commands.
 
 ## Working Rules
 
