@@ -63,6 +63,7 @@ public enum DaemonError: Error, CustomStringConvertible {
 }
 
 public final class DaemonClient {
+    private static let maximumResponseBytes = 64 * 1024
     private let socketPath: String
     /// Hard ceiling on a single daemon round-trip. A misbehaving or busy daemon
     /// (e.g. a slow SMC unlock) can never block the caller longer than this.
@@ -143,26 +144,14 @@ public final class DaemonClient {
         guard connectResult == 0 else { throw DaemonError.notRunning }
 
         let bytes = [UInt8](payload + [0x0A])
-        try writeAll(bytes, to: fd)
+        do {
+            try SocketFrameIO.writeAll(bytes, to: fd)
+        } catch {
+            throw DaemonError.connectionFailed
+        }
 
         // Read response — 64KB handles status JSON on sensor-rich machines
         return try readResponse(fd)
-    }
-
-    private func writeAll(_ bytes: [UInt8], to fd: Int32) throws {
-        var offset = 0
-        while offset < bytes.count {
-            let written = bytes.withUnsafeBufferPointer { buffer in
-                write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
-            }
-            if written > 0 {
-                offset += written
-            } else if written < 0, errno == EINTR {
-                continue
-            } else {
-                throw DaemonError.connectionFailed
-            }
-        }
     }
 
     private func shouldRetryLegacy(error: DaemonError, for request: DaemonRequest) -> Bool {
@@ -222,20 +211,20 @@ public final class DaemonClient {
     }
 
     private func readResponse(_ fd: Int32) throws -> Data {
-        var buffer = [UInt8](repeating: 0, count: 65536)
-        let n = read(fd, &buffer, buffer.count - 1)
-        if n > 0 {
-            return Data(buffer[0..<n])
-        }
-
-        if n == 0 {
+        do {
+            return try SocketFrameIO.readFrame(
+                from: fd,
+                maximumBytes: Self.maximumResponseBytes
+            )
+        } catch SocketFrameIOError.timedOut {
+            throw DaemonError.timedOut
+        } catch let SocketFrameIOError.frameTooLarge(maximumBytes) {
+            throw DaemonError.protocolError(
+                "response exceeded \(maximumBytes) bytes"
+            )
+        } catch {
             throw DaemonError.connectionFailed
         }
-
-        if errno == EAGAIN || errno == EWOULDBLOCK {
-            throw DaemonError.timedOut
-        }
-        throw DaemonError.connectionFailed
     }
 
     public func execute(_ command: FanCommand) throws {
@@ -300,6 +289,8 @@ enum HeartbeatWatchdog {
 }
 
 public final class DaemonServer {
+    static let maximumRequestBytes = 64 * 1024
+
     private let socketFD: Int32
     private let fanControl: FanControl
 
@@ -525,11 +516,21 @@ public final class DaemonServer {
             return
         }
 
-        var buffer = [UInt8](repeating: 0, count: 65536)
-        let n = read(fd, &buffer, buffer.count - 1)
-        guard n > 0 else { return }
-
-        let bytes = Data(buffer[0..<n])
+        let bytes: Data
+        do {
+            bytes = try SocketFrameIO.readFrame(
+                from: fd,
+                maximumBytes: Self.maximumRequestBytes
+            )
+        } catch let SocketFrameIOError.frameTooLarge(maximumBytes) {
+            writeResponse(
+                fd,
+                fallbackText: "error: request exceeds \(maximumBytes) bytes"
+            )
+            return
+        } catch {
+            return
+        }
         let request = decodeRequest(bytes)
 
         let response: DaemonResponse = {
@@ -622,17 +623,17 @@ public final class DaemonServer {
     }
 
     private func writeResponse(_ fd: Int32, typed: DaemonResponse? = nil, fallbackText: String) {
+        let responseBytes: [UInt8]
         if let typed, let data = try? DaemonCodec.encodeResponse(typed) {
-            let bytes = [UInt8](data)
-            _ = bytes.withUnsafeBufferPointer { buf in
-                write(fd, buf.baseAddress!, buf.count)
-            }
-            return
+            responseBytes = [UInt8](data) + [0x0A]
+        } else {
+            responseBytes = Array((fallbackText + "\n").utf8)
         }
 
-        let responseBytes = Array((fallbackText + "\n").utf8)
-        _ = responseBytes.withUnsafeBufferPointer { buf in
-            write(fd, buf.baseAddress!, buf.count)
+        do {
+            try SocketFrameIO.writeAll(responseBytes, to: fd)
+        } catch {
+            TFLogger.shared.error("Daemon response write failed: \(error)")
         }
     }
 

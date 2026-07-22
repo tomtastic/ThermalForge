@@ -6,14 +6,16 @@ future work only.
 
 Current verified baseline:
 
-- 136 tests pass across 28 suites.
+- 140 tests pass across 29 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
   CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, and curve
   construction, rule persistence mutations, runtime anomaly observation, and
   runtime control decisions, and fan unlock/write paths have dedicated
-  components or test seams. The CLI entry file now only registers commands.
+  components or test seams. Daemon requests and responses use bounded,
+  newline-delimited framing with complete writes. The CLI entry file now only
+  registers commands.
 
 ## Working Rules
 
@@ -23,18 +25,6 @@ Current verified baseline:
 - Run `swift test` before every commit and a release build after each phase.
 - Do not mix visualization, update notifications, or unrelated feature work
   into these refactors.
-
-## Phase 6: Hardware and Transport Cleanup
-
-### 15. Harden daemon server framing
-
-- Reuse a complete-write helper for daemon responses.
-- Define an explicit maximum request size and newline framing behavior.
-- Handle interrupted and partial reads without changing the current JSON/text
-  compatibility policy.
-- Keep peer-UID authorization and serialized SMC access unchanged.
-
-Commit boundary: server transport hardening with Unix-socket integration tests.
 
 ## Completion Criteria
 
