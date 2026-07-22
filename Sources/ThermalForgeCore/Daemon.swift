@@ -263,15 +263,6 @@ public final class DaemonClient {
         }
     }
 
-    public func fetchRules() throws -> [ThermalRule] {
-        let response = try send(DaemonRequest(command: "rules.list"))
-        if !response.ok {
-            let err = response.error ?? DaemonErrorPayload(code: "daemon_error", message: response.message ?? "unknown")
-            throw DaemonError.commandFailed(code: err.code, message: err.message)
-        }
-        return response.rules ?? []
-    }
-
     private func legacyCommandToRequest(_ command: String) throws -> DaemonRequest {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: " ")
@@ -606,58 +597,6 @@ public final class DaemonServer {
         case "heartbeat":
             recordHeartbeat()
             return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
-
-        case "rules.list":
-            return DaemonResponse(requestID: request.requestID, ok: true, rules: RulePersistence.load())
-
-        case "rules.put":
-            guard let rule = request.rule else {
-                return DaemonResponse(requestID: request.requestID, ok: false, error: DaemonErrorPayload(code: "validation_error", message: "missing rule payload"))
-            }
-            var rules = RulePersistence.load()
-            if let idx = rules.firstIndex(where: { $0.id == rule.id }) {
-                rules[idx] = rule
-            } else {
-                rules.append(rule)
-            }
-            do {
-                try RulePersistence.save(rules)
-                return DaemonResponse(requestID: request.requestID, ok: true, rules: rules)
-            } catch {
-                TFLogger.shared.event(ThermalEvent(type: .daemonCommandFailed, details: "rules.put failed: \(error)"))
-                return DaemonResponse(requestID: request.requestID, ok: false, error: DaemonErrorPayload(code: "persist_failed", message: "\(error)"))
-            }
-
-        case "rules.remove":
-            guard let ruleID = request.ruleID else {
-                return DaemonResponse(requestID: request.requestID, ok: false, error: DaemonErrorPayload(code: "validation_error", message: "missing ruleID"))
-            }
-            var rules = RulePersistence.load()
-            rules.removeAll(where: { $0.id == ruleID })
-            do {
-                try RulePersistence.save(rules)
-                return DaemonResponse(requestID: request.requestID, ok: true, rules: rules)
-            } catch {
-                TFLogger.shared.event(ThermalEvent(type: .daemonCommandFailed, details: "rules.remove failed: \(error)"))
-                return DaemonResponse(requestID: request.requestID, ok: false, error: DaemonErrorPayload(code: "persist_failed", message: "\(error)"))
-            }
-
-        case "rules.enable", "rules.disable":
-            guard let ruleID = request.ruleID else {
-                return DaemonResponse(requestID: request.requestID, ok: false, error: DaemonErrorPayload(code: "validation_error", message: "missing ruleID"))
-            }
-            let desired = request.command == "rules.enable"
-            var rules = RulePersistence.load()
-            if let idx = rules.firstIndex(where: { $0.id == ruleID }) {
-                rules[idx].enabled = desired
-            }
-            do {
-                try RulePersistence.save(rules)
-                return DaemonResponse(requestID: request.requestID, ok: true, rules: rules)
-            } catch {
-                TFLogger.shared.event(ThermalEvent(type: .daemonCommandFailed, details: "\(request.command) failed: \(error)"))
-                return DaemonResponse(requestID: request.requestID, ok: false, error: DaemonErrorPayload(code: "persist_failed", message: "\(error)"))
-            }
 
         default:
             TFLogger.shared.event(ThermalEvent(type: .daemonCommandRejected, details: "unknown command: \(request.command)"))

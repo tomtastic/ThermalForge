@@ -6,19 +6,11 @@ import Testing
 struct DaemonCodecTests {
     @Test("Request round-trip")
     func requestRoundTrip() throws {
-        let rule = ThermalRule(
-            id: "rule-1",
-            name: "example",
-            enabled: true,
-            priority: 900,
-            condition: ThermalRuleCondition(metric: .maxTemp, comparator: .greaterThanOrEqual, valueCelsius: 55),
-            action: .setMax,
-            untilTempBelowC: 65
-        )
-        let original = DaemonRequest(command: "rules.put", rpm: nil, rule: rule, ruleID: nil)
+        let original = DaemonRequest(requestID: "abc", command: "set", rpm: 4_200)
         let encoded = try DaemonCodec.encodeRequest(original)
         let decoded = try DaemonCodec.decodeRequest(encoded)
         #expect(decoded == original)
+        #expect(String(decoding: encoded, as: UTF8.self) == "{\"command\":\"set\",\"requestID\":\"abc\",\"rpm\":4200,\"version\":1}")
     }
 
     @Test("Response round-trip with error")
@@ -28,7 +20,6 @@ struct DaemonCodecTests {
             ok: false,
             message: nil,
             status: nil,
-            rules: nil,
             error: DaemonErrorPayload(code: "validation_error", message: "missing rule")
         )
         let encoded = try DaemonCodec.encodeResponse(original)

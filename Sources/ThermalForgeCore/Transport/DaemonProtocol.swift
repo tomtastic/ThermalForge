@@ -5,23 +5,17 @@ public struct DaemonRequest: Codable, Equatable {
     public var requestID: String
     public var command: String
     public var rpm: Int?
-    public var rule: ThermalRule?
-    public var ruleID: String?
 
     public init(
         version: Int = 1,
         requestID: String = UUID().uuidString,
         command: String,
-        rpm: Int? = nil,
-        rule: ThermalRule? = nil,
-        ruleID: String? = nil
+        rpm: Int? = nil
     ) {
         self.version = version
         self.requestID = requestID
         self.command = command
         self.rpm = rpm
-        self.rule = rule
-        self.ruleID = ruleID
     }
 }
 
@@ -41,7 +35,6 @@ public struct DaemonResponse: Codable, Equatable {
     public var ok: Bool
     public var message: String?
     public var status: ThermalStatus?
-    public var rules: [ThermalRule]?
     public var error: DaemonErrorPayload?
 
     public init(
@@ -50,7 +43,6 @@ public struct DaemonResponse: Codable, Equatable {
         ok: Bool,
         message: String? = nil,
         status: ThermalStatus? = nil,
-        rules: [ThermalRule]? = nil,
         error: DaemonErrorPayload? = nil
     ) {
         self.version = version
@@ -58,7 +50,6 @@ public struct DaemonResponse: Codable, Equatable {
         self.ok = ok
         self.message = message
         self.status = status
-        self.rules = rules
         self.error = error
     }
 }

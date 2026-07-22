@@ -21,29 +21,6 @@ Current verified baseline:
 - Do not mix visualization, update notifications, or unrelated feature work
   into these refactors.
 
-## Phase 2: Consolidate Rule Handling
-
-### 5. Resolve the unused daemon rule API
-
-The app and CLI read and write `rules.json` directly. The daemon's rule mutation
-endpoints have no callers and resolve persistence under root's home, creating a
-second disconnected rule store.
-
-Recommended decision: remove `fetchRules`, `rules.list`, `rules.put`,
-`rules.remove`, `rules.enable`, and `rules.disable` from the daemon protocol.
-Also remove the now-unused rule payload fields from daemon request/response
-models.
-
-If external daemon rule clients must be supported instead, route all rule
-storage through an explicitly selected console-user store and make the app and
-CLI use that API. Do not retain two authoritative stores.
-
-Commit boundary: protocol simplification, codec fixtures, and removal of daemon
-mutation code.
-
-Keep the legacy text fallback for basic fan commands until a deliberate 1.0
-compatibility review.
-
 ## Phase 3: Split Calibration by Responsibility
 
 `Calibration.swift` still combines lid detection, workload discovery, CPU/GPU
