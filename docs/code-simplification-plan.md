@@ -6,14 +6,14 @@ future work only.
 
 Current verified baseline:
 
-- 128 tests pass across 27 suites.
+- 131 tests pass across 28 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
   CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, and curve
-  construction, rule persistence mutations, and runtime anomaly observation
-  have dedicated components or test seams. The CLI entry file now only
-  registers commands.
+  construction, rule persistence mutations, runtime anomaly observation, and
+  runtime control decisions have dedicated components or test seams. The CLI
+  entry file now only registers commands.
 
 ## Working Rules
 
@@ -23,24 +23,6 @@ Current verified baseline:
 - Run `swift test` before every commit and a release build after each phase.
 - Do not mix visualization, update notifications, or unrelated feature work
   into these refactors.
-
-## Phase 5: Narrow the Runtime Control Loop
-
-### 13. Separate observation from fan decisions
-
-`ThermalMonitor.tick()` still performs sensor acquisition, safety evaluation,
-rule preemption, profile control, cadence changes, and UI publication.
-
-Plan:
-
-- Sequence tests now cover safety trigger/clear, rule preemption, Smart ramping,
-  profile hysteresis, and idle cadence transitions.
-- Keep sensor polling and scheduling in `ThermalMonitor`.
-- Extract a pure control decision input/output model for safety, rules, and
-  profiles.
-- Keep actual daemon/SMC commands at the outer boundary.
-
-Commit boundary: control decision extraction.
 
 ## Phase 6: Hardware and Transport Cleanup
 

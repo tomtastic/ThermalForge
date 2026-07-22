@@ -51,38 +51,11 @@ struct ElapsedCadence {
     }
 }
 
-struct TemperatureRateHistory {
-    private let capacity: Int
-    private var samples: [(time: TimeInterval, temperature: Float)] = []
-
-    init(capacity: Int = 4) {
-        self.capacity = max(capacity, 2)
-    }
-
-    mutating func record(_ temperature: Float, at time: TimeInterval) {
-        samples.append((time, temperature))
-        if samples.count > capacity {
-            samples.removeFirst(samples.count - capacity)
-        }
-    }
-
-    mutating func removeAll() {
-        samples.removeAll()
-    }
-
-    var ratePerSecond: Float {
-        guard let oldest = samples.first, let newest = samples.last else { return 0 }
-        let elapsed = newest.time - oldest.time
-        guard elapsed > 0 else { return 0 }
-        return (newest.temperature - oldest.temperature) / Float(elapsed)
-    }
-}
-
 // MARK: - Thermal Monitor
 
 public final class ThermalMonitor {
     private let sensorProvider: SensorProvider
-    private let controlService: ControlService
+    private let decisionEngine: RuntimeControlDecisionEngine
     private let lidStateProvider: any LidStateProvider
     private let now: () -> TimeInterval
     private let calibrationLoader: (Bool) -> CalibrationData?
@@ -90,8 +63,8 @@ public final class ThermalMonitor {
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.thermalforge.monitor", qos: .utility)
 
-    public private(set) var activeProfile: FanProfile
-    public private(set) var state: MonitorState = .idle
+    public var activeProfile: FanProfile { decisionEngine.activeProfile }
+    public var state: MonitorState { decisionEngine.state }
     public private(set) var latestStatus: ThermalStatus?
 
     // MARK: - Tick Timing
@@ -129,22 +102,6 @@ public final class ThermalMonitor {
     /// start temp doesn't flap the timer. Returns to fast immediately on activity.
     private static let idleConfirmTicks = 8
     private var consecutiveIdleTicks = 0
-
-    /// Re-apply an active rule command periodically for resilience without saturating daemon I/O.
-    private static let ruleCommandRefreshInterval: TimeInterval = 5
-
-    // MARK: - Fan State
-
-    private var lastAppliedRPMPercent: Float = 0
-    private var fansCurrentlyRunning = false
-    private var sustainedAboveCount = 0
-    private var lastRuleDecision: RuleDecision?
-    private var lastRuleCommandAppliedAt: Date?
-    private var lastSafetyCommandAppliedAt: TimeInterval?
-
-    // MARK: - Smart Profile State
-
-    private var tempHistory = TemperatureRateHistory()
 
     // MARK: - Anomaly Detection
 
@@ -233,8 +190,10 @@ public final class ThermalMonitor {
         anomalyObserver: any ThermalAnomalyObserving
     ) {
         self.sensorProvider = sensorProvider
-        self.activeProfile = profile
-        self.controlService = controlService
+        decisionEngine = RuntimeControlDecisionEngine(
+            profile: profile,
+            controlService: controlService
+        )
         self.lidStateProvider = lidStateProvider
         self.now = now
         self.calibrationLoader = calibrationLoader
@@ -266,7 +225,7 @@ public final class ThermalMonitor {
 
     public func updateRules(_ rules: [ThermalRule], enabled: Bool) {
         queue.async { [self] in
-            controlService.replaceRules(rules, enabled: enabled)
+            decisionEngine.replaceRules(rules, enabled: enabled)
         }
     }
 
@@ -321,9 +280,8 @@ public final class ThermalMonitor {
         // we're near the safety ceiling. Fans merely running at a STEADY speed
         // doesn't need 4–10 Hz — so a warm idle on Performance (fans holding at
         // minimum at ~56°C) relaxes to the slow rate instead of polling fast.
-        let engaging = !activeProfile.curve.handsOff && !fansCurrentlyRunning && sustainedAboveCount > 0
         let busy = fanChanged
-            || engaging
+            || decisionEngine.isEngaging
             || state == .safetyOverride
             || maxTemp >= Self.safetyWatchTemp
 
@@ -348,19 +306,12 @@ public final class ThermalMonitor {
     /// Update the active profile.
     public func switchProfile(_ profile: FanProfile) {
         queue.async { [self] in
-            activeProfile = profile
-            lastAppliedRPMPercent = 0
-            fansCurrentlyRunning = false
-            sustainedAboveCount = 0
+            decisionEngine.switchProfile(profile)
             lastFullStatusAt = nil
             lastMonitorTickAt = nil
-            lastRuleDecision = nil
-            lastRuleCommandAppliedAt = nil
-            lastSafetyCommandAppliedAt = nil
 
             if profile.id == "smart" {
-                // Reset Smart state and reload calibration data for current lid state.
-                tempHistory.removeAll()
+                // Reload calibration data for current lid state.
                 calibrationLidClosed = lidStateProvider.isLidClosed
                 let loaded = calibrationLoader(calibrationLidClosed)
                 if let error = loaded?.validationError {
@@ -370,8 +321,6 @@ public final class ThermalMonitor {
                     calibration = loaded
                 }
             }
-
-            state = controlService.transition(.idle)
         }
     }
 
@@ -415,155 +364,32 @@ public final class ThermalMonitor {
         if monitorDue, let status {
             monitorTick(status: status, maxTemp: maxTemp)
             lastMonitorTickAt = now
-            if activeProfile.id == "smart" {
-                tempHistory.record(maxTemp, at: now)
-            }
         }
 
-        // Safety override: any CPU/GPU sensor > 95°C
-        if maxTemp >= FanProfile.safetyTempThreshold {
-            lastRuleDecision = nil
-            lastRuleCommandAppliedAt = nil
-            let shouldApplySafetyCommand = lastSafetyCommandAppliedAt.map {
-                now - $0 >= Self.ruleCommandRefreshInterval
-            } ?? true
-            if shouldApplySafetyCommand {
-                applyCommand(.setMax)
-                lastSafetyCommandAppliedAt = now
-            }
-            if state != .safetyOverride {
-                state = controlService.transition(.safetyTriggered)
-                fansCurrentlyRunning = true
-                lastAppliedRPMPercent = 1.0
-                TFLogger.shared.safety("Override triggered: \(String(format: "%.1f", maxTemp))°C — fans maxed")
-                TFLogger.shared.event(ThermalEvent(type: .safetyOverrideTriggered, details: "maxTemp=\(String(format: "%.1f", maxTemp))"))
-            }
-            if let status { onUpdate?(status, activeProfile, state, calibrationState) }
-            applyCadence(maxTemp: maxTemp, fanChanged: shouldApplySafetyCommand)
-            return
-        }
-
-        // Clear safety override with hysteresis.
-        if state == .safetyOverride {
-            if maxTemp < FanProfile.safetyTempThreshold - FanProfile.hysteresisDegrees {
-                state = controlService.transition(.safetyCleared)
-                lastSafetyCommandAppliedAt = nil
-                TFLogger.shared.event(ThermalEvent(type: .safetyOverrideCleared, details: "maxTemp=\(String(format: "%.1f", maxTemp))"))
-            } else {
-                let shouldApplySafetyCommand = lastSafetyCommandAppliedAt.map {
-                    now - $0 >= Self.ruleCommandRefreshInterval
-                } ?? true
-                if shouldApplySafetyCommand {
-                    applyCommand(.setMax)
-                    lastSafetyCommandAppliedAt = now
-                }
-                if let status { onUpdate?(status, activeProfile, state, calibrationState) }
-                applyCadence(maxTemp: maxTemp, fanChanged: shouldApplySafetyCommand)
-                return
-            }
-        }
-
-        // Sustained trigger: track consecutive ticks above start threshold.
-        let startThreshold = activeProfile.curve.startTemp
-        if maxTemp >= startThreshold {
-            sustainedAboveCount += 1
-        } else {
-            sustainedAboveCount = 0
-        }
-
-        // Rule engine preemption (after safety, before profile curve).
-        if let status {
-            let temperatures = TemperatureSummary(status.temperatures)
-            let context = RuleEvaluationContext(
-                cpuTemp: temperatures.cpu ?? 0,
-                gpuTemp: temperatures.gpu ?? 0,
-                maxTemp: maxTemp
-            )
-            if let decision = controlService.evaluateRules(context: context) {
-                let decisionChanged = decision != lastRuleDecision
-                var preempted = false
-
-                if let profileID = decision.profileID,
-                   let targetProfile = FanProfile.builtIn.first(where: { $0.id == profileID })
-                {
-                    if decisionChanged || activeProfile.id != targetProfile.id {
-                        activeProfile = targetProfile
-                    }
-                    preempted = true
-                }
-
-                let fanLimits = status.fans.first
-                    .map { (min: Float($0.minRPM), max: Float($0.maxRPM)) }
-                    ?? (min: 2317, max: 7826)
-                if let command = decision.resolvedFanCommand(
-                    minRPM: fanLimits.min,
-                    maxRPM: fanLimits.max
-                ) {
-                    let shouldReapply: Bool
-                    if decisionChanged {
-                        shouldReapply = true
-                    } else if let lastAppliedAt = lastRuleCommandAppliedAt {
-                        shouldReapply = Date().timeIntervalSince(lastAppliedAt) >= Self.ruleCommandRefreshInterval
-                    } else {
-                        shouldReapply = true
-                    }
-
-                    if shouldReapply {
-                        applyCommand(command)
-                        lastRuleCommandAppliedAt = Date()
-                    }
-
-                    switch command {
-                    case .setMax:
-                        lastAppliedRPMPercent = 1.0
-                        fansCurrentlyRunning = true
-                        state = controlService.transition(.profileActive("Rule: \(decision.sourceRuleName)"))
-                    case .setRPM(let rpm):
-                        let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
-                        lastAppliedRPMPercent = min(max(rpm / maxRPM, 0), 1)
-                        fansCurrentlyRunning = rpm > 0
-                        state = controlService.transition(.profileActive("Rule: \(decision.sourceRuleName)"))
-                    case .resetAuto:
-                        lastAppliedRPMPercent = 0
-                        fansCurrentlyRunning = false
-                        state = controlService.transition(.idle)
-                    }
-                    preempted = true
-                }
-
-                if preempted {
-                    if decisionChanged {
-                        TFLogger.shared.event(ThermalEvent(type: .ruleTriggered, details: "rule=\(decision.sourceRuleID) name=\(decision.sourceRuleName)"))
-                    }
-                    lastRuleDecision = decision
-                    onUpdate?(status, activeProfile, state, calibrationState)
-                    return
-                }
-            }
-        }
-
-        lastRuleDecision = nil
-        lastRuleCommandAppliedAt = nil
-
-        // Profile-specific logic — fan min/max are firmware-static (cached).
-        // Track whether the applied fan speed actually moved this tick: that's
-        // the signal for fast polling (ramping) vs relaxing (holding steady).
-        let appliedBefore = lastAppliedRPMPercent
-        let runningBefore = fansCurrentlyRunning
         let limits = (sensorProvider as? FanControl)?.primaryFanLimits() ?? (2317, 7826)
-        let (minRPM, maxRPM) = limits
+        let output = decisionEngine.evaluate(RuntimeControlInput(
+            status: status,
+            maxTemp: maxTemp,
+            fanLimits: RuntimeFanLimits(minRPM: limits.0, maxRPM: limits.1),
+            now: now,
+            tickInterval: tickInterval,
+            recordTemperatureRate: monitorDue && status != nil,
+            calibration: calibration
+        ))
 
-        if activeProfile.id == "smart" {
-            tickSmart(peakTemp: maxTemp, minRPM: minRPM, maxRPM: maxRPM)
-        } else {
-            tickCurve(peakTemp: maxTemp, minRPM: minRPM, maxRPM: maxRPM)
+        if let command = output.command {
+            applyCommand(command)
         }
-        let fanChanged = lastAppliedRPMPercent != appliedBefore || fansCurrentlyRunning != runningBefore
+        for notice in output.notices {
+            logControlNotice(notice)
+        }
 
         // Publish whenever this tick produced the full UI status snapshot.
         if let status { onUpdate?(status, activeProfile, state, calibrationState) }
 
-        applyCadence(maxTemp: maxTemp, fanChanged: fanChanged)
+        if output.shouldApplyCadence {
+            applyCadence(maxTemp: maxTemp, fanChanged: output.fanChanged)
+        }
     }
 
     // MARK: - Monitor Cadence (target ~2 seconds)
@@ -579,162 +405,30 @@ public final class ThermalMonitor {
         )
     }
 
-    // MARK: - Smart Profile
-
-    private static let smartCeiling: Float = 85.0
-    private static let smartFloor: Float = 53.0
-    private static let smartStopTemp: Float = 50.0
-
-    private func tickSmart(peakTemp: Float, minRPM: Float, maxRPM: Float) {
-        let minPct = minRPM / maxRPM
-
-        if peakTemp < Self.smartStopTemp && fansCurrentlyRunning && rateOfChange() <= 0 {
-            applyCommand(.resetAuto)
-            lastAppliedRPMPercent = 0
-            fansCurrentlyRunning = false
-            state = controlService.transition(.idle)
-            TFLogger.shared.fan("Smart fans off: \(String(format: "%.1f", peakTemp))°C below \(Int(Self.smartStopTemp))°C")
-            return
-        }
-
-        if peakTemp < Self.smartFloor && !fansCurrentlyRunning {
-            return
-        }
-
-        if peakTemp >= Self.smartStopTemp && peakTemp < Self.smartFloor && !fansCurrentlyRunning {
-            return
-        }
-
-        let sustainedTicksNeeded = Int(activeProfile.curve.sustainedTriggerSec / tickInterval)
-        if !fansCurrentlyRunning && sustainedAboveCount < sustainedTicksNeeded {
-            if sustainedAboveCount == 1 {
-                TFLogger.shared.fan("Sustained trigger: \(String(format: "%.1f", peakTemp))°C — waiting (\(sustainedAboveCount)/\(sustainedTicksNeeded)) [Smart]")
-            }
-            return
-        }
-
-        let rate = rateOfChange()
-        var targetPct: Float
-
-        if let cal = calibration, let calPct = cal.fanPercentForTemp(peakTemp) {
-            targetPct = calPct
-            if rate > 0 {
-                let urgency = min(max((peakTemp - Self.smartFloor) / (Self.smartCeiling - Self.smartFloor), 0), 1)
-                targetPct = min(targetPct + rate * 0.15 * (1 + urgency), 1.0)
-            }
-        } else {
-            let range = Self.smartCeiling - Self.smartFloor
-            let position = min(max((peakTemp - Self.smartFloor) / range, 0), 1)
-            targetPct = position * position * (3 - 2 * position)
-            if rate > 0 {
-                targetPct = min(targetPct + rate * 0.2, 1.0)
-            }
-        }
-
-        if peakTemp > Self.smartCeiling {
-            targetPct = 1.0
-        }
-
-        targetPct = min(max(targetPct, 0), 1.0)
-        if targetPct > 0 && targetPct < minPct {
-            targetPct = minPct
-        }
-
-        let rampUp = activeProfile.curve.rampUpPerSec * tickInterval
-        let rampDown = activeProfile.curve.rampDownPerSec * tickInterval
-
-        if targetPct > lastAppliedRPMPercent {
-            targetPct = min(targetPct, lastAppliedRPMPercent + rampUp)
-        } else if targetPct < lastAppliedRPMPercent {
-            targetPct = max(targetPct, lastAppliedRPMPercent - rampDown)
-        }
-
-        if abs(targetPct - lastAppliedRPMPercent) > 0.002 {
-            let targetRPM = max(maxRPM * targetPct, minRPM)
-            applyCommand(.setRPM(targetRPM))
-
-            if !fansCurrentlyRunning {
-                TFLogger.shared.fan("Smart fans on: \(Int(targetRPM)) RPM at \(String(format: "%.1f", peakTemp))°C")
-            }
-
-            lastAppliedRPMPercent = targetPct
-            fansCurrentlyRunning = true
-            state = controlService.transition(.profileActive("Smart"))
-        } else if fansCurrentlyRunning {
-            state = controlService.transition(.profileActive("Smart"))
-        }
-    }
-
-    /// Temperature rate of change in °C per second (smoothed over history).
-    private func rateOfChange() -> Float {
-        tempHistory.ratePerSecond
-    }
-
-    // MARK: - Curve-Based Profiles
-
-    private func tickCurve(peakTemp: Float, minRPM: Float, maxRPM: Float) {
-        let curve = activeProfile.curve
-
-        if curve.handsOff {
-            if fansCurrentlyRunning {
-                applyCommand(.resetAuto)
-                fansCurrentlyRunning = false
-                lastAppliedRPMPercent = 0
-                state = controlService.transition(.idle)
-            }
-            return
-        }
-
-        guard let rawTarget = curve.targetPercent(at: peakTemp, fansCurrentlyRunning: fansCurrentlyRunning) else {
-            if fansCurrentlyRunning {
-                applyCommand(.resetAuto)
-                fansCurrentlyRunning = false
-                lastAppliedRPMPercent = 0
-                state = controlService.transition(.idle)
-                TFLogger.shared.fan("Fans off: \(String(format: "%.1f", peakTemp))°C below \(Int(curve.stopTemp))°C [\(activeProfile.name)]")
-            }
-            return
-        }
-
-        let sustainedTicksNeeded = Int(curve.sustainedTriggerSec / tickInterval)
-        if !fansCurrentlyRunning && sustainedAboveCount < sustainedTicksNeeded {
-            if sustainedAboveCount == 1 {
-                TFLogger.shared.fan("Sustained trigger: \(String(format: "%.1f", peakTemp))°C — waiting (\(sustainedAboveCount)/\(sustainedTicksNeeded)) [\(activeProfile.name)]")
-            }
-            return
-        }
-
-        var targetPct = rawTarget <= 0.001 ? minRPM / maxRPM : rawTarget
-        targetPct = min(max(targetPct, minRPM / maxRPM), curve.maxRPMPercent)
-
-        let rampUp = curve.rampUpPerSec * tickInterval
-        let rampDown = curve.rampDownPerSec * tickInterval
-
-        if targetPct > lastAppliedRPMPercent {
-            if !curve.instantEngage {
-                targetPct = min(targetPct, lastAppliedRPMPercent + rampUp)
-            }
-        } else if targetPct < lastAppliedRPMPercent {
-            targetPct = max(targetPct, lastAppliedRPMPercent - rampDown)
-        }
-
-        if abs(targetPct - lastAppliedRPMPercent) > 0.002 {
-            let targetRPM = max(maxRPM * targetPct, minRPM)
-            applyCommand(.setRPM(targetRPM))
-
-            if !fansCurrentlyRunning {
-                TFLogger.shared.fan("Fans on: \(Int(targetRPM)) RPM at \(String(format: "%.1f", peakTemp))°C [\(activeProfile.name)]")
-            }
-
-            lastAppliedRPMPercent = targetPct
-            fansCurrentlyRunning = true
-            state = controlService.transition(.profileActive(activeProfile.name))
-        } else if fansCurrentlyRunning {
-            state = controlService.transition(.profileActive(activeProfile.name))
-        }
-    }
-
     // MARK: - Helpers
+
+    private func logControlNotice(_ notice: RuntimeControlNotice) {
+        switch notice {
+        case let .safetyTriggered(maxTemp):
+            TFLogger.shared.safety("Override triggered: \(String(format: "%.1f", maxTemp))°C — fans maxed")
+            TFLogger.shared.event(ThermalEvent(
+                type: .safetyOverrideTriggered,
+                details: "maxTemp=\(String(format: "%.1f", maxTemp))"
+            ))
+        case let .safetyCleared(maxTemp):
+            TFLogger.shared.event(ThermalEvent(
+                type: .safetyOverrideCleared,
+                details: "maxTemp=\(String(format: "%.1f", maxTemp))"
+            ))
+        case let .ruleTriggered(id, name):
+            TFLogger.shared.event(ThermalEvent(
+                type: .ruleTriggered,
+                details: "rule=\(id) name=\(name)"
+            ))
+        case let .fan(message):
+            TFLogger.shared.fan(message)
+        }
+    }
 
     private func applyCommand(_ command: FanCommand) {
         do {
