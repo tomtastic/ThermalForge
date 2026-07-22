@@ -345,7 +345,7 @@ public final class CalibrationRunner {
 
     /// Cleanup: always stop stress, reset fans, close CSV on any exit path
     private func cleanup() {
-        stopStress()
+        calibrationWorkload.stop()
         try? fanControl.resetAuto()
         csvHandle?.closeFile()
         csvHandle = nil
@@ -382,9 +382,6 @@ public final class CalibrationRunner {
 
     /// Ceiling: record data and skip remaining lower fan levels
     private static let ceilingTemp: Float = 84.0
-
-    /// Safety: abort and max fans
-    private static let safetyTemp: Float = 90.0
 
     /// Run full calibration. Blocks until complete.
     public func run() throws -> CalibrationData {
@@ -481,99 +478,44 @@ public final class CalibrationRunner {
 
         // Phase 2: Fan-level stabilization sweep (high to low)
         log("Phase 2: Starting fan-level sweep (intensity: \(String(format: "%.5f", baselineIntensity)))...")
-        startStress(intensity: baselineIntensity)
-
-        var rawData: [(fanPct: Float, equilTemp: Float)] = []
-        var abortLowerLevels = false
-        var unstableFanLevels: [Int] = []
-
-        for (_, fanPct) in levels.enumerated() {
-            try throwIfCancelled()
-            guard !abortLowerLevels else { break }
-
-            let targetRPM = Swift.max(maxRPM * fanPct, minRPM)
-            log("[\(Int(fanPct * 100))%] Setting fans to \(Int(targetRPM)) RPM — waiting for stabilization...")
-
-            try fanControl.setAllFans(rpm: targetRPM)
-
-            var readings: [Float] = []
-            let levelStart = DispatchTime.now().uptimeNanoseconds
-            let deadline = Date().addingTimeInterval(TimeInterval(mode.maxWaitPerLevel))
-            var stabilized = false
-
-            while Date() < deadline {
-                try throwIfCancelled()
-                let elapsedSeconds = Int(
-                    (DispatchTime.now().uptimeNanoseconds - levelStart) / 1_000_000_000
+        let sweep = EquilibriumSweep(
+            configuration: .init(maximumWaitPerLevel: TimeInterval(mode.maxWaitPerLevel)),
+            levels: levels,
+            minimumRPM: minRPM,
+            maximumRPM: maxRPM,
+            workloadIntensity: baselineIntensity,
+            workload: calibrationWorkload,
+            workloadWarning: { [self] in gpuStressWorkload?.lastWarning },
+            convergence: convergenceModel,
+            setFanRPM: { [self] rpm in try fanControl.setAllFans(rpm: rpm) },
+            setMaximumFans: { [self] in try fanControl.setMax() },
+            sample: { [self] in calibrationTemperature() },
+            onSample: { [self] fanPercent, temperature in
+                let fan0RPM = (try? fanControl.fanInfo(0))?.actualRPM ?? 0
+                let fan1RPM = fanCount > 1
+                    ? ((try? fanControl.fanInfo(1))?.actualRPM ?? 0)
+                    : 0
+                let timestamp = isoFormatter.string(from: Date())
+                csvWrite(
+                    "\(timestamp),\(String(format: "%.2f", fanPercent)),"
+                        + "\(String(format: "%.1f", temperature.selected)),"
+                        + "\(String(format: "%.1f", temperature.cpu)),"
+                        + "\(String(format: "%.1f", temperature.gpu)),"
+                        + "\(Int(fan0RPM)),\(Int(fan1RPM)),stabilizing"
                 )
-                guard let temperature = calibrationTemperature() else {
-                    try wait(for: 2)
-                    continue
-                }
-                let temp = temperature.selected
-                readings.append(temp)
-
-                // CSV logging
-                let fan0rpm = (try? fanControl.fanInfo(0))?.actualRPM ?? 0
-                let fan1rpm = fanCount > 1 ? ((try? fanControl.fanInfo(1))?.actualRPM ?? 0) : 0
-                let ts = isoFormatter.string(from: Date())
-                csvWrite("\(ts),\(String(format: "%.2f", fanPct)),\(String(format: "%.1f", temp)),\(String(format: "%.1f", temperature.cpu)),\(String(format: "%.1f", temperature.gpu)),\(Int(fan0rpm)),\(Int(fan1rpm)),stabilizing")
-
-                // Safety: abort if too hot
-                if temp >= Self.safetyTemp {
-                    log("[\(Int(fanPct * 100))%] Safety at \(String(format: "%.0f", temp))°C — maxing fans, skipping lower levels")
-                    try fanControl.setMax()
-                    try wait(for: 30)
-                    rawData.append((fanPct: fanPct, equilTemp: Self.ceilingTemp))
-                    abortLowerLevels = true
-                    break
-                }
-
-                // Ceiling: record and skip lower levels
-                if temp >= Self.ceilingTemp {
-                    log("[\(Int(fanPct * 100))%] Ceiling reached at \(String(format: "%.1f", temp))°C")
-                    rawData.append((fanPct: fanPct, equilTemp: Self.ceilingTemp))
-                    abortLowerLevels = true
-                    break
-                }
-
-                // Check stabilization
-                if let metrics = convergenceModel.metrics(readings: readings),
-                   convergenceModel.accepts(metrics)
-                {
-                    let equilTemp = metrics.mean
-                    log("[\(Int(fanPct * 100))%] Stabilized at \(String(format: "%.1f", equilTemp))°C (\(elapsedSeconds)s)")
-                    log("  \(convergenceModel.format(metrics))")
-                    rawData.append((fanPct: fanPct, equilTemp: equilTemp))
-                    stabilized = true
-                    break
-                }
-
-                if readings.count >= convergenceModel.windowSize,
-                   readings.count % 15 == 0,
-                   let metrics = convergenceModel.metrics(readings: readings)
-                {
-                    log("[\(Int(fanPct * 100))%] Still converging (\(elapsedSeconds)s): \(convergenceModel.format(metrics))")
-                }
-
-                try wait(for: 2)
-            }
-
-            // Never turn an arbitrary timeout average into calibration data.
-            if !stabilized && !abortLowerLevels {
-                unstableFanLevels.append(Int(fanPct * 100))
-                let elapsedSeconds = Int(
-                    (DispatchTime.now().uptimeNanoseconds - levelStart) / 1_000_000_000
-                )
-                if let metrics = convergenceModel.metrics(readings: readings) {
-                    log("[\(Int(fanPct * 100))%] Timeout — excluded unstable level (\(elapsedSeconds)s): \(convergenceModel.format(metrics))")
-                } else {
-                    log("[\(Int(fanPct * 100))%] Timeout — excluded level with insufficient readings")
-                }
-            }
+            },
+            now: {
+                TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+            },
+            wait: { [self] interval in try wait(for: interval) },
+            checkCancellation: { [self] in try throwIfCancelled() },
+            log: { [self] message in log(message) }
+        )
+        let sweepResult = try sweep.run()
+        let rawData = sweepResult.measurements.map {
+            (fanPct: $0.fanPercent, equilTemp: $0.equilibriumTemperature)
         }
-
-        stopStress()
+        let unstableFanLevels = sweepResult.unstableFanLevels
         try throwIfCancelled()
 
         // Phase 3: Build control curve from raw equilibrium data
@@ -744,26 +686,6 @@ public final class CalibrationRunner {
         }
         let temp = calibrationTemperature()?.selected ?? 0
         log("Cooldown limit reached at \(String(format: "%.1f", temp))°C — continuing with maximum fans")
-    }
-
-    // MARK: - Stress (CPU + GPU combined)
-    //
-    // Combined stress matches real-world worst case on Apple Silicon where
-    // CPU, GPU, and Neural Engine share the same die and unified memory.
-    // This is the Notebookcheck standard (Prime95 + FurMark simultaneously).
-
-    /// Start stress at a given intensity (0.0–1.0).
-    /// CPU: intensity * coreCount, including a duty-cycled fractional thread.
-    /// GPU: intensity * 4M grid size.
-    private func startStress(intensity: Float = 1.0) {
-        _ = calibrationWorkload.start(intensity: intensity)
-        if let warning = gpuStressWorkload?.lastWarning {
-            log(warning)
-        }
-    }
-
-    private func stopStress() {
-        calibrationWorkload.stop()
     }
 
     // MARK: - Helpers

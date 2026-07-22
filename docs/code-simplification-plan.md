@@ -6,7 +6,7 @@ future work only.
 
 Current verified baseline:
 
-- 111 tests pass across 22 suites.
+- 113 tests pass across 23 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
@@ -28,14 +28,12 @@ construction, CSV logging, and top-level orchestration.
 
 ### 9. Extract equilibrium sweep and curve construction
 
-- Move fan-level stabilization into `EquilibriumSweep`.
 - Move interpolation, monotonic enforcement, and coverage validation into
   `CalibrationCurveBuilder`.
 - Keep raw measurements separate from generated 60–85°C control points.
-- Test timeout exclusion, ceiling termination, insufficient coverage, and
-  monotonic output.
+- Test insufficient coverage and monotonic output.
 
-Remaining commit boundaries: sweep coordinator, then curve builder.
+Remaining commit boundary: curve builder.
 
 ### 10. Reduce `CalibrationRunner` to orchestration
 
