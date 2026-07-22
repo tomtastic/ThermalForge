@@ -144,6 +144,7 @@ public final class ThermalMonitor {
     private var sustainedAboveCount = 0
     private var lastRuleDecision: RuleDecision?
     private var lastRuleCommandAppliedAt: Date?
+    private var lastSafetyCommandAppliedAt: TimeInterval?
 
     // MARK: - Smart Profile State
 
@@ -365,6 +366,7 @@ public final class ThermalMonitor {
             lastMonitorTickAt = nil
             lastRuleDecision = nil
             lastRuleCommandAppliedAt = nil
+            lastSafetyCommandAppliedAt = nil
 
             if profile.id == "smart" {
                 // Reset Smart state and reload calibration data for current lid state.
@@ -432,8 +434,14 @@ public final class ThermalMonitor {
         if maxTemp >= FanProfile.safetyTempThreshold {
             lastRuleDecision = nil
             lastRuleCommandAppliedAt = nil
-            if state != .safetyOverride {
+            let shouldApplySafetyCommand = lastSafetyCommandAppliedAt.map {
+                now - $0 >= Self.ruleCommandRefreshInterval
+            } ?? true
+            if shouldApplySafetyCommand {
                 applyCommand(.setMax)
+                lastSafetyCommandAppliedAt = now
+            }
+            if state != .safetyOverride {
                 state = controlService.transition(.safetyTriggered)
                 fansCurrentlyRunning = true
                 lastAppliedRPMPercent = 1.0
@@ -441,16 +449,28 @@ public final class ThermalMonitor {
                 TFLogger.shared.event(ThermalEvent(type: .safetyOverrideTriggered, details: "maxTemp=\(String(format: "%.1f", maxTemp))"))
             }
             if let status { onUpdate?(status, activeProfile, state, calibrationState) }
-            applyCadence(maxTemp: maxTemp, fanChanged: true)
+            applyCadence(maxTemp: maxTemp, fanChanged: shouldApplySafetyCommand)
             return
         }
 
         // Clear safety override with hysteresis.
-        if state == .safetyOverride
-            && maxTemp < FanProfile.safetyTempThreshold - FanProfile.hysteresisDegrees
-        {
-            state = controlService.transition(.safetyCleared)
-            TFLogger.shared.event(ThermalEvent(type: .safetyOverrideCleared, details: "maxTemp=\(String(format: "%.1f", maxTemp))"))
+        if state == .safetyOverride {
+            if maxTemp < FanProfile.safetyTempThreshold - FanProfile.hysteresisDegrees {
+                state = controlService.transition(.safetyCleared)
+                lastSafetyCommandAppliedAt = nil
+                TFLogger.shared.event(ThermalEvent(type: .safetyOverrideCleared, details: "maxTemp=\(String(format: "%.1f", maxTemp))"))
+            } else {
+                let shouldApplySafetyCommand = lastSafetyCommandAppliedAt.map {
+                    now - $0 >= Self.ruleCommandRefreshInterval
+                } ?? true
+                if shouldApplySafetyCommand {
+                    applyCommand(.setMax)
+                    lastSafetyCommandAppliedAt = now
+                }
+                if let status { onUpdate?(status, activeProfile, state, calibrationState) }
+                applyCadence(maxTemp: maxTemp, fanChanged: shouldApplySafetyCommand)
+                return
+            }
         }
 
         // Sustained trigger: track consecutive ticks above start threshold.

@@ -13,9 +13,18 @@ struct ThermalMonitorSequenceTests {
         #expect(harness.monitor.state == .safetyOverride)
         #expect(harness.commands.values == [.setMax])
 
+        harness.tick(at: 92)
+        #expect(harness.monitor.state == .safetyOverride)
+        #expect(harness.commands.values == [.setMax])
+
+        for _ in 0..<4 {
+            harness.tick(at: 92)
+        }
+        #expect(harness.commands.values == [.setMax, .setMax])
+
         harness.tick(at: 89)
         #expect(harness.monitor.state == .idle)
-        #expect(harness.commands.values == [.setMax, .resetAuto])
+        #expect(harness.commands.values == [.setMax, .setMax, .resetAuto])
     }
 
     @Test("A matching rule preempts a hands-off profile")
