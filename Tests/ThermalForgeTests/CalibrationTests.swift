@@ -301,30 +301,33 @@ struct CalibrationConvergenceTests {
 
     @Test("Stable noisy readings converge after detrending")
     func stableNoiseConverges() throws {
+        let convergence = CalibrationConvergenceModel(mode: .optimized)
         let readings: [Float] = (0..<30).map { $0.isMultiple(of: 2) ? 59.5 : 60.5 }
-        let metrics = try #require(CalibrationRunner.stabilityMetrics(readings: readings))
+        let metrics = try #require(convergence.metrics(readings: readings))
 
         #expect(metrics.rawStandardDeviation >= 0.5)
-        #expect(CalibrationMode.optimized.acceptsStability(metrics))
+        #expect(convergence.accepts(metrics))
     }
 
     @Test("Smooth temperature drift is not accepted as equilibrium")
     func driftDoesNotConverge() throws {
+        let convergence = CalibrationConvergenceModel(mode: .optimized)
         let readings: [Float] = (0..<30).map { 58 + Float($0) * 0.05 }
-        let metrics = try #require(CalibrationRunner.stabilityMetrics(readings: readings))
+        let metrics = try #require(convergence.metrics(readings: readings))
 
         #expect(metrics.residualStandardDeviation < 0.001)
-        #expect(!CalibrationMode.optimized.acceptsStability(metrics))
+        #expect(!convergence.accepts(metrics))
     }
 
     @Test("Old transients age out of the convergence window")
     func convergenceUsesRecentWindow() throws {
+        let convergence = CalibrationConvergenceModel(mode: .optimized)
         let transient: [Float] = [64, 66, 63, 65, 62, 64]
         let plateau = [Float](repeating: 59, count: 30)
-        let metrics = try #require(CalibrationRunner.stabilityMetrics(readings: transient + plateau))
+        let metrics = try #require(convergence.metrics(readings: transient + plateau))
 
         #expect(metrics.mean == 59)
-        #expect(CalibrationMode.optimized.acceptsStability(metrics))
+        #expect(convergence.accepts(metrics))
     }
 
     @Test("Generated control curve never slows fans as temperature rises")

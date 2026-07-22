@@ -29,15 +29,13 @@ construction, CSV logging, and top-level orchestration.
 ### 9. Extract equilibrium sweep and curve construction
 
 - Move fan-level stabilization into `EquilibriumSweep`.
-- Move stability metrics and acceptance thresholds into a focused convergence
-  model.
 - Move interpolation, monotonic enforcement, and coverage validation into
   `CalibrationCurveBuilder`.
 - Keep raw measurements separate from generated 60–85°C control points.
 - Test timeout exclusion, ceiling termination, insufficient coverage, and
   monotonic output.
 
-Commit boundaries: convergence model, sweep coordinator, then curve builder.
+Remaining commit boundaries: sweep coordinator, then curve builder.
 
 ### 10. Reduce `CalibrationRunner` to orchestration
 

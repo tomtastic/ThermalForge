@@ -180,40 +180,7 @@ public enum CalibrationMode: String, CaseIterable {
     /// All modes begin evaluating after 60 seconds. Accuracy comes from the
     /// convergence tolerances below rather than an arbitrary longer minimum.
     public var stabilizationWindowSize: Int {
-        30 // 60 seconds at one reading every 2 seconds
-    }
-
-    /// Maximum accepted temperature trend over the stabilization window.
-    var maximumSlopePerSecond: Float {
-        switch self {
-        case .quick: return 0.008
-        case .standard: return 0.005
-        case .optimized: return 0.003
-        }
-    }
-
-    /// Maximum difference between the means of the first and second half.
-    var maximumHalfMeanDelta: Float {
-        switch self {
-        case .quick: return 0.9
-        case .standard: return 0.6
-        case .optimized: return 0.4
-        }
-    }
-
-    /// Maximum 95% confidence radius of the detrended mean.
-    var maximumConfidenceRadius: Float {
-        switch self {
-        case .quick: return 0.90
-        case .standard: return 0.65
-        case .optimized: return 0.45
-        }
-    }
-
-    func acceptsStability(_ metrics: CalibrationStabilityMetrics) -> Bool {
-        abs(metrics.slopePerSecond) <= maximumSlopePerSecond
-            && metrics.halfMeanDelta <= maximumHalfMeanDelta
-            && metrics.confidenceRadius95 <= maximumConfidenceRadius
+        CalibrationConvergenceModel(mode: self).windowSize
     }
 
     /// Maximum seconds to wait at each fan level for stabilization
@@ -266,15 +233,6 @@ struct CalibrationTemperatureSample: Equatable {
     let gpu: Float
 }
 
-struct CalibrationStabilityMetrics: Equatable {
-    let mean: Float
-    let slopePerSecond: Float
-    let rawStandardDeviation: Float
-    let residualStandardDeviation: Float
-    let halfMeanDelta: Float
-    let confidenceRadius95: Float
-}
-
 // MARK: - Calibration Runner
 
 public final class CalibrationRunner {
@@ -284,6 +242,7 @@ public final class CalibrationRunner {
     private let workloadIntensityOverride: Float?
     private let cancellationToken: CancellationToken
     private let lidStateProvider: any LidStateProvider
+    private let convergenceModel: CalibrationConvergenceModel
     private let calibrationWorkload: any CalibrationWorkload
     private let gpuStressWorkload: GPUStressWorkload?
     private let isoFormatter = ISO8601DateFormatter()
@@ -310,6 +269,7 @@ public final class CalibrationRunner {
         self.workloadIntensityOverride = workloadIntensity
         self.cancellationToken = cancellationToken
         self.lidStateProvider = lidStateProvider
+        self.convergenceModel = CalibrationConvergenceModel(mode: mode)
 
         let cpuWorkload = CPUStressWorkload()
         switch stressType {
@@ -578,20 +538,22 @@ public final class CalibrationRunner {
                 }
 
                 // Check stabilization
-                if let metrics = stabilityMetrics(readings: readings), isStabilized(metrics: metrics) {
+                if let metrics = convergenceModel.metrics(readings: readings),
+                   convergenceModel.accepts(metrics)
+                {
                     let equilTemp = metrics.mean
                     log("[\(Int(fanPct * 100))%] Stabilized at \(String(format: "%.1f", equilTemp))°C (\(elapsedSeconds)s)")
-                    log("  \(formatStability(metrics))")
+                    log("  \(convergenceModel.format(metrics))")
                     rawData.append((fanPct: fanPct, equilTemp: equilTemp))
                     stabilized = true
                     break
                 }
 
-                if readings.count >= mode.stabilizationWindowSize,
+                if readings.count >= convergenceModel.windowSize,
                    readings.count % 15 == 0,
-                   let metrics = stabilityMetrics(readings: readings)
+                   let metrics = convergenceModel.metrics(readings: readings)
                 {
-                    log("[\(Int(fanPct * 100))%] Still converging (\(elapsedSeconds)s): \(formatStability(metrics))")
+                    log("[\(Int(fanPct * 100))%] Still converging (\(elapsedSeconds)s): \(convergenceModel.format(metrics))")
                 }
 
                 try wait(for: 2)
@@ -603,8 +565,8 @@ public final class CalibrationRunner {
                 let elapsedSeconds = Int(
                     (DispatchTime.now().uptimeNanoseconds - levelStart) / 1_000_000_000
                 )
-                if let metrics = stabilityMetrics(readings: readings) {
-                    log("[\(Int(fanPct * 100))%] Timeout — excluded unstable level (\(elapsedSeconds)s): \(formatStability(metrics))")
+                if let metrics = convergenceModel.metrics(readings: readings) {
+                    log("[\(Int(fanPct * 100))%] Timeout — excluded unstable level (\(elapsedSeconds)s): \(convergenceModel.format(metrics))")
                 } else {
                     log("[\(Int(fanPct * 100))%] Timeout — excluded level with insufficient readings")
                 }
@@ -678,79 +640,6 @@ public final class CalibrationRunner {
             lidClosed: clamshell,
             measurements: measurements
         )
-    }
-
-    /// Measure convergence over the most recent 60 seconds. Raw standard
-    /// deviation is diagnostic only: it mixes real drift with sensor noise and
-    /// previously caused flat-but-noisy levels to wait forever. Acceptance uses
-    /// trend, half-window movement, and uncertainty after detrending.
-    static func stabilityMetrics(
-        readings: [Float],
-        windowSize: Int = 30,
-        sampleInterval: Float = 2
-    ) -> CalibrationStabilityMetrics? {
-        guard readings.count >= windowSize, windowSize >= 4 else { return nil }
-        let window = Array(readings.suffix(windowSize))
-        let n = Float(window.count)
-
-        let mean = window.reduce(0, +) / n
-        let variance = window.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / n
-        let rawStandardDeviation = sqrt(variance)
-
-        let xMean = (n - 1) / 2
-        var numerator: Float = 0
-        var denominator: Float = 0
-        for i in 0..<window.count {
-            let x = Float(i) - xMean
-            let y = window[i] - mean
-            numerator += x * y
-            denominator += x * x
-        }
-        let slopePerSample = denominator > 0 ? numerator / denominator : 0
-        let slopePerSecond = slopePerSample / sampleInterval
-
-        let residualVariance = window.enumerated().reduce(Float(0)) { partial, item in
-            let predicted = mean + slopePerSample * (Float(item.offset) - xMean)
-            let residual = item.element - predicted
-            return partial + residual * residual
-        } / n
-        let residualStandardDeviation = sqrt(residualVariance)
-
-        let half = window.count / 2
-        let firstMean = window.prefix(half).reduce(0, +) / Float(half)
-        let secondCount = window.count - half
-        let secondMean = window.suffix(secondCount).reduce(0, +) / Float(secondCount)
-        let halfMeanDelta = abs(secondMean - firstMean)
-        // Thermal samples are autocorrelated. Treat each five-sample (10s)
-        // block as one effective observation instead of claiming all 30 samples
-        // are independent.
-        let effectiveSampleCount = max(Float(window.count / 5), 2)
-        let confidenceRadius95 = 1.96 * residualStandardDeviation / sqrt(effectiveSampleCount)
-
-        return CalibrationStabilityMetrics(
-            mean: mean,
-            slopePerSecond: slopePerSecond,
-            rawStandardDeviation: rawStandardDeviation,
-            residualStandardDeviation: residualStandardDeviation,
-            halfMeanDelta: halfMeanDelta,
-            confidenceRadius95: confidenceRadius95
-        )
-    }
-
-    private func stabilityMetrics(readings: [Float]) -> CalibrationStabilityMetrics? {
-        Self.stabilityMetrics(readings: readings, windowSize: mode.stabilizationWindowSize)
-    }
-
-    private func isStabilized(metrics: CalibrationStabilityMetrics) -> Bool {
-        mode.acceptsStability(metrics)
-    }
-
-    private func formatStability(_ metrics: CalibrationStabilityMetrics) -> String {
-        "mean \(String(format: "%.2f", metrics.mean))°C, " +
-            "slope \(String(format: "%+.4f", metrics.slopePerSecond))°C/s, " +
-            "half Δ \(String(format: "%.2f", metrics.halfMeanDelta))°C, " +
-            "noise σ \(String(format: "%.2f", metrics.residualStandardDeviation))°C, " +
-            "95% ±\(String(format: "%.2f", metrics.confidenceRadius95))°C"
     }
 
     /// Build monotonically increasing control curve from raw equilibrium data.
@@ -843,7 +732,7 @@ public final class CalibrationRunner {
 
                 // In warm rooms the fixed 45°C target may be unreachable. A
                 // stable baseline is what the equilibrium model actually needs.
-                if let metrics = Self.stabilityMetrics(readings: readings, windowSize: 15),
+                if let metrics = convergenceModel.metrics(readings: readings, windowSize: 15),
                    abs(metrics.slopePerSecond) <= 0.005,
                    metrics.halfMeanDelta <= 0.5
                 {
