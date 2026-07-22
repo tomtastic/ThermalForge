@@ -11,7 +11,8 @@ Current verified baseline:
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
   CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, and curve
-  construction have dedicated components or test seams.
+  construction have dedicated components or test seams. The CLI fan mutation
+  commands have moved out of the root entry file.
 
 ## Working Rules
 
@@ -24,10 +25,10 @@ Current verified baseline:
 
 ## Phase 4: Split the CLI and System Coordination
 
-`Sources/thermalforge/ThermalForge.swift` still contains every command and the
-launchd/application lifecycle helpers.
+`Sources/thermalforge/ThermalForge.swift` still contains the status, watch,
+calibration, logging, rule, install, uninstall, and daemon commands.
 
-### 11. Split command implementations
+### 11. Split remaining command implementations
 
 Suggested layout:
 
@@ -35,7 +36,6 @@ Suggested layout:
 Sources/thermalforge/
   ThermalForge.swift
   Commands/
-    FanCommands.swift
     StatusCommands.swift
     WatchCommand.swift
     CalibrationCommand.swift
