@@ -9,7 +9,6 @@
 //  - Monitor tick (2s): process capture, anomaly detection, history logging
 //
 
-import Darwin
 import Foundation
 
 // MARK: - Fan Commands
@@ -87,6 +86,7 @@ public final class ThermalMonitor {
     private let lidStateProvider: any LidStateProvider
     private let now: () -> TimeInterval
     private let calibrationLoader: (Bool) -> CalibrationData?
+    private let anomalyObserver: any ThermalAnomalyObserving
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.thermalforge.monitor", qos: .utility)
 
@@ -106,10 +106,6 @@ public final class ThermalMonitor {
     private static let monitorInterval: TimeInterval = 2.0
     private var lastFullStatusAt: TimeInterval?
     private var lastMonitorTickAt: TimeInterval?
-
-    /// Below this peak temperature the rolling process buffer isn't worth its
-    /// sysctl sweep — skip process capture at idle. (°C)
-    private static let processCaptureFloor: Float = 50.0
 
     // MARK: - Adaptive cadence
 
@@ -152,16 +148,7 @@ public final class ThermalMonitor {
 
     // MARK: - Anomaly Detection
 
-    /// Tracks the 15 most recent monitor readings.
-    private var anomalyHistory: [Float] = []
     private var isCalibrating = false
-
-    // MARK: - Process Buffer
-
-    /// Rolling buffer — captures what was running BEFORE a spike.
-    /// Retains the 15 most recent monitor snapshots.
-    private var processBuffer: [(timestamp: String, processes: String)] = []
-    private let isoFormatter = ISO8601DateFormatter()
 
     /// Call this to suppress anomaly logging during calibration.
     public func setCalibrating(_ value: Bool) {
@@ -231,7 +218,8 @@ public final class ThermalMonitor {
             now: {
                 TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
             },
-            calibrationLoader: { CalibrationData.load(forLidClosed: $0) }
+            calibrationLoader: { CalibrationData.load(forLidClosed: $0) },
+            anomalyObserver: ThermalAnomalyObserver()
         )
     }
 
@@ -241,7 +229,8 @@ public final class ThermalMonitor {
         controlService: ControlService,
         lidStateProvider: any LidStateProvider,
         now: @escaping () -> TimeInterval,
-        calibrationLoader: @escaping (Bool) -> CalibrationData?
+        calibrationLoader: @escaping (Bool) -> CalibrationData?,
+        anomalyObserver: any ThermalAnomalyObserving
     ) {
         self.sensorProvider = sensorProvider
         self.activeProfile = profile
@@ -249,6 +238,7 @@ public final class ThermalMonitor {
         self.lidStateProvider = lidStateProvider
         self.now = now
         self.calibrationLoader = calibrationLoader
+        self.anomalyObserver = anomalyObserver
         calibrationLidClosed = lidStateProvider.isLidClosed
 
         let loaded = calibrationLoader(calibrationLidClosed)
@@ -581,66 +571,12 @@ public final class ThermalMonitor {
     /// Heavy operations: process capture + anomaly detection.
     /// Targets 2-second intervals, bounded by the adaptive thermal poll.
     private func monitorTick(status: ThermalStatus, maxTemp: Float) {
-        // Rolling process buffer — captures what was running BEFORE a spike, but
-        // only while the machine is warm enough for one to matter. At true idle
-        // the sysctl(KERN_PROC_ALL) sweep is pure overhead, so skip it and drop
-        // any stale snapshots. Anomaly detection below still runs every cycle.
-        if maxTemp >= Self.processCaptureFloor {
-            let currentProcs = captureTopProcesses()
-            let ts = isoFormatter.string(from: Date())
-            processBuffer.append((timestamp: ts, processes: currentProcs))
-            if processBuffer.count > 15 { processBuffer.removeFirst() }
-        } else if !processBuffer.isEmpty {
-            processBuffer.removeAll()
-        }
-
-        if !isCalibrating {
-            var spikeDetected = false
-
-            // Tier 1: instant spike — >5°C between consecutive monitor readings.
-            if let prevTemp = anomalyHistory.last {
-                let instantDelta = maxTemp - prevTemp
-                if abs(instantDelta) > 5 {
-                    let direction = instantDelta > 0 ? "spike" : "drop"
-                    let fan0 = status.fans.first
-                    TFLogger.shared.info(
-                        "Instant \(direction): \(String(format: "%.1f", prevTemp))→\(String(format: "%.1f", maxTemp))°C " +
-                            "(\(String(format: "%+.1f", instantDelta))°C in 2s) | " +
-                            "Fan0: \(fan0?.actualRPM ?? 0) RPM (\(fan0?.mode ?? "?")) | " +
-                            "Profile: \(activeProfile.name)"
-                    )
-                    spikeDetected = true
-                }
-            }
-
-            // Tier 2: sustained change — >10°C over 30 seconds.
-            if anomalyHistory.count >= 15 {
-                let oldest = anomalyHistory.first!
-                let sustainedDelta = maxTemp - oldest
-                if abs(sustainedDelta) > 10 {
-                    let direction = sustainedDelta > 0 ? "spike" : "drop"
-                    let fan0 = status.fans.first
-                    TFLogger.shared.info(
-                        "Sustained \(direction): \(String(format: "%.1f", oldest))→\(String(format: "%.1f", maxTemp))°C " +
-                            "(\(String(format: "%+.1f", sustainedDelta))°C in 30s) | " +
-                            "Fan0: \(fan0?.actualRPM ?? 0) RPM (\(fan0?.mode ?? "?")) | " +
-                            "Profile: \(activeProfile.name)"
-                    )
-                    spikeDetected = true
-                    anomalyHistory.removeAll()
-                }
-            }
-
-            if spikeDetected {
-                TFLogger.shared.info("Pre-spike process history (last \(processBuffer.count) samples):")
-                for entry in processBuffer {
-                    TFLogger.shared.info("  \(entry.timestamp): \(entry.processes)")
-                }
-            }
-        }
-
-        anomalyHistory.append(maxTemp)
-        if anomalyHistory.count > 15 { anomalyHistory.removeFirst() }
+        anomalyObserver.observe(
+            status: status,
+            maxTemp: maxTemp,
+            profileName: activeProfile.name,
+            isCalibrating: isCalibrating
+        )
     }
 
     // MARK: - Smart Profile
@@ -796,44 +732,6 @@ public final class ThermalMonitor {
         } else if fansCurrentlyRunning {
             state = controlService.transition(.profileActive(activeProfile.name))
         }
-    }
-
-    // MARK: - Process Capture
-
-    /// Capture top 5 processes by CPU for anomaly logging.
-    private func captureTopProcesses() -> String {
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
-        var size = 0
-        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0, size > 0 else { return "unavailable" }
-
-        let count = size / MemoryLayout<kinfo_proc>.stride
-        var procs = [kinfo_proc](repeating: kinfo_proc(), count: count)
-        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return "unavailable" }
-
-        let actualCount = size / MemoryLayout<kinfo_proc>.stride
-        var results: [(name: String, cpu: Double)] = []
-
-        for i in 0..<actualCount {
-            let proc = procs[i]
-            let pid = proc.kp_proc.p_pid
-            guard pid > 0 else { continue }
-
-            let name = withUnsafePointer(to: proc.kp_proc.p_comm) { ptr in
-                ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
-                    String(cString: $0)
-                }
-            }
-
-            guard !name.isEmpty, name != "kernel_task" else { continue }
-            let cpuPct = Double(proc.kp_proc.p_pctcpu) / 100.0
-            if cpuPct > 0.1 {
-                results.append((name, cpuPct))
-            }
-        }
-
-        let top5 = results.sorted { $0.cpu > $1.cpu }.prefix(5)
-        if top5.isEmpty { return "idle" }
-        return top5.map { "\($0.name)(\(String(format: "%.1f", $0.cpu))%)" }.joined(separator: ", ")
     }
 
     // MARK: - Helpers

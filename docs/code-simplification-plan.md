@@ -6,13 +6,14 @@ future work only.
 
 Current verified baseline:
 
-- 125 tests pass across 26 suites.
+- 128 tests pass across 27 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
   CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, and curve
-  construction, and rule persistence mutations have dedicated components or
-  test seams. The CLI entry file now only registers commands.
+  construction, rule persistence mutations, and runtime anomaly observation
+  have dedicated components or test seams. The CLI entry file now only
+  registers commands.
 
 ## Working Rules
 
@@ -28,8 +29,7 @@ Current verified baseline:
 ### 13. Separate observation from fan decisions
 
 `ThermalMonitor.tick()` still performs sensor acquisition, safety evaluation,
-rule preemption, profile control, anomaly logging, cadence changes, and UI
-publication.
+rule preemption, profile control, cadence changes, and UI publication.
 
 Plan:
 
@@ -39,14 +39,8 @@ Plan:
 - Extract a pure control decision input/output model for safety, rules, and
   profiles.
 - Keep actual daemon/SMC commands at the outer boundary.
-- Move anomaly/process-history recording behind a separate observer.
-- Add sequence tests covering safety trigger/clear, rule preemption, Smart
-  ramping, hysteresis, and idle cadence transitions before moving logic.
 
-Commit boundaries:
-
-1. Anomaly observer extraction.
-2. Control decision extraction.
+Commit boundary: control decision extraction.
 
 ## Phase 6: Hardware and Transport Cleanup
 

@@ -110,7 +110,8 @@ private final class MonitorHarness {
             controlService: controlService,
             lidStateProvider: FixedMonitorLidStateProvider(),
             now: { [clock] in clock.value },
-            calibrationLoader: { _ in nil }
+            calibrationLoader: { _ in nil },
+            anomalyObserver: NoOpAnomalyObserver()
         )
         monitor.onFanCommand = { [commands] command in
             commands.values.append(command)
@@ -154,4 +155,13 @@ private final class CommandRecorder {
 
 private struct FixedMonitorLidStateProvider: LidStateProvider {
     let isLidClosed = false
+}
+
+private final class NoOpAnomalyObserver: ThermalAnomalyObserving {
+    func observe(
+        status: ThermalStatus,
+        maxTemp: Float,
+        profileName: String,
+        isCalibrating: Bool
+    ) {}
 }
