@@ -28,10 +28,9 @@ Current verified baseline:
 ### 12. Consolidate repeated command mutations
 
 `RulePersistence` now has tested add, remove, enable, disable, and replace
-operations, and the CLI uses them. The GUI and legacy migration still mutate
-loaded arrays directly.
+operations, and the CLI and GUI use them. The legacy migration still mutates a
+loaded array directly.
 
-- Migrate `AppState` rule edits to the persistence operations.
 - Migrate legacy rule creation to the add operation.
 - Keep user-facing output in command types rather than core storage objects.
 

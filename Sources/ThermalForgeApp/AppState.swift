@@ -63,7 +63,6 @@ final class AppState {
 
     var rules: [ThermalRule] = [] {
         didSet {
-            persistRules()
             pushRulesToMonitor()
         }
     }
@@ -280,11 +279,16 @@ do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPa
         monitor?.updateRules(rules, enabled: rulesEnabled)
     }
 
-    private func persistRules() {
+    private func applyRuleMutation(
+        context: String,
+        _ mutation: () throws -> [ThermalRule]?
+    ) {
         do {
-            try RulePersistence.save(rules)
+            if let updatedRules = try mutation() {
+                rules = updatedRules
+            }
         } catch {
-            TFLogger.shared.error("Failed to persist rules: \(error)")
+            TFLogger.shared.error("\(context): \(error)")
         }
     }
 
@@ -340,17 +344,27 @@ do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPa
     }
 
     func removeRule(_ id: String) {
-        rules.removeAll(where: { $0.id == id })
+        applyRuleMutation(context: "Failed to remove rule") {
+            let result = try RulePersistence.remove(id: id)
+            return result.removedCount > 0 ? result.rules : nil
+        }
     }
 
     func toggleRule(_ id: String, enabled: Bool) {
-        guard let idx = rules.firstIndex(where: { $0.id == id }) else { return }
-        rules[idx].enabled = enabled
+        applyRuleMutation(context: "Failed to update rule") {
+            if enabled {
+                return try RulePersistence.enable(id: id)
+            }
+            return try RulePersistence.disable(id: id)
+        }
     }
 
     func moveRule(_ id: String, toPriority priority: Int) {
-        guard let idx = rules.firstIndex(where: { $0.id == id }) else { return }
-        rules[idx].priority = priority
+        guard var rule = rules.first(where: { $0.id == id }) else { return }
+        rule.priority = priority
+        applyRuleMutation(context: "Failed to reprioritize rule") {
+            try RulePersistence.replace(rule)
+        }
     }
 
     // MARK: - Launch at Login
@@ -395,10 +409,11 @@ do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPa
         rule.untilTempBelowC = release
         rule.name = "IF temp ≥ \(Int(trigger))°C THEN \(Int(fanPercent * 100))% until ≤ \(Int(release))°C"
 
-        if let index = rules.firstIndex(where: { $0.id == rule.id }) {
-            rules[index] = rule
-        } else {
-            rules.append(rule)
+        applyRuleMutation(context: "Failed to update quick temperature rule") {
+            if let updatedRules = try RulePersistence.replace(rule) {
+                return updatedRules
+            }
+            return try RulePersistence.add(rule)
         }
     }
 
