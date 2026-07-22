@@ -6,7 +6,7 @@ future work only.
 
 Current verified baseline:
 
-- 120 tests pass across 25 suites.
+- 125 tests pass across 26 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
@@ -33,6 +33,8 @@ publication.
 
 Plan:
 
+- Sequence tests now cover safety trigger/clear, rule preemption, Smart ramping,
+  profile hysteresis, and idle cadence transitions.
 - Keep sensor polling and scheduling in `ThermalMonitor`.
 - Extract a pure control decision input/output model for safety, rules, and
   profiles.
@@ -43,9 +45,8 @@ Plan:
 
 Commit boundaries:
 
-1. Sequence-test harness.
-2. Anomaly observer extraction.
-3. Control decision extraction.
+1. Anomaly observer extraction.
+2. Control decision extraction.
 
 ## Phase 6: Hardware and Transport Cleanup
 

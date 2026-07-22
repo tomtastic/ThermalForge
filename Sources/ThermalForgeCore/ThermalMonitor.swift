@@ -85,6 +85,8 @@ public final class ThermalMonitor {
     private let sensorProvider: SensorProvider
     private let controlService: ControlService
     private let lidStateProvider: any LidStateProvider
+    private let now: () -> TimeInterval
+    private let calibrationLoader: (Bool) -> CalibrationData?
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.thermalforge.monitor", qos: .utility)
 
@@ -98,6 +100,7 @@ public final class ThermalMonitor {
     /// Set from `start(interval:)` so the ramp / sustained-trigger math (which
     /// divides by it) always matches the real timer rate.
     private var tickInterval: Float = 1.0
+    var currentTickInterval: Float { tickInterval }
 
     private static let fullStatusInterval: TimeInterval = 0.5
     private static let monitorInterval: TimeInterval = 2.0
@@ -186,7 +189,7 @@ public final class ThermalMonitor {
     /// Reload calibration data if the lid state has changed.
     /// Throttled to `lidCheckInterval` seconds to avoid frequent lid-state queries.
     private func syncCalibration() {
-        let now = UInt64(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        let now = UInt64(now())
         guard now - lastLidCheckTimestamp >= lidCheckInterval else { return }
         lastLidCheckTimestamp = now
         let currentLidClosed = lidStateProvider.isLidClosed
@@ -195,7 +198,7 @@ public final class ThermalMonitor {
         TFLogger.shared.info("Lid state changed (clamshell: \(currentLidClosed)) — reloading calibration")
         calibrationLidClosed = currentLidClosed
 
-        guard let data = CalibrationData.load(forLidClosed: currentLidClosed) else {
+        guard let data = calibrationLoader(currentLidClosed) else {
             calibration = nil
             TFLogger.shared.info("No calibration data for current lid state — using fallback curve")
             return
@@ -213,19 +216,41 @@ public final class ThermalMonitor {
     /// Called when a fan command needs to be executed (may require privilege).
     public var onFanCommand: ((FanCommand) throws -> Void)?
 
-    public init(
+    public convenience init(
         sensorProvider: SensorProvider,
         profile: FanProfile = .silent,
         controlService: ControlService = ControlService(),
         lidStateProvider: any LidStateProvider = MacLidStateProvider()
     ) {
+        self.init(
+            sensorProvider: sensorProvider,
+            profile: profile,
+            controlService: controlService,
+            lidStateProvider: lidStateProvider,
+            now: {
+                TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+            },
+            calibrationLoader: { CalibrationData.load(forLidClosed: $0) }
+        )
+    }
+
+    init(
+        sensorProvider: SensorProvider,
+        profile: FanProfile,
+        controlService: ControlService,
+        lidStateProvider: any LidStateProvider,
+        now: @escaping () -> TimeInterval,
+        calibrationLoader: @escaping (Bool) -> CalibrationData?
+    ) {
         self.sensorProvider = sensorProvider
         self.activeProfile = profile
         self.controlService = controlService
         self.lidStateProvider = lidStateProvider
+        self.now = now
+        self.calibrationLoader = calibrationLoader
         calibrationLidClosed = lidStateProvider.isLidClosed
 
-        let loaded = CalibrationData.load(forLidClosed: calibrationLidClosed)
+        let loaded = calibrationLoader(calibrationLidClosed)
         if let error = loaded?.validationError {
             TFLogger.shared.error("Calibration data rejected: \(error)")
             calibration = nil
@@ -322,9 +347,11 @@ public final class ThermalMonitor {
         let idleRate = activeProfile.curve.handsOff ? Self.handsOffIdleInterval : Self.idleInterval
         let wantFast = busy || consecutiveIdleTicks < Self.idleConfirmTicks
         let desired = wantFast ? activeInterval : max(idleRate, activeInterval)
-        guard desired != tickInterval, let timer else { return }
+        guard desired != tickInterval else { return }
         tickInterval = desired
-        scheduleTimer(timer, interval: desired)
+        if let timer {
+            scheduleTimer(timer, interval: desired)
+        }
     }
 
     /// Update the active profile.
@@ -343,7 +370,7 @@ public final class ThermalMonitor {
                 // Reset Smart state and reload calibration data for current lid state.
                 tempHistory.removeAll()
                 calibrationLidClosed = lidStateProvider.isLidClosed
-                let loaded = CalibrationData.load(forLidClosed: calibrationLidClosed)
+                let loaded = calibrationLoader(calibrationLidClosed)
                 if let error = loaded?.validationError {
                     TFLogger.shared.error("Calibration data rejected on reload: \(error)")
                     calibration = nil
@@ -358,11 +385,11 @@ public final class ThermalMonitor {
 
     // MARK: - Polling
 
-    private func tick() {
+    func tick() {
         // Check if lid state changed and reload calibration accordingly.
         syncCalibration()
 
-        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        let now = now()
         let monitorDue = ElapsedCadence.isDue(
             lastRun: lastMonitorTickAt,
             now: now,
