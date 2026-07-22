@@ -23,19 +23,6 @@ Current verified baseline:
 - Do not mix visualization, update notifications, or unrelated feature work
   into these refactors.
 
-## Phase 4: Split the CLI and System Coordination
-
-### 12. Consolidate repeated command mutations
-
-`RulePersistence` now has tested add, remove, enable, disable, and replace
-operations, and the CLI and GUI use them. The legacy migration still mutates a
-loaded array directly.
-
-- Migrate legacy rule creation to the add operation.
-- Keep user-facing output in command types rather than core storage objects.
-
-Commit boundary: one store/API consolidation at a time.
-
 ## Phase 5: Narrow the Runtime Control Loop
 
 ### 13. Separate observation from fan decisions

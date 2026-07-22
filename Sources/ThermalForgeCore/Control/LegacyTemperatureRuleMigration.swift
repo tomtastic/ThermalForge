@@ -32,7 +32,7 @@ public enum LegacyTemperatureRuleMigration {
             return .noLegacySettings
         }
 
-        var rules = RulePersistence.load(from: rulesFilePath)
+        let rules = RulePersistence.load(from: rulesFilePath)
         guard !rules.contains(where: { $0.id == ruleID }) else {
             userDefaults.set(migrationVersion, forKey: migrationKey)
             return .existingRulePreserved
@@ -55,7 +55,7 @@ public enum LegacyTemperatureRuleMigration {
             maximum: 100
         )
 
-        rules.append(ThermalRule(
+        let rule = ThermalRule(
             id: ruleID,
             name: "IF temp ≥ \(Int(trigger))°C THEN \(Int(fanPercent))% until ≤ \(Int(release))°C",
             enabled: enabled,
@@ -67,8 +67,8 @@ public enum LegacyTemperatureRuleMigration {
             ),
             action: .setFanPercent(Float(fanPercent / 100)),
             untilTempBelowC: Float(release)
-        ))
-        try RulePersistence.save(rules, to: rulesFilePath)
+        )
+        try RulePersistence.add(rule, to: rulesFilePath)
         userDefaults.set(migrationVersion, forKey: migrationKey)
         return .migrated
     }
