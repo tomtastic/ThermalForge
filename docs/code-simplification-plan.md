@@ -25,7 +25,7 @@ Current verified baseline:
 
 ## Phase 4: Split the CLI and System Coordination
 
-`Sources/thermalforge/ThermalForge.swift` still contains the watch, calibration,
+`Sources/thermalforge/ThermalForge.swift` still contains the calibration,
 logging, rule, install, uninstall, and daemon commands.
 
 ### 11. Split remaining command implementations
@@ -36,7 +36,6 @@ Suggested layout:
 Sources/thermalforge/
   ThermalForge.swift
   Commands/
-    WatchCommand.swift
     CalibrationCommand.swift
     LoggingCommand.swift
     RuleCommands.swift
