@@ -6,7 +6,6 @@
 //
 
 import ArgumentParser
-import Foundation
 import ThermalForgeCore
 
 @main
@@ -30,19 +29,4 @@ struct ThermalForge: ParsableCommand {
             Daemon.self,
         ]
     )
-}
-
-// MARK: - Daemon
-
-struct Daemon: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "daemon",
-        abstract: "Run the privileged socket server (called by launchd)"
-    )
-
-    func run() throws {
-        let fc = try FanControl()
-        let server = try DaemonServer(fanControl: fc)
-        server.run()
-    }
 }

@@ -25,28 +25,6 @@ Current verified baseline:
 
 ## Phase 4: Split the CLI and System Coordination
 
-`Sources/thermalforge/ThermalForge.swift` still contains the daemon command.
-
-### 11. Split remaining command implementations
-
-Suggested layout:
-
-```text
-Sources/thermalforge/
-  ThermalForge.swift
-  Commands/
-    DaemonCommand.swift
-  System/
-    ProcessRunner.swift
-    LaunchdCoordinator.swift
-```
-
-Move code without changing command names, options, output, or exit behavior.
-Keep the root file limited to the `@main` declaration and command registration.
-
-Commit boundaries should follow command groups so each move remains easy to
-review and revert.
-
 ### 12. Consolidate repeated command mutations
 
 - Give rule persistence tested add, remove, enable, disable, and replace
