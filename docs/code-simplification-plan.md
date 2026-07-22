@@ -23,27 +23,6 @@ Current verified baseline:
 
 ## Phase 2: Consolidate Rule Handling
 
-### 4. Replace the legacy custom temperature rule
-
-The GUI currently exposes both the persistent priority rule engine and a
-separate `TemperatureRule` path stored in `UserDefaults`. When the legacy rule
-is enabled, it runs before and bypasses the persistent rule engine.
-
-Plan:
-
-- Represent the quick IF/THEN rule as a normal `ThermalRule` with a stable ID.
-- Perform a one-time migration of the existing enabled state, trigger
-  temperature, release temperature, and fan percentage.
-- Preserve hysteresis by mapping the release temperature to
-  `untilTempBelowC`.
-- Remove `TemperatureRule`, `temperatureRuleEngaged`, its monitor branch, and
-  the four legacy settings after migration.
-- Present a single Rules section in the menu-bar UI.
-- Verify that hard safety still preempts every rule and that priority/latching
-  behavior remains deterministic.
-
-Remaining commit boundary: legacy monitor path removal.
-
 ### 5. Resolve the unused daemon rule API
 
 The app and CLI read and write `rules.json` directly. The daemon's rule mutation

@@ -26,7 +26,7 @@ final class AppState {
     var launchAtLogin: Bool = false {
         didSet { updateLoginItem() }
     }
-    var customRuleTriggerTempC: Double {
+    var quickRuleTriggerTempC: Double {
         get { Double(quickTemperatureRule?.condition.valueCelsius ?? 55) }
         set {
             updateQuickTemperatureRule {
@@ -38,11 +38,11 @@ final class AppState {
             }
         }
     }
-    var customRuleReleaseTempC: Double {
+    var quickRuleReleaseTempC: Double {
         get { Double(quickTemperatureRule?.untilTempBelowC ?? 50) }
         set { updateQuickTemperatureRule { $0.untilTempBelowC = Float(newValue) } }
     }
-    var customRuleFanPercent: Double {
+    var quickRuleFanPercent: Double {
         get {
             guard case let .setFanPercent(percent) = quickTemperatureRule?.action else { return 100 }
             return Double(percent * 100)
@@ -65,7 +65,6 @@ final class AppState {
         didSet {
             persistRules()
             pushRulesToMonitor()
-            syncLegacyTemperatureRuleFromPersistentRule()
         }
     }
 
@@ -80,7 +79,6 @@ final class AppState {
     var daemonAvailable: Bool = ThermalForgeDaemon.isRunning
     @ObservationIgnored private var menuOpen = false
     @ObservationIgnored private var lastStatus: ThermalStatus?
-    @ObservationIgnored private var syncingRuleSettings = false
     @ObservationIgnored private var daemonCheckTimer: Timer?
 
     init() {
@@ -276,7 +274,6 @@ do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPa
 
         monitor.start()
         self.monitor = monitor
-        syncLegacyTemperatureRuleFromPersistentRule()
     }
 
     private func pushRulesToMonitor() {
@@ -403,25 +400,6 @@ do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPa
         } else {
             rules.append(rule)
         }
-    }
-
-    private func syncLegacyTemperatureRuleFromPersistentRule() {
-        guard !syncingRuleSettings else { return }
-        syncingRuleSettings = true
-        defer { syncingRuleSettings = false }
-
-        guard let rule = quickTemperatureRule,
-              rule.enabled,
-              case let .setFanPercent(fanPercent) = rule.action
-        else {
-            monitor?.setTemperatureRule(nil)
-            return
-        }
-        monitor?.setTemperatureRule(TemperatureRule(
-            triggerTempC: rule.condition.valueCelsius,
-            releaseTempC: rule.untilTempBelowC ?? rule.condition.valueCelsius - 1,
-            fanPercent: fanPercent
-        ))
     }
 
     private static let defaultQuickTemperatureRule = ThermalRule(

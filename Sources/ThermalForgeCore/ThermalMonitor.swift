@@ -45,23 +45,6 @@ public struct CalibrationState: Equatable {
     }
 }
 
-// MARK: - Custom Rule
-
-/// User-defined IF/THEN/ELSE fan rule.
-/// IF temp >= triggerTempC THEN set fanPercent
-/// ELSE IF temp <= releaseTempC THEN reset to Apple auto.
-public struct TemperatureRule: Equatable {
-    public let triggerTempC: Float
-    public let releaseTempC: Float
-    public let fanPercent: Float
-
-    public init(triggerTempC: Float, releaseTempC: Float, fanPercent: Float) {
-        self.triggerTempC = triggerTempC
-        self.releaseTempC = releaseTempC
-        self.fanPercent = fanPercent
-    }
-}
-
 struct ElapsedCadence {
     static func isDue(lastRun: TimeInterval?, now: TimeInterval, interval: TimeInterval) -> Bool {
         guard let lastRun else { return true }
@@ -155,8 +138,6 @@ public final class ThermalMonitor {
     private var lastAppliedRPMPercent: Float = 0
     private var fansCurrentlyRunning = false
     private var sustainedAboveCount = 0
-    private var temperatureRule: TemperatureRule?
-    private var temperatureRuleEngaged = false
     private var lastRuleDecision: RuleDecision?
     private var lastRuleCommandAppliedAt: Date?
 
@@ -364,25 +345,6 @@ public final class ThermalMonitor {
         }
     }
 
-    public func setTemperatureRule(_ rule: TemperatureRule?) {
-        queue.async { [self] in
-            let hadRule = (temperatureRule != nil)
-            temperatureRule = rule
-            temperatureRuleEngaged = false
-            sustainedAboveCount = 0
-            lastRuleDecision = nil
-            lastRuleCommandAppliedAt = nil
-
-            // Keep transitions deterministic when toggling the override rule.
-            if hadRule != (rule != nil), fansCurrentlyRunning {
-                applyCommand(.resetAuto)
-                fansCurrentlyRunning = false
-                lastAppliedRPMPercent = 0
-                state = .idle
-            }
-        }
-    }
-
     // MARK: - Polling
 
     private func tick() {
@@ -451,14 +413,6 @@ public final class ThermalMonitor {
         {
             state = controlService.transition(.safetyCleared)
             TFLogger.shared.event(ThermalEvent(type: .safetyOverrideCleared, details: "maxTemp=\(String(format: "%.1f", maxTemp))"))
-        }
-
-        if let rule = temperatureRule {
-            lastRuleDecision = nil
-            lastRuleCommandAppliedAt = nil
-            tickTemperatureRule(status: status, peakTemp: maxTemp, rule: rule)
-            if let status { onUpdate?(status, activeProfile, state, calibrationState) }
-            return
         }
 
         // Sustained trigger: track consecutive ticks above start threshold.
@@ -723,52 +677,6 @@ public final class ThermalMonitor {
     }
 
     // MARK: - Curve-Based Profiles
-
-    private func tickTemperatureRule(status: ThermalStatus?, peakTemp: Float, rule: TemperatureRule) {
-        let maxRPM = status?.fans.first.map { Float($0.maxRPM) } ?? 7826
-        let minRPM = status?.fans.first.map { Float($0.minRPM) } ?? 2317
-        let minPct = minRPM / maxRPM
-        let targetPct = min(max(rule.fanPercent, minPct), 1.0)
-
-        if temperatureRuleEngaged {
-            if peakTemp <= rule.releaseTempC {
-                applyCommand(.resetAuto)
-                temperatureRuleEngaged = false
-                fansCurrentlyRunning = false
-                lastAppliedRPMPercent = 0
-                state = .idle
-                TFLogger.shared.profile("Rule disengaged: \(String(format: "%.1f", peakTemp))°C <= \(String(format: "%.1f", rule.releaseTempC))°C")
-                return
-            }
-
-            if abs(targetPct - lastAppliedRPMPercent) > 0.002 {
-                let targetRPM = max(maxRPM * targetPct, minRPM)
-                applyCommand(.setRPM(targetRPM))
-                lastAppliedRPMPercent = targetPct
-            }
-            fansCurrentlyRunning = true
-            state = .active(profileName: "Rule")
-            return
-        }
-
-        if peakTemp >= rule.triggerTempC {
-            let targetRPM = max(maxRPM * targetPct, minRPM)
-            applyCommand(.setRPM(targetRPM))
-            temperatureRuleEngaged = true
-            fansCurrentlyRunning = true
-            lastAppliedRPMPercent = targetPct
-            state = .active(profileName: "Rule")
-            TFLogger.shared.profile("Rule engaged: \(String(format: "%.1f", peakTemp))°C >= \(String(format: "%.1f", rule.triggerTempC))°C, fan \(Int(targetPct * 100))%")
-            return
-        }
-
-        if fansCurrentlyRunning {
-            applyCommand(.resetAuto)
-            fansCurrentlyRunning = false
-            lastAppliedRPMPercent = 0
-        }
-        state = .idle
-    }
 
     private func tickCurve(peakTemp: Float, minRPM: Float, maxRPM: Float) {
         let curve = activeProfile.curve

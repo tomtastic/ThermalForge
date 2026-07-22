@@ -167,29 +167,29 @@ struct MenuBarView: View {
 
                         if rule.id == LegacyTemperatureRuleMigration.ruleID && rule.enabled {
                             Stepper(
-                                value: $appState.customRuleTriggerTempC,
+                                value: $appState.quickRuleTriggerTempC,
                                 in: 40 ... 95,
                                 step: 1
                             ) {
-                                Text("IF temp ≥ \(Int(appState.customRuleTriggerTempC))°C")
+                                Text("IF temp ≥ \(Int(appState.quickRuleTriggerTempC))°C")
                                     .font(.caption)
                             }
 
                             Stepper(
-                                value: $appState.customRuleFanPercent,
+                                value: $appState.quickRuleFanPercent,
                                 in: 20 ... 100,
                                 step: 5
                             ) {
-                                Text("THEN set fan \(Int(appState.customRuleFanPercent))%")
+                                Text("THEN set fan \(Int(appState.quickRuleFanPercent))%")
                                     .font(.caption)
                             }
 
                             Stepper(
-                                value: $appState.customRuleReleaseTempC,
+                                value: $appState.quickRuleReleaseTempC,
                                 in: 35 ... 94,
                                 step: 1
                             ) {
-                                Text("UNTIL temp ≤ \(Int(appState.customRuleReleaseTempC))°C")
+                                Text("UNTIL temp ≤ \(Int(appState.quickRuleReleaseTempC))°C")
                                     .font(.caption)
                             }
                         }
