@@ -6,7 +6,7 @@ future work only.
 
 Current verified baseline:
 
-- 101 tests pass across 20 suites.
+- 104 tests pass across 21 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, and uninstall ownership have
@@ -26,17 +26,6 @@ Current verified baseline:
 `Calibration.swift` still combines lid detection, workload discovery, CPU/GPU
 stress generation, equilibrium measurement, curve construction, CSV logging,
 and top-level orchestration.
-
-### 6. Isolate lid-state detection
-
-- Introduce a `LidStateProvider` protocol.
-- Put AppKit/CoreGraphics or IOKit-specific detection in a macOS implementation.
-- Inject the provider into calibration and the monitor.
-- Test lid-specific selection without depending on attached displays.
-- Evaluate `AppleClamshellState` as the primary hardware signal, with a
-  documented screen-based fallback if necessary.
-
-Commit boundary: provider extraction with no calibration behavior change.
 
 ### 7. Extract stress workload ownership
 

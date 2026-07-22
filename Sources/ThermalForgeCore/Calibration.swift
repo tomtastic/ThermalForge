@@ -7,8 +7,6 @@
 
 import Foundation
 import Metal
-import AppKit
-import CoreGraphics
 import Darwin
 
 // MARK: - Data Model
@@ -136,33 +134,6 @@ public struct CalibrationData: Codable {
     }
 
     public var isValid: Bool { validationError == nil }
-}
-
-// MARK: - Lid State Detection
-
-/// Detect whether the Mac is in clamshell (lid closed) mode.
-///
-/// In clamshell mode, the built-in display is off and at least one external
-/// display is active. If no external display is present, the Mac sleeps when
-/// the lid is closed, so we don't need to worry about that case for fan control.
-///
-/// Detection: In clamshell mode, the built-in display does NOT appear in
-/// `NSScreen.screens`. So if there are screens but none is built-in → clamshell.
-public func isClamshellMode() -> Bool {
-    let screens = NSScreen.screens
-    guard !screens.isEmpty else { return false }
-
-    let screenNumberKey = NSDeviceDescriptionKey("NSScreenNumber")
-    let hasBuiltIn = screens.contains { screen in
-        guard let number = screen.deviceDescription[screenNumberKey] as? NSNumber else {
-            return false
-        }
-        return CGDisplayIsBuiltin(CGDirectDisplayID(number.uint32Value)) != 0
-    }
-
-    // If there are active screens but the built-in display is not among them,
-    // the lid must be closed (clamshell mode with external display).
-    return !hasBuiltIn
 }
 
 // MARK: - Calibration Mode
@@ -318,6 +289,7 @@ public final class CalibrationRunner {
     private let stressType: CalibrationStressType
     private let workloadIntensityOverride: Float?
     private let cancellationToken: CancellationToken
+    private let lidStateProvider: any LidStateProvider
     private var stressThreads: [Thread] = []
     private let stressLock = NSLock()
     private var _stressRunning = false
@@ -340,18 +312,23 @@ public final class CalibrationRunner {
         mode: CalibrationMode = .standard,
         stressType: CalibrationStressType = .combined,
         workloadIntensity: Float? = nil,
-        cancellationToken: CancellationToken = CancellationToken()
+        cancellationToken: CancellationToken = CancellationToken(),
+        lidStateProvider: any LidStateProvider = MacLidStateProvider()
     ) {
         self.fanControl = fanControl
         self.mode = mode
         self.stressType = stressType
         self.workloadIntensityOverride = workloadIntensity
         self.cancellationToken = cancellationToken
+        self.lidStateProvider = lidStateProvider
     }
 
     /// Check if running this mode would downgrade existing calibration
-    public static func wouldDowngrade(mode: CalibrationMode) -> Bool {
-        guard let existing = CalibrationData.load() else { return false }
+    public static func wouldDowngrade(
+        mode: CalibrationMode,
+        lidStateProvider: any LidStateProvider = MacLidStateProvider()
+    ) -> Bool {
+        guard let existing = CalibrationData.load(lidStateProvider: lidStateProvider) else { return false }
         return mode.rank < existing.modeRank
     }
 
@@ -724,7 +701,7 @@ public final class CalibrationRunner {
         let machine = String(cString: modelBuf)
 
         // Detect lid state once — used for logging and file naming
-        let clamshell = isClamshellMode()
+        let clamshell = lidStateProvider.isLidClosed
 
         let levels = Self.fanLevels(minPct: minPct)
         log("Mode: \(mode.description)")

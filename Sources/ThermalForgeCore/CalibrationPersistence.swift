@@ -106,8 +106,18 @@ extension CalibrationData {
     }
 
     /// Load calibration data matching the current lid state.
-    public static func load() -> CalibrationData? {
-        load(forLidClosed: isClamshellMode())
+    public static func load(
+        lidStateProvider: any LidStateProvider = MacLidStateProvider()
+    ) -> CalibrationData? {
+        load(forLidClosed: lidStateProvider.isLidClosed)
+    }
+
+    static func load(
+        lidStateProvider: any LidStateProvider,
+        pathForLidState: (Bool) -> URL
+    ) -> CalibrationData? {
+        let lidClosed = lidStateProvider.isLidClosed
+        return load(forLidClosed: lidClosed, from: pathForLidState(lidClosed))
     }
 
     /// A missing state-specific file means that state is uncalibrated. Legacy

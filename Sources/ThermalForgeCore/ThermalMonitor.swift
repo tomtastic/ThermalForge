@@ -84,6 +84,7 @@ struct TemperatureRateHistory {
 public final class ThermalMonitor {
     private let sensorProvider: SensorProvider
     private let controlService: ControlService
+    private let lidStateProvider: any LidStateProvider
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.thermalforge.monitor", qos: .utility)
 
@@ -163,18 +164,11 @@ public final class ThermalMonitor {
         queue.async { self.isCalibrating = value }
     }
 
-    private var calibration: CalibrationData? = {
-        guard let data = CalibrationData.load() else { return nil }
-        if let error = data.validationError {
-            TFLogger.shared.error("Calibration data rejected: \(error)")
-            return nil
-        }
-        return data
-    }()
+    private var calibration: CalibrationData?
 
     /// Track which lid state the current calibration was loaded for,
     /// so we can reload when the lid state flips.
-    private var calibrationLidClosed: Bool = isClamshellMode()
+    private var calibrationLidClosed: Bool
 
     /// Snapshot of calibration status for the UI.
     private var calibrationState: CalibrationState {
@@ -185,17 +179,17 @@ public final class ThermalMonitor {
     }
 
     /// How often (in seconds) to recheck lid state. Lid changes are rare —
-    /// checking every 60s is plenty and avoids NSScreen queries on every tick.
+    /// checking every 60s is plenty and avoids hardware queries on every tick.
     private let lidCheckInterval: Int = 60
     private var lastLidCheckTimestamp: UInt64 = 0
 
     /// Reload calibration data if the lid state has changed.
-    /// Throttled to `lidCheckInterval` seconds to avoid frequent NSScreen queries.
+    /// Throttled to `lidCheckInterval` seconds to avoid frequent lid-state queries.
     private func syncCalibration() {
         let now = UInt64(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         guard now - lastLidCheckTimestamp >= lidCheckInterval else { return }
         lastLidCheckTimestamp = now
-        let currentLidClosed = isClamshellMode()
+        let currentLidClosed = lidStateProvider.isLidClosed
         guard currentLidClosed != calibrationLidClosed else { return }
 
         TFLogger.shared.info("Lid state changed (clamshell: \(currentLidClosed)) — reloading calibration")
@@ -222,19 +216,36 @@ public final class ThermalMonitor {
     public init(
         sensorProvider: SensorProvider,
         profile: FanProfile = .silent,
-        controlService: ControlService = ControlService()
+        controlService: ControlService = ControlService(),
+        lidStateProvider: any LidStateProvider = MacLidStateProvider()
     ) {
         self.sensorProvider = sensorProvider
         self.activeProfile = profile
         self.controlService = controlService
+        self.lidStateProvider = lidStateProvider
+        calibrationLidClosed = lidStateProvider.isLidClosed
+
+        let loaded = CalibrationData.load(forLidClosed: calibrationLidClosed)
+        if let error = loaded?.validationError {
+            TFLogger.shared.error("Calibration data rejected: \(error)")
+            calibration = nil
+        } else {
+            calibration = loaded
+        }
     }
 
     public convenience init(
         fanControl: FanControl,
         profile: FanProfile = .silent,
-        controlService: ControlService = ControlService()
+        controlService: ControlService = ControlService(),
+        lidStateProvider: any LidStateProvider = MacLidStateProvider()
     ) {
-        self.init(sensorProvider: fanControl, profile: profile, controlService: controlService)
+        self.init(
+            sensorProvider: fanControl,
+            profile: profile,
+            controlService: controlService,
+            lidStateProvider: lidStateProvider
+        )
     }
 
     public func updateRules(_ rules: [ThermalRule], enabled: Bool) {
@@ -331,7 +342,7 @@ public final class ThermalMonitor {
             if profile.id == "smart" {
                 // Reset Smart state and reload calibration data for current lid state.
                 tempHistory.removeAll()
-                calibrationLidClosed = isClamshellMode()
+                calibrationLidClosed = lidStateProvider.isLidClosed
                 let loaded = CalibrationData.load(forLidClosed: calibrationLidClosed)
                 if let error = loaded?.validationError {
                     TFLogger.shared.error("Calibration data rejected on reload: \(error)")
