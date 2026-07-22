@@ -27,9 +27,12 @@ Current verified baseline:
 
 ### 12. Consolidate repeated command mutations
 
-- Give rule persistence tested add, remove, enable, disable, and replace
-  operations instead of repeating array mutation in the CLI, GUI, and daemon.
-- Share duration parsing and formatting where it is genuinely reused.
+`RulePersistence` now has tested add, remove, enable, disable, and replace
+operations, and the CLI uses them. The GUI and legacy migration still mutate
+loaded arrays directly.
+
+- Migrate `AppState` rule edits to the persistence operations.
+- Migrate legacy rule creation to the add operation.
 - Keep user-facing output in command types rather than core storage objects.
 
 Commit boundary: one store/API consolidation at a time.

@@ -75,9 +75,7 @@ struct RulesAdd: ParsableCommand {
             untilTempBelowC: until
         )
 
-        var rules = RulePersistence.load()
-        rules.append(rule)
-        try RulePersistence.save(rules)
+        try RulePersistence.add(rule)
 
         print("Added rule: \(rule.id)")
     }
@@ -93,12 +91,8 @@ struct RulesRemove: ParsableCommand {
     var id: String
 
     func run() throws {
-        var rules = RulePersistence.load()
-        let before = rules.count
-        rules.removeAll(where: { $0.id == id })
-        try RulePersistence.save(rules)
-        let removed = before - rules.count
-        print(removed > 0 ? "Removed \(removed) rule(s)." : "No matching rule.")
+        let result = try RulePersistence.remove(id: id)
+        print(result.removedCount > 0 ? "Removed \(result.removedCount) rule(s)." : "No matching rule.")
     }
 }
 
@@ -112,12 +106,9 @@ struct RulesEnable: ParsableCommand {
     var id: String
 
     func run() throws {
-        var rules = RulePersistence.load()
-        guard let index = rules.firstIndex(where: { $0.id == id }) else {
+        guard try RulePersistence.enable(id: id) != nil else {
             throw ValidationError("Rule not found: \(id)")
         }
-        rules[index].enabled = true
-        try RulePersistence.save(rules)
         print("Enabled rule: \(id)")
     }
 }
@@ -132,12 +123,9 @@ struct RulesDisable: ParsableCommand {
     var id: String
 
     func run() throws {
-        var rules = RulePersistence.load()
-        guard let index = rules.firstIndex(where: { $0.id == id }) else {
+        guard try RulePersistence.disable(id: id) != nil else {
             throw ValidationError("Rule not found: \(id)")
         }
-        rules[index].enabled = false
-        try RulePersistence.save(rules)
         print("Disabled rule: \(id)")
     }
 }
