@@ -6,7 +6,7 @@ future work only.
 
 Current verified baseline:
 
-- 104 tests pass across 21 suites.
+- 105 tests pass across 21 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, and uninstall ownership have
@@ -29,13 +29,12 @@ and top-level orchestration.
 
 ### 7. Extract stress workload ownership
 
-- Move CPU worker planning and execution into `CPUStressWorkload`.
 - Move Metal setup and dispatch into `GPUStressWorkload`.
 - Combine them behind a small `CalibrationWorkload` interface.
 - Make start/stop idempotent and keep resource cleanup deterministic.
 - Retain the existing fractional CPU-load and selected-sensor tests.
 
-Commit boundaries: CPU workload extraction, then GPU workload extraction.
+Remaining commit boundary: GPU workload extraction and combined interface.
 
 ### 8. Extract intensity discovery
 

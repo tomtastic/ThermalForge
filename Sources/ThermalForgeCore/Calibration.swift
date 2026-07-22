@@ -276,11 +276,6 @@ struct CalibrationStabilityMetrics: Equatable {
     let confidenceRadius95: Float
 }
 
-struct CalibrationCPUStressPlan: Equatable {
-    let fullThreads: Int
-    let fractionalDutyCycle: Float
-}
-
 // MARK: - Calibration Runner
 
 public final class CalibrationRunner {
@@ -290,6 +285,7 @@ public final class CalibrationRunner {
     private let workloadIntensityOverride: Float?
     private let cancellationToken: CancellationToken
     private let lidStateProvider: any LidStateProvider
+    private let cpuStressWorkload = CPUStressWorkload()
     private var stressThreads: [Thread] = []
     private let stressLock = NSLock()
     private var _stressRunning = false
@@ -1127,67 +1123,13 @@ public final class CalibrationRunner {
         stressRunning = true
 
         if stressType == .combined || stressType == .cpu {
-            let coreCount = ProcessInfo.processInfo.activeProcessorCount
-            let plan = Self.cpuStressPlan(intensity: intensity, coreCount: coreCount)
-            for _ in 0..<plan.fullThreads {
-                startCPUStressThread(dutyCycle: 1)
-            }
-            if plan.fractionalDutyCycle > 0 {
-                startCPUStressThread(dutyCycle: plan.fractionalDutyCycle)
-            }
+            cpuStressWorkload.start(intensity: intensity)
         }
 
         // GPU stress: scale grid size by intensity
         if stressType == .combined || stressType == .gpu {
             startGPUStress(intensity: intensity)
         }
-    }
-
-    static func cpuStressPlan(intensity: Float, coreCount: Int) -> CalibrationCPUStressPlan {
-        let clampedIntensity = min(max(intensity, 0), 1)
-        let desiredCoreLoad = clampedIntensity * Float(max(coreCount, 1))
-        let fullThreads = Int(desiredCoreLoad.rounded(.down))
-        let fractionalDutyCycle = desiredCoreLoad - Float(fullThreads)
-        return CalibrationCPUStressPlan(
-            fullThreads: fullThreads,
-            fractionalDutyCycle: fractionalDutyCycle
-        )
-    }
-
-    private func startCPUStressThread(dutyCycle: Float) {
-        let clampedDuty = min(max(dutyCycle, 0), 1)
-        // Fractional work must be fine-grained: a 100ms cycle with a large
-        // minimum batch created short full-power single-core bursts that peak
-        // CPU sensors reported as 65–76°C even at ~0.15% total intensity.
-        // A 10ms period and small batches distribute the same average work much
-        // more evenly. Full workers retain large batches for efficiency.
-        let isFullWorker = clampedDuty >= 0.999
-        let period: TimeInterval = isFullWorker ? 0.1 : 0.01
-        let activeDuration = period * Double(clampedDuty)
-        let workIterations = isFullWorker ? 10_000 : 250
-
-        let thread = Thread {
-            while self.stressRunning {
-                let cycleStart = Date()
-                repeat {
-                    var x: Double = 1.0
-                    for i in 1...workIterations {
-                        x = sin(x) * cos(Double(i))
-                    }
-                    _ = x
-                } while self.stressRunning
-                    && Date().timeIntervalSince(cycleStart) < activeDuration
-
-                let elapsed = Date().timeIntervalSince(cycleStart)
-                let remaining = period - elapsed
-                if remaining > 0 {
-                    Thread.sleep(forTimeInterval: remaining)
-                }
-            }
-        }
-        thread.qualityOfService = .userInteractive
-        thread.start()
-        stressThreads.append(thread)
     }
 
     private func startGPUStress(intensity: Float = 1.0) {
@@ -1283,6 +1225,7 @@ public final class CalibrationRunner {
 
     private func stopStress() {
         stressRunning = false
+        cpuStressWorkload.stop()
         // Most workers exit within one 100ms duty-cycle period. Poll briefly
         // instead of imposing a fixed two-second delay on every Phase 1 trial.
         let deadline = Date().addingTimeInterval(2)

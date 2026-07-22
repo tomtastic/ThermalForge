@@ -157,17 +157,29 @@ struct CalibrationConvergenceTests {
 
     @Test("Low CPU intensities use a fractional worker without a one-core jump")
     func fractionalCPUStressPlan() {
-        let veryLow = CalibrationRunner.cpuStressPlan(intensity: 0.003, coreCount: 16)
+        let veryLow = CPUStressWorkload.plan(intensity: 0.003, coreCount: 16)
         #expect(veryLow.fullThreads == 0)
         #expect(abs(veryLow.fractionalDutyCycle - 0.048) < 0.0001)
 
-        let initialProbe = CalibrationRunner.cpuStressPlan(intensity: 0.05, coreCount: 16)
+        let initialProbe = CPUStressWorkload.plan(intensity: 0.05, coreCount: 16)
         #expect(initialProbe.fullThreads == 0)
         #expect(abs(initialProbe.fractionalDutyCycle - 0.8) < 0.0001)
 
-        let higher = CalibrationRunner.cpuStressPlan(intensity: 0.10, coreCount: 16)
+        let higher = CPUStressWorkload.plan(intensity: 0.10, coreCount: 16)
         #expect(higher.fullThreads == 1)
         #expect(abs(higher.fractionalDutyCycle - 0.6) < 0.0001)
+    }
+
+    @Test("CPU stress start and stop are idempotent")
+    func cpuStressLifecycleIsIdempotent() {
+        let workload = CPUStressWorkload()
+
+        #expect(workload.start(intensity: 0, coreCount: 8))
+        #expect(workload.isRunning)
+        #expect(!workload.start(intensity: 0, coreCount: 8))
+        #expect(workload.stop())
+        #expect(!workload.isRunning)
+        #expect(!workload.stop())
     }
 
     @Test("All-maximum calibration curves are rejected")
