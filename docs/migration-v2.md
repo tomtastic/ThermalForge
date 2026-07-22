@@ -18,7 +18,7 @@
 
 1. Rebuild and reinstall:
    - `swift build -c release`
-   - `sudo .build/release/thermalforge install`
+   - `sudo "$(swift build -c release --show-bin-path)/thermalforge" install`
 2. Rebuild app bundle:
    - `sudo ./Scripts/build-app-bundle.sh /Applications/ThermalForge.app`
 3. Restart daemon:

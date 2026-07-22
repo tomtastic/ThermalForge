@@ -48,23 +48,6 @@ Questions to resolve during design:
 
 ## Near-Term Maintenance
 
-### Code Simplification Audit
-
-Perform a focused codebase audit after this roadmap rewrite.
-The remaining remediation sequence and commit boundaries are tracked in the
-[code simplification plan](docs/code-simplification-plan.md).
-
-Initial targets:
-
-- Split the large calibration implementation into workload discovery,
-  convergence/sweep, curve construction, and persistence components.
-- Split CLI command implementations out of the monolithic CLI entry file.
-- Consolidate duplicated temperature-family and machine-state selection logic.
-- Identify stale compatibility code and comments that describe superseded
-  polling or calibration designs.
-- Review error propagation and exit statuses for long-running CLI commands.
-- Preserve behavior with tests before structural changes.
-
 ### Update Notifications
 
 Add a lightweight, non-intrusive update check:

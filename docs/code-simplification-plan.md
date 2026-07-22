@@ -1,8 +1,8 @@
-# Code Simplification Plan
+# Code Simplification Audit
 
-This document tracks the remaining work from the July 2026 code-simplification
-audit. Completed audit fixes are recorded in git history; this file describes
-future work only.
+The July 2026 code-simplification audit is complete. Individual fixes and
+structural moves are recorded as separate commits in git history; this file
+records the final verification baseline.
 
 Current verified baseline:
 
@@ -10,25 +10,14 @@ Current verified baseline:
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
-  CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, and curve
-  construction, rule persistence mutations, runtime anomaly observation, and
+  CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, curve
+  construction, rule persistence mutations, runtime anomaly observation,
   runtime control decisions, and fan unlock/write paths have dedicated
   components or test seams. Daemon requests and responses use bounded,
   newline-delimited framing with complete writes. The CLI entry file now only
   registers commands.
 
-## Working Rules
-
-- Preserve observable behavior before changing it.
-- Add a regression test before fixing a discovered correctness issue.
-- Keep each independently verifiable fix or structural move in its own commit.
-- Run `swift test` before every commit and a release build after each phase.
-- Do not mix visualization, update notifications, or unrelated feature work
-  into these refactors.
-
-## Completion Criteria
-
-The audit remediation is complete when:
+## Completion Verification
 
 - Only one rule model and one authoritative rule store remain.
 - Calibration phases are independently testable without SMC hardware, Metal,
@@ -39,4 +28,4 @@ The audit remediation is complete when:
 - Privileged operations consistently report failures and target both root and
   console-user state where appropriate.
 - No tracked generated app bundle or superseded design document remains.
-- The full test suite and production build pass after every phase.
+- The final full test suite and production build pass.

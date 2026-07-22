@@ -24,7 +24,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         // Reset fans to Apple defaults on quit so the SMC resumes thermal
-        // management. The daemon has a 15s heartbeat watchdog as a fallback,
+        // management. The daemon has a 10s heartbeat watchdog as a fallback,
         // but we want this to happen promptly. Block for up to 3s — applicationWillTerminate
         // is called on the main thread before termination, so a short wait is fine.
         let client = DaemonClient(timeoutSeconds: 3)
