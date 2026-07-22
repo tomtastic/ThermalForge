@@ -25,8 +25,8 @@ Current verified baseline:
 
 ## Phase 4: Split the CLI and System Coordination
 
-`Sources/thermalforge/ThermalForge.swift` still contains the rule, install,
-uninstall, and daemon commands.
+`Sources/thermalforge/ThermalForge.swift` still contains the install, uninstall,
+and daemon commands.
 
 ### 11. Split remaining command implementations
 
@@ -36,7 +36,6 @@ Suggested layout:
 Sources/thermalforge/
   ThermalForge.swift
   Commands/
-    RuleCommands.swift
     InstallCommand.swift
     UninstallCommand.swift
     DaemonCommand.swift
