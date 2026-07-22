@@ -155,25 +155,58 @@ struct MenuBarView: View {
                     .padding(.vertical, 2)
             } else {
                 ForEach(appState.rules.sorted(by: { $0.priority > $1.priority })) { rule in
-                    HStack {
-                        Toggle(rule.name, isOn: ruleBinding(rule.id))
-                        Button(action: { appState.removeRule(rule.id) }) {
-                            Image(systemName: "trash")
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Toggle(rule.name, isOn: ruleBinding(rule.id))
+                            Button(action: { appState.removeRule(rule.id) }) {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
+
+                        if rule.id == LegacyTemperatureRuleMigration.ruleID && rule.enabled {
+                            Stepper(
+                                value: $appState.customRuleTriggerTempC,
+                                in: 40 ... 95,
+                                step: 1
+                            ) {
+                                Text("IF temp ≥ \(Int(appState.customRuleTriggerTempC))°C")
+                                    .font(.caption)
+                            }
+
+                            Stepper(
+                                value: $appState.customRuleFanPercent,
+                                in: 20 ... 100,
+                                step: 5
+                            ) {
+                                Text("THEN set fan \(Int(appState.customRuleFanPercent))%")
+                                    .font(.caption)
+                            }
+
+                            Stepper(
+                                value: $appState.customRuleReleaseTempC,
+                                in: 35 ... 94,
+                                step: 1
+                            ) {
+                                Text("UNTIL temp ≤ \(Int(appState.customRuleReleaseTempC))°C")
+                                    .font(.caption)
+                            }
+                        }
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 1)
                 }
             }
 
-            Button(action: { appState.addQuickRule() }) {
-                Label("Add IF/THEN Rule", systemImage: "plus.circle")
+            if !appState.hasQuickTemperatureRule {
+                Button(action: { appState.addQuickRule() }) {
+                    Label("Add IF/THEN Rule", systemImage: "plus.circle")
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 12)
+                .padding(.top, 2)
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 12)
-            .padding(.top, 2)
 
             Divider().padding(.vertical, 4)
 
@@ -193,45 +226,6 @@ struct MenuBarView: View {
                 .buttonStyle(.bordered)
             }
             .padding(.horizontal, 12)
-
-            Divider().padding(.vertical, 4)
-
-            // Custom IF/THEN rule
-            SectionHeader(title: "IF / THEN RULE")
-            Toggle("Enable Custom Rule", isOn: $appState.customRuleEnabled)
-                .padding(.horizontal, 12)
-
-            if appState.customRuleEnabled {
-                Stepper(
-                    value: $appState.customRuleTriggerTempC,
-                    in: 40 ... 95,
-                    step: 1
-                ) {
-                    Text("IF temp ≥ \(Int(appState.customRuleTriggerTempC))°C")
-                        .font(.caption)
-                }
-                .padding(.horizontal, 12)
-
-                Stepper(
-                    value: $appState.customRuleFanPercent,
-                    in: 20 ... 100,
-                    step: 5
-                ) {
-                    Text("THEN set fan \(Int(appState.customRuleFanPercent))%")
-                        .font(.caption)
-                }
-                .padding(.horizontal, 12)
-
-                Stepper(
-                    value: $appState.customRuleReleaseTempC,
-                    in: 35 ... 94,
-                    step: 1
-                ) {
-                    Text("ELSE when temp ≤ \(Int(appState.customRuleReleaseTempC))°C")
-                        .font(.caption)
-                }
-                .padding(.horizontal, 12)
-            }
 
             Divider().padding(.vertical, 4)
 

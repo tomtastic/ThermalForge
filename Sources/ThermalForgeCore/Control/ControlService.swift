@@ -32,6 +32,14 @@ public struct RuleDecision: Equatable {
         self.sourceRuleID = sourceRuleID
         self.sourceRuleName = sourceRuleName
     }
+
+    public func resolvedFanCommand(minRPM: Float, maxRPM: Float) -> FanCommand? {
+        if let command { return command }
+        guard let fanPercent, maxRPM > 0 else { return nil }
+        let minimumPercent = min(max(minRPM / maxRPM, 0), 1)
+        let targetPercent = min(max(fanPercent, minimumPercent), 1)
+        return .setRPM(max(maxRPM * targetPercent, minRPM))
+    }
 }
 
 public final class ControlService {

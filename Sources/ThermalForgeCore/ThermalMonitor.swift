@@ -490,7 +490,13 @@ public final class ThermalMonitor {
                     preempted = true
                 }
 
-                if let command = decision.command {
+                let fanLimits = status.fans.first
+                    .map { (min: Float($0.minRPM), max: Float($0.maxRPM)) }
+                    ?? (min: 2317, max: 7826)
+                if let command = decision.resolvedFanCommand(
+                    minRPM: fanLimits.min,
+                    maxRPM: fanLimits.max
+                ) {
                     let shouldReapply: Bool
                     if decisionChanged {
                         shouldReapply = true

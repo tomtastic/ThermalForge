@@ -25,6 +25,27 @@ struct RuleEngineTests {
         #expect(decision?.sourceRuleID == "percent")
     }
 
+    @Test("Fan-percentage decisions respect machine fan limits")
+    func fanPercentageResolvesAgainstLimits() {
+        let lowDecision = RuleDecision(
+            command: nil,
+            fanPercent: 0.1,
+            profileID: nil,
+            sourceRuleID: "low",
+            sourceRuleName: "Low"
+        )
+        let highDecision = RuleDecision(
+            command: nil,
+            fanPercent: 1.5,
+            profileID: nil,
+            sourceRuleID: "high",
+            sourceRuleName: "High"
+        )
+
+        #expect(lowDecision.resolvedFanCommand(minRPM: 2_000, maxRPM: 8_000) == .setRPM(2_000))
+        #expect(highDecision.resolvedFanCommand(minRPM: 2_000, maxRPM: 8_000) == .setRPM(8_000))
+    }
+
     @Test("Highest priority matching rule wins")
     func highestPriorityWins() {
         let low = ThermalRule(

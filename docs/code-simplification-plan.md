@@ -6,7 +6,7 @@ future work only.
 
 Current verified baseline:
 
-- 100 tests pass across 20 suites.
+- 101 tests pass across 20 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, and uninstall ownership have
@@ -42,10 +42,7 @@ Plan:
 - Verify that hard safety still preempts every rule and that priority/latching
   behavior remains deterministic.
 
-Remaining commit boundaries:
-
-1. GUI conversion to the persistent rule model.
-2. Legacy monitor path removal.
+Remaining commit boundary: legacy monitor path removal.
 
 ### 5. Resolve the unused daemon rule API
 
