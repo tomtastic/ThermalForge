@@ -25,18 +25,21 @@ public enum RuleComparator: String, Codable, CaseIterable {
 public enum ThermalRuleAction: Codable, Equatable {
     case setMax
     case setRPM(Int)
+    case setFanPercent(Float)
     case resetAuto
     case selectProfile(String)
 
     private enum CodingKeys: String, CodingKey {
         case type
         case rpm
+        case fanPercent
         case profileID
     }
 
     private enum ActionType: String, Codable {
         case setMax
         case setRPM
+        case setFanPercent
         case resetAuto
         case selectProfile
     }
@@ -49,6 +52,8 @@ public enum ThermalRuleAction: Codable, Equatable {
             self = .setMax
         case .setRPM:
             self = .setRPM(try c.decode(Int.self, forKey: .rpm))
+        case .setFanPercent:
+            self = .setFanPercent(try c.decode(Float.self, forKey: .fanPercent))
         case .resetAuto:
             self = .resetAuto
         case .selectProfile:
@@ -64,6 +69,9 @@ public enum ThermalRuleAction: Codable, Equatable {
         case .setRPM(let rpm):
             try c.encode(ActionType.setRPM, forKey: .type)
             try c.encode(rpm, forKey: .rpm)
+        case .setFanPercent(let fanPercent):
+            try c.encode(ActionType.setFanPercent, forKey: .type)
+            try c.encode(fanPercent, forKey: .fanPercent)
         case .resetAuto:
             try c.encode(ActionType.resetAuto, forKey: .type)
         case .selectProfile(let profileID):

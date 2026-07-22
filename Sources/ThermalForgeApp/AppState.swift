@@ -105,6 +105,11 @@ final class AppState {
         // Clean expired logs.
         ThermalLogger.cleanExpired()
 
+        do {
+            try LegacyTemperatureRuleMigration.migrate()
+        } catch {
+            TFLogger.shared.error("Legacy temperature-rule migration failed: \(error)")
+        }
         rules = RulePersistence.load()
 
         startMonitoring()

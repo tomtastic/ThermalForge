@@ -93,25 +93,35 @@ public final class RuleEngine {
 
     private static func makeDecision(rule: ThermalRule) -> RuleDecision {
         let command: FanCommand?
+        let fanPercent: Float?
         let profileID: String?
 
         switch rule.action {
         case .setMax:
             command = .setMax
+            fanPercent = nil
             profileID = nil
         case .setRPM(let rpm):
             command = .setRPM(Float(rpm))
+            fanPercent = nil
+            profileID = nil
+        case .setFanPercent(let percent):
+            command = nil
+            fanPercent = percent
             profileID = nil
         case .resetAuto:
             command = .resetAuto
+            fanPercent = nil
             profileID = nil
         case .selectProfile(let id):
             command = nil
+            fanPercent = nil
             profileID = id
         }
 
         return RuleDecision(
             command: command,
+            fanPercent: fanPercent,
             profileID: profileID,
             sourceRuleID: rule.id,
             sourceRuleName: rule.name

@@ -4,6 +4,27 @@ import Testing
 
 @Suite("Rule Engine")
 struct RuleEngineTests {
+    @Test("Fan-percentage actions remain machine-independent")
+    func fanPercentageDecision() {
+        let rule = ThermalRule(
+            id: "percent",
+            name: "Percent",
+            condition: ThermalRuleCondition(
+                metric: .maxTemp,
+                comparator: .greaterThanOrEqual,
+                valueCelsius: 60
+            ),
+            action: .setFanPercent(0.65)
+        )
+        let engine = RuleEngine(rules: [rule])
+
+        let decision = engine.evaluate(context: .init(cpuTemp: 65, gpuTemp: 50, maxTemp: 65))
+
+        #expect(decision?.command == nil)
+        #expect(decision?.fanPercent == 0.65)
+        #expect(decision?.sourceRuleID == "percent")
+    }
+
     @Test("Highest priority matching rule wins")
     func highestPriorityWins() {
         let low = ThermalRule(

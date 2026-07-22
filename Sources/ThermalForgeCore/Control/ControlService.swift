@@ -14,12 +14,20 @@ public struct RuleEvaluationContext: Equatable {
 
 public struct RuleDecision: Equatable {
     public let command: FanCommand?
+    public let fanPercent: Float?
     public let profileID: String?
     public let sourceRuleID: String
     public let sourceRuleName: String
 
-    public init(command: FanCommand?, profileID: String?, sourceRuleID: String, sourceRuleName: String) {
+    public init(
+        command: FanCommand?,
+        fanPercent: Float? = nil,
+        profileID: String?,
+        sourceRuleID: String,
+        sourceRuleName: String
+    ) {
         self.command = command
+        self.fanPercent = fanPercent
         self.profileID = profileID
         self.sourceRuleID = sourceRuleID
         self.sourceRuleName = sourceRuleName

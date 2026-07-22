@@ -7,17 +7,25 @@ public enum RulePersistence {
     }
 
     public static func load() -> [ThermalRule] {
-        guard FileManager.default.fileExists(atPath: filePath.path) else { return [] }
-        guard let data = try? Data(contentsOf: filePath) else { return [] }
+        load(from: filePath)
+    }
+
+    static func load(from path: URL) -> [ThermalRule] {
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        guard let data = try? Data(contentsOf: path) else { return [] }
         return (try? JSONDecoder().decode([ThermalRule].self, from: data)) ?? []
     }
 
     public static func save(_ rules: [ThermalRule]) throws {
-        let dir = filePath.deletingLastPathComponent()
+        try save(rules, to: filePath)
+    }
+
+    static func save(_ rules: [ThermalRule], to path: URL) throws {
+        let dir = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(rules)
-        try data.write(to: filePath)
+        try data.write(to: path)
     }
 }
