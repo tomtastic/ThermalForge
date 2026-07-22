@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import Metal
 import Darwin
 
 // MARK: - Data Model
@@ -285,14 +284,8 @@ public final class CalibrationRunner {
     private let workloadIntensityOverride: Float?
     private let cancellationToken: CancellationToken
     private let lidStateProvider: any LidStateProvider
-    private let cpuStressWorkload = CPUStressWorkload()
-    private var stressThreads: [Thread] = []
-    private let stressLock = NSLock()
-    private var _stressRunning = false
-    private var stressRunning: Bool {
-        get { stressLock.lock(); defer { stressLock.unlock() }; return _stressRunning }
-        set { stressLock.lock(); _stressRunning = newValue; stressLock.unlock() }
-    }
+    private let calibrationWorkload: any CalibrationWorkload
+    private let gpuStressWorkload: GPUStressWorkload?
     private let isoFormatter = ISO8601DateFormatter()
 
     public var onProgress: ((String) -> Void)?
@@ -317,6 +310,23 @@ public final class CalibrationRunner {
         self.workloadIntensityOverride = workloadIntensity
         self.cancellationToken = cancellationToken
         self.lidStateProvider = lidStateProvider
+
+        let cpuWorkload = CPUStressWorkload()
+        switch stressType {
+        case .cpu:
+            self.calibrationWorkload = cpuWorkload
+            self.gpuStressWorkload = nil
+        case .gpu:
+            let gpuWorkload = GPUStressWorkload()
+            self.calibrationWorkload = gpuWorkload
+            self.gpuStressWorkload = gpuWorkload
+        case .combined:
+            let gpuWorkload = GPUStressWorkload()
+            self.calibrationWorkload = CalibrationWorkloadGroup(
+                workloads: [cpuWorkload, gpuWorkload]
+            )
+            self.gpuStressWorkload = gpuWorkload
+        }
     }
 
     /// Check if running this mode would downgrade existing calibration
@@ -1119,125 +1129,14 @@ public final class CalibrationRunner {
     /// CPU: intensity * coreCount, including a duty-cycled fractional thread.
     /// GPU: intensity * 4M grid size.
     private func startStress(intensity: Float = 1.0) {
-        guard !stressRunning else { return }
-        stressRunning = true
-
-        if stressType == .combined || stressType == .cpu {
-            cpuStressWorkload.start(intensity: intensity)
-        }
-
-        // GPU stress: scale grid size by intensity
-        if stressType == .combined || stressType == .gpu {
-            startGPUStress(intensity: intensity)
-        }
-    }
-
-    private func startGPUStress(intensity: Float = 1.0) {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            log("Warning: Metal device not available, running CPU-only stress")
-            return
-        }
-
-        // Compile a compute shader at runtime that does dense FP32 math
-        let shaderSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        kernel void stress(device float *data [[buffer(0)]],
-                          uint id [[thread_position_in_grid]]) {
-            float x = data[id];
-            for (int i = 0; i < 2000; i++) {
-                x = sin(x) * cos(x) + tan(x * 0.01);
-                x = fma(x, x, float(i) * 0.001);
-                x = sqrt(abs(x) + 1.0);
-            }
-            data[id] = x;
-        }
-        """
-
-        guard let library = try? device.makeLibrary(source: shaderSource, options: nil),
-              let function = library.makeFunction(name: "stress"),
-              let pipeline = try? device.makeComputePipelineState(function: function),
-              let queue = device.makeCommandQueue()
-        else {
-            log("Warning: Metal pipeline setup failed, running CPU-only stress")
-            return
-        }
-
-        // Scale GPU work by intensity — grid size controls utilization
-        let baseCount = 1024 * 1024 * 4 // 4M floats at 100%
-        let elementCount = Swift.max(Int(Float(baseCount) * intensity), 1024)
-        let bufferSize = elementCount * MemoryLayout<Float>.stride
-        guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
-            log("Warning: Metal buffer allocation failed, running CPU-only stress")
-            return
-        }
-
-        // Fill with initial values
-        let ptr = buffer.contents().bindMemory(to: Float.self, capacity: elementCount)
-        for i in 0..<elementCount {
-            ptr[i] = Float(i % 1000) * 0.001
-        }
-
-        self.gpuDevice = device
-        self.gpuPipeline = pipeline
-        self.gpuQueue = queue
-        self.gpuBuffer = buffer
-        self.gpuElementCount = elementCount
-
-        // Run GPU dispatches on a background thread
-        let thread = Thread {
-            self.gpuStressLoop()
-        }
-        thread.qualityOfService = .userInteractive
-        thread.start()
-        stressThreads.append(thread)
-    }
-
-    private var gpuDevice: MTLDevice?
-    private var gpuPipeline: MTLComputePipelineState?
-    private var gpuQueue: MTLCommandQueue?
-    private var gpuBuffer: MTLBuffer?
-    private var gpuElementCount: Int = 0
-
-    private func gpuStressLoop() {
-        guard let pipeline = gpuPipeline,
-              let queue = gpuQueue,
-              let buffer = gpuBuffer
-        else { return }
-
-        let threadGroupSize = MTLSize(width: pipeline.maxTotalThreadsPerThreadgroup, height: 1, depth: 1)
-        let gridSize = MTLSize(width: gpuElementCount, height: 1, depth: 1)
-
-        while stressRunning {
-            guard let commandBuffer = queue.makeCommandBuffer(),
-                  let encoder = commandBuffer.makeComputeCommandEncoder()
-            else { continue }
-
-            encoder.setComputePipelineState(pipeline)
-            encoder.setBuffer(buffer, offset: 0, index: 0)
-            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadGroupSize)
-            encoder.endEncoding()
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
+        _ = calibrationWorkload.start(intensity: intensity)
+        if let warning = gpuStressWorkload?.lastWarning {
+            log(warning)
         }
     }
 
     private func stopStress() {
-        stressRunning = false
-        cpuStressWorkload.stop()
-        // Most workers exit within one 100ms duty-cycle period. Poll briefly
-        // instead of imposing a fixed two-second delay on every Phase 1 trial.
-        let deadline = Date().addingTimeInterval(2)
-        while stressThreads.contains(where: { !$0.isFinished }), Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-        stressThreads.removeAll()
-        // Release Metal resources — stops GPU dispatches
-        gpuBuffer = nil
-        gpuPipeline = nil
-        gpuQueue = nil
-        gpuDevice = nil
+        calibrationWorkload.stop()
     }
 
     // MARK: - Helpers

@@ -6,11 +6,11 @@ future work only.
 
 Current verified baseline:
 
-- 105 tests pass across 21 suites.
+- 107 tests pass across 21 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
-  client transport, cancellation cleanup, and uninstall ownership have
-  dedicated components or test seams.
+  client transport, cancellation cleanup, uninstall ownership, lid detection,
+  and CPU/GPU stress workloads have dedicated components or test seams.
 
 ## Working Rules
 
@@ -23,18 +23,8 @@ Current verified baseline:
 
 ## Phase 3: Split Calibration by Responsibility
 
-`Calibration.swift` still combines lid detection, workload discovery, CPU/GPU
-stress generation, equilibrium measurement, curve construction, CSV logging,
-and top-level orchestration.
-
-### 7. Extract stress workload ownership
-
-- Move Metal setup and dispatch into `GPUStressWorkload`.
-- Combine them behind a small `CalibrationWorkload` interface.
-- Make start/stop idempotent and keep resource cleanup deterministic.
-- Retain the existing fractional CPU-load and selected-sensor tests.
-
-Remaining commit boundary: GPU workload extraction and combined interface.
+`Calibration.swift` still combines intensity discovery, equilibrium
+measurement, curve construction, CSV logging, and top-level orchestration.
 
 ### 8. Extract intensity discovery
 

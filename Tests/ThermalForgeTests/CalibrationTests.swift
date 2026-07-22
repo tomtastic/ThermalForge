@@ -3,6 +3,48 @@ import Testing
 
 @testable import ThermalForgeCore
 
+private enum WorkloadEvent: Equatable {
+    case started(String, Float)
+    case stopped(String)
+}
+
+private final class WorkloadEventRecorder {
+    private let lock = NSLock()
+    private var events: [WorkloadEvent] = []
+
+    func append(_ event: WorkloadEvent) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    var snapshot: [WorkloadEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+}
+
+private final class RecordingCalibrationWorkload: CalibrationWorkload {
+    private let name: String
+    private let recorder: WorkloadEventRecorder
+
+    init(name: String, recorder: WorkloadEventRecorder) {
+        self.name = name
+        self.recorder = recorder
+    }
+
+    func start(intensity: Float) -> Bool {
+        recorder.append(.started(name, intensity))
+        return true
+    }
+
+    func stop() -> Bool {
+        recorder.append(.stopped(name))
+        return true
+    }
+}
+
 @Suite("Calibration selection")
 struct CalibrationSelectionTests {
     private func calibration(lidClosed: Bool) -> CalibrationData {
@@ -179,6 +221,36 @@ struct CalibrationConvergenceTests {
         #expect(!workload.start(intensity: 0, coreCount: 8))
         #expect(workload.stop())
         #expect(!workload.isRunning)
+        #expect(!workload.stop())
+    }
+
+    @Test("Combined workload start and stop are ordered and idempotent")
+    func combinedWorkloadLifecycleIsIdempotent() {
+        let recorder = WorkloadEventRecorder()
+        let workload = CalibrationWorkloadGroup(workloads: [
+            RecordingCalibrationWorkload(name: "cpu", recorder: recorder),
+            RecordingCalibrationWorkload(name: "gpu", recorder: recorder),
+        ])
+
+        #expect(workload.start(intensity: 0.25))
+        #expect(!workload.start(intensity: 0.5))
+        #expect(workload.stop())
+        #expect(!workload.stop())
+        #expect(recorder.snapshot == [
+            .started("cpu", 0.25),
+            .started("gpu", 0.25),
+            .stopped("gpu"),
+            .stopped("cpu"),
+        ])
+    }
+
+    @Test("GPU stress reports unavailable Metal without remaining active")
+    func unavailableGPUFailsCleanly() {
+        let workload = GPUStressWorkload(deviceProvider: { nil })
+
+        #expect(!workload.start(intensity: 0.25))
+        #expect(!workload.isRunning)
+        #expect(workload.lastWarning == "Warning: Metal device not available, running CPU-only stress")
         #expect(!workload.stop())
     }
 

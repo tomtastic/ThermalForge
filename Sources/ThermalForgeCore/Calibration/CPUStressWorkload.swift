@@ -5,7 +5,7 @@ struct CalibrationCPUStressPlan: Equatable {
     let fractionalDutyCycle: Float
 }
 
-final class CPUStressWorkload {
+final class CPUStressWorkload: CalibrationWorkload {
     private let lock = NSLock()
     private var running = false
     private var threads: [Thread] = []
@@ -17,9 +17,14 @@ final class CPUStressWorkload {
     }
 
     @discardableResult
+    func start(intensity: Float) -> Bool {
+        start(intensity: intensity, coreCount: ProcessInfo.processInfo.activeProcessorCount)
+    }
+
+    @discardableResult
     func start(
         intensity: Float,
-        coreCount: Int = ProcessInfo.processInfo.activeProcessorCount
+        coreCount: Int
     ) -> Bool {
         lock.lock()
         guard !running else {
@@ -40,7 +45,12 @@ final class CPUStressWorkload {
     }
 
     @discardableResult
-    func stop(timeout: TimeInterval = 2) -> Bool {
+    func stop() -> Bool {
+        stop(timeout: 2)
+    }
+
+    @discardableResult
+    func stop(timeout: TimeInterval) -> Bool {
         lock.lock()
         let wasRunning = running
         running = false
