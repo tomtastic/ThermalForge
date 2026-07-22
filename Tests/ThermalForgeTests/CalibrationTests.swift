@@ -274,16 +274,17 @@ struct CalibrationConvergenceTests {
 
     @Test("A sweep below the Smart control range is rejected")
     func insufficientTemperatureCoverageIsRejected() {
-        let rawData: [(fanPct: Float, equilTemp: Float)] = [
-            (1.0, 50.8),
-            (0.8, 51.6),
-            (0.6, 52.7),
-            (0.45, 54.4),
-            (0.29, 58.1),
+        let rawData: [CalibrationEquilibriumMeasurement] = [
+            .init(fanPercent: 1.0, equilibriumTemperature: 50.8),
+            .init(fanPercent: 0.8, equilibriumTemperature: 51.6),
+            .init(fanPercent: 0.6, equilibriumTemperature: 52.7),
+            .init(fanPercent: 0.45, equilibriumTemperature: 54.4),
+            .init(fanPercent: 0.29, equilibriumTemperature: 58.1),
         ]
+        let builder = CalibrationCurveBuilder(minimumFanPercent: 0.29)
 
-        #expect(CalibrationRunner.temperatureCoverageError(rawData: rawData) != nil)
-        #expect(CalibrationRunner.buildControlCurve(rawData: rawData, minPct: 0.29).isEmpty)
+        #expect(builder.coverageError(measurements: rawData) != nil)
+        #expect(builder.build(measurements: rawData).isEmpty)
     }
 
     @Test("Calibration selects temperatures that match the stress source")
@@ -332,16 +333,14 @@ struct CalibrationConvergenceTests {
 
     @Test("Generated control curve never slows fans as temperature rises")
     func generatedCurveIsMonotonic() {
-        let measurements = CalibrationRunner.buildControlCurve(
-            rawData: [
-                (fanPct: 1.0, equilTemp: 61.1),
-                (fanPct: 0.8, equilTemp: 60.5),
-                (fanPct: 0.6, equilTemp: 71.8),
-                (fanPct: 0.45, equilTemp: 74.8),
-                (fanPct: 0.29, equilTemp: 84.0),
-            ],
-            minPct: 0.29
-        )
+        let builder = CalibrationCurveBuilder(minimumFanPercent: 0.29)
+        let measurements = builder.build(measurements: [
+            .init(fanPercent: 1.0, equilibriumTemperature: 61.1),
+            .init(fanPercent: 0.8, equilibriumTemperature: 60.5),
+            .init(fanPercent: 0.6, equilibriumTemperature: 71.8),
+            .init(fanPercent: 0.45, equilibriumTemperature: 74.8),
+            .init(fanPercent: 0.29, equilibriumTemperature: 84.0),
+        ])
 
         for pair in zip(measurements, measurements.dropFirst()) {
             #expect(pair.1.holdingRPMPercent >= pair.0.holdingRPMPercent)

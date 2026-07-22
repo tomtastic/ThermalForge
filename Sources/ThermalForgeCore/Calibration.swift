@@ -377,9 +377,6 @@ public final class CalibrationRunner {
         [1.0, 0.80, 0.60, 0.45, minPct]
     }
 
-    /// Temperature targets for the control curve output
-    private static let controlCurveTemps: [Float] = [60, 65, 70, 75, 80, 85]
-
     /// Ceiling: record data and skip remaining lower fan levels
     private static let ceilingTemp: Float = 84.0
 
@@ -512,9 +509,7 @@ public final class CalibrationRunner {
             log: { [self] message in log(message) }
         )
         let sweepResult = try sweep.run()
-        let rawData = sweepResult.measurements.map {
-            (fanPct: $0.fanPercent, equilTemp: $0.equilibriumTemperature)
-        }
+        let rawData = sweepResult.measurements
         let unstableFanLevels = sweepResult.unstableFanLevels
         try throwIfCancelled()
 
@@ -525,7 +520,7 @@ public final class CalibrationRunner {
         if rawData.count < 3 {
             log("")
             log("CALIBRATION FAILED: Insufficient converged data (\(rawData.count) point(s), need 3+).")
-            if rawData.first?.equilTemp ?? 0 >= Self.ceilingTemp {
+            if rawData.first?.equilibriumTemperature ?? 0 >= Self.ceilingTemp {
                 log("Even 100% fans + minimum stress hit the \(Int(Self.ceilingTemp))°C ceiling.")
                 if ambientTemp > 0 {
                     log("At \(String(format: "%.1f", ambientTemp))°C ambient, this machine cannot dissipate")
@@ -544,7 +539,8 @@ public final class CalibrationRunner {
             throw CalibrationError.insufficientData(reason: "Only \(rawData.count) fan levels produced converged data; at least 3 are required.\(unstable)")
         }
 
-        if let coverageError = Self.temperatureCoverageError(rawData: rawData) {
+        let curveBuilder = CalibrationCurveBuilder(minimumFanPercent: minPct)
+        if let coverageError = curveBuilder.coverageError(measurements: rawData) {
             log("")
             log("CALIBRATION FAILED: \(coverageError)")
             log("The workload was too weak to measure the Smart control range.")
@@ -552,7 +548,7 @@ public final class CalibrationRunner {
             throw CalibrationError.insufficientData(reason: coverageError)
         }
 
-        let measurements = Self.buildControlCurve(rawData: rawData, minPct: minPct)
+        let measurements = curveBuilder.build(measurements: rawData)
 
         // Validate we got something useful
         if measurements.isEmpty {
@@ -582,72 +578,6 @@ public final class CalibrationRunner {
             lidClosed: clamshell,
             measurements: measurements
         )
-    }
-
-    /// Build monotonically increasing control curve from raw equilibrium data.
-    /// Raw data: (fanPct, equilTemp) — higher fan = lower equilibrium (physically correct).
-    /// Control curve: (targetTemp, holdingRPMPercent) — higher temp = higher fan (for Smart).
-    /// Formula: fan_control(T) = (1.0 + minPct) - F_equil(T)
-    static func buildControlCurve(rawData: [(fanPct: Float, equilTemp: Float)], minPct: Float) -> [CalibrationData.Measurement] {
-        guard rawData.count >= 2, temperatureCoverageError(rawData: rawData) == nil else { return [] }
-
-        // Sort raw data by equilibrium temp ascending
-        let sorted = rawData.sorted { $0.equilTemp < $1.equilTemp }
-
-        var measurements: [CalibrationData.Measurement] = []
-        var previousControlFan = minPct
-
-        for target in Self.controlCurveTemps {
-            // Interpolate equilibrium fan speed for this target temp
-            let fEquil = interpolateEquilFanSpeed(temp: target, data: sorted)
-
-            // Flip: control fan speed = (1.0 + minPct) - equilibrium fan speed
-            var controlFan = (1.0 + minPct) - fEquil
-            controlFan = min(max(controlFan, minPct), 1.0)
-
-            // Sensor noise can slightly invert adjacent equilibrium points. A
-            // calibrated control curve must never slow the fans as temperature
-            // rises, so retain the previous (more conservative) percentage.
-            controlFan = max(controlFan, previousControlFan)
-            previousControlFan = controlFan
-
-            measurements.append(CalibrationData.Measurement(
-                targetTemp: target,
-                holdingRPMPercent: controlFan
-            ))
-        }
-
-        return measurements
-    }
-
-    /// A fitted curve must include measured behavior through 80°C. The 85°C
-    /// point remains the hard maximum-fan anchor, but extrapolating every target
-    /// from a sweep that stayed below the control range only produces an
-    /// all-maximum curve with no useful machine-specific information.
-    static func temperatureCoverageError(rawData: [(fanPct: Float, equilTemp: Float)]) -> String? {
-        guard let maximum = rawData.map(\.equilTemp).max() else {
-            return "No equilibrium temperatures were measured"
-        }
-        let requiredMaximum = controlCurveTemps.dropLast().last ?? 80
-        guard maximum >= requiredMaximum else {
-            return "Sweep reached only \(String(format: "%.1f", maximum))°C; at least \(Int(requiredMaximum))°C is required"
-        }
-        return nil
-    }
-
-    /// Interpolate the equilibrium fan speed for a given temperature from raw data.
-    private static func interpolateEquilFanSpeed(temp: Float, data: [(fanPct: Float, equilTemp: Float)]) -> Float {
-        guard !data.isEmpty else { return 0.5 }
-        if temp <= data.first!.equilTemp { return data.first!.fanPct }
-        if temp >= data.last!.equilTemp { return data.last!.fanPct }
-
-        for i in 0..<(data.count - 1) {
-            if temp >= data[i].equilTemp && temp <= data[i + 1].equilTemp {
-                let t = (temp - data[i].equilTemp) / (data[i + 1].equilTemp - data[i].equilTemp)
-                return data[i].fanPct + t * (data[i + 1].fanPct - data[i].fanPct)
-            }
-        }
-        return data.last!.fanPct
     }
 
     private func waitForCooldown(below threshold: Float) throws {

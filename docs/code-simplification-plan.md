@@ -23,17 +23,7 @@ Current verified baseline:
 
 ## Phase 3: Split Calibration by Responsibility
 
-`Calibration.swift` still combines equilibrium measurement, curve
-construction, CSV logging, and top-level orchestration.
-
-### 9. Extract equilibrium sweep and curve construction
-
-- Move interpolation, monotonic enforcement, and coverage validation into
-  `CalibrationCurveBuilder`.
-- Keep raw measurements separate from generated 60–85°C control points.
-- Test insufficient coverage and monotonic output.
-
-Remaining commit boundary: curve builder.
+`Calibration.swift` still combines CSV logging and top-level orchestration.
 
 ### 10. Reduce `CalibrationRunner` to orchestration
 
