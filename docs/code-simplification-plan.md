@@ -6,11 +6,12 @@ future work only.
 
 Current verified baseline:
 
-- 113 tests pass across 23 suites.
+- 115 tests pass across 24 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
-  and CPU/GPU stress workloads have dedicated components or test seams.
+  CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, and curve
+  construction have dedicated components or test seams.
 
 ## Working Rules
 
@@ -20,19 +21,6 @@ Current verified baseline:
 - Run `swift test` before every commit and a release build after each phase.
 - Do not mix visualization, update notifications, or unrelated feature work
   into these refactors.
-
-## Phase 3: Split Calibration by Responsibility
-
-`Calibration.swift` still combines CSV logging and top-level orchestration.
-
-### 10. Reduce `CalibrationRunner` to orchestration
-
-After extraction, `CalibrationRunner` should coordinate phases, progress
-messages, CSV recording, and final `CalibrationData` assembly. It should not
-own sensor-family knowledge, Metal resources, worker threads, persistence, or
-curve mathematics.
-
-Commit boundary: final wiring and removal of superseded private helpers.
 
 ## Phase 4: Split the CLI and System Coordination
 

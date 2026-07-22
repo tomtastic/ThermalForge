@@ -242,6 +242,7 @@ public final class CalibrationRunner {
     private let workloadIntensityOverride: Float?
     private let cancellationToken: CancellationToken
     private let lidStateProvider: any LidStateProvider
+    private let temperatureSelector: CalibrationTemperatureSelector
     private let convergenceModel: CalibrationConvergenceModel
     private let calibrationWorkload: any CalibrationWorkload
     private let gpuStressWorkload: GPUStressWorkload?
@@ -269,6 +270,7 @@ public final class CalibrationRunner {
         self.workloadIntensityOverride = workloadIntensity
         self.cancellationToken = cancellationToken
         self.lidStateProvider = lidStateProvider
+        self.temperatureSelector = CalibrationTemperatureSelector(stressType: stressType)
         self.convergenceModel = CalibrationConvergenceModel(mode: mode)
 
         let cpuWorkload = CPUStressWorkload()
@@ -315,32 +317,9 @@ public final class CalibrationRunner {
         return try finder.find()
     }
 
-    /// Select the sensor family that matches the generated workload. Combined
-    /// calibration follows the hotter CPU/GPU family, matching Smart's input.
     private func calibrationTemperature() -> CalibrationTemperatureSample? {
         guard let status = try? fanControl.status() else { return nil }
-        return Self.calibrationTemperature(from: status.temperatures, stressType: stressType)
-    }
-
-    static func calibrationTemperature(
-        from temperatures: [String: Float],
-        stressType: CalibrationStressType
-    ) -> CalibrationTemperatureSample? {
-        let summary = TemperatureSummary(temperatures)
-        let cpu = summary.cpu ?? 0
-        let gpu = summary.gpu ?? 0
-
-        let selected: Float
-        switch stressType {
-        case .cpu:
-            selected = cpu
-        case .gpu:
-            selected = gpu > 0 ? gpu : cpu
-        case .combined:
-            selected = max(cpu, gpu)
-        }
-        guard selected > 0 else { return nil }
-        return CalibrationTemperatureSample(selected: selected, cpu: cpu, gpu: gpu)
+        return temperatureSelector.select(from: status.temperatures)
     }
 
     /// Cleanup: always stop stress, reset fans, close CSV on any exit path
@@ -411,7 +390,7 @@ public final class CalibrationRunner {
         // Record ambient temperature
         var ambientTemp: Float = 0
         if let status = try? fanControl.status() {
-            ambientTemp = TemperatureSummary(status.temperatures).ambient ?? 0
+            ambientTemp = temperatureSelector.ambient(from: status.temperatures) ?? 0
         }
         if ambientTemp > 0 {
             log("Ambient: \(String(format: "%.1f", ambientTemp))°C \(clamshell ? "(lid closed / clamshell)" : "(lid open)")")
@@ -581,44 +560,16 @@ public final class CalibrationRunner {
     }
 
     private func waitForCooldown(below threshold: Float) throws {
-        // Calibration owns fan control while the app/daemon are stopped. Use
-        // maximum cooling instead of Apple auto to reach the baseline quickly.
-        try? fanControl.setMax()
-        var readings: [Float] = []
-        for _ in 0..<60 {
-            try throwIfCancelled()
-            let temp = calibrationTemperature()?.selected ?? 0
-            if temp > 0 {
-                readings.append(temp)
-
-                // Preserve the fast path when the requested baseline is
-                // reachable, but ensure it is not just a single sensor dip.
-                let recent = readings.suffix(3)
-                if recent.count == 3,
-                   recent.max()! - recent.min()! <= 0.5,
-                   temp < threshold
-                {
-                    log("Cooled to \(String(format: "%.1f", temp))°C")
-                    return
-                }
-
-                // In warm rooms the fixed 45°C target may be unreachable. A
-                // stable baseline is what the equilibrium model actually needs.
-                if let metrics = convergenceModel.metrics(readings: readings, windowSize: 15),
-                   abs(metrics.slopePerSecond) <= 0.005,
-                   metrics.halfMeanDelta <= 0.5
-                {
-                    log("Baseline stabilized at \(String(format: "%.1f", metrics.mean))°C")
-                    return
-                }
-            }
-            try wait(for: 2)
-        }
-        let temp = calibrationTemperature()?.selected ?? 0
-        log("Cooldown limit reached at \(String(format: "%.1f", temp))°C — continuing with maximum fans")
+        let cooldown = CalibrationCooldown(
+            convergence: convergenceModel,
+            setMaximumFans: { [self] in try fanControl.setMax() },
+            temperature: { [self] in calibrationTemperature()?.selected },
+            wait: { [self] interval in try wait(for: interval) },
+            checkCancellation: { [self] in try throwIfCancelled() },
+            log: { [self] message in log(message) }
+        )
+        try cooldown.run(below: threshold)
     }
-
-    // MARK: - Helpers
 
     // MARK: - Logging
 

@@ -293,11 +293,13 @@ struct CalibrationConvergenceTests {
             "TC0P": 62,
             "Tp01": 64,
             "TG0P": 71,
+            "TA0P": 31,
         ]
 
-        #expect(CalibrationRunner.calibrationTemperature(from: temperatures, stressType: .cpu)?.selected == 64)
-        #expect(CalibrationRunner.calibrationTemperature(from: temperatures, stressType: .gpu)?.selected == 71)
-        #expect(CalibrationRunner.calibrationTemperature(from: temperatures, stressType: .combined)?.selected == 71)
+        #expect(CalibrationTemperatureSelector(stressType: .cpu).select(from: temperatures)?.selected == 64)
+        #expect(CalibrationTemperatureSelector(stressType: .gpu).select(from: temperatures)?.selected == 71)
+        #expect(CalibrationTemperatureSelector(stressType: .combined).select(from: temperatures)?.selected == 71)
+        #expect(CalibrationTemperatureSelector(stressType: .combined).ambient(from: temperatures) == 31)
     }
 
     @Test("Stable noisy readings converge after detrending")
