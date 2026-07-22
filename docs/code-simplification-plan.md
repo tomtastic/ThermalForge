@@ -6,14 +6,14 @@ future work only.
 
 Current verified baseline:
 
-- 131 tests pass across 28 suites.
+- 136 tests pass across 28 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
   CPU/GPU stress workloads, calibration cooldown, equilibrium sweep, and curve
   construction, rule persistence mutations, runtime anomaly observation, and
-  runtime control decisions have dedicated components or test seams. The CLI
-  entry file now only registers commands.
+  runtime control decisions, and fan unlock/write paths have dedicated
+  components or test seams. The CLI entry file now only registers commands.
 
 ## Working Rules
 
@@ -25,17 +25,6 @@ Current verified baseline:
   into these refactors.
 
 ## Phase 6: Hardware and Transport Cleanup
-
-### 14. Simplify fan unlock and write paths
-
-- Consolidate `unlockFans` and `unlockSingleFan` around one per-fan unlock
-  primitive.
-- Share RPM validation and target-key writes.
-- Validate requested all-fan RPM against every fan's limits rather than only
-  fan zero.
-- Preserve the Ftst and M5 direct-mode hardware branches with fake-SMC tests.
-
-Commit boundary: fan-control helper consolidation and per-fan limit tests.
 
 ### 15. Harden daemon server framing
 

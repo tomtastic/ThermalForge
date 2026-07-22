@@ -66,6 +66,7 @@ public struct DiscoveredKey {
 
 public final class FanControl {
     private let smc: SMCReading
+    private let wait: (TimeInterval) -> Void
     /// Which mode key works on this hardware (detected at init)
     private let modeKeyTemplate: String
     /// Whether Ftst unlock is available (M1-M4) or not (M5+)
@@ -87,8 +88,13 @@ public final class FanControl {
     }
 
     /// Designated init — accepts any SMC backend (real or a test fake).
-    public init(smc: SMCReading) {
+    public convenience init(smc: SMCReading) {
+        self.init(smc: smc, wait: Thread.sleep(forTimeInterval:))
+    }
+
+    init(smc: SMCReading, wait: @escaping (TimeInterval) -> Void) {
         self.smc = smc
+        self.wait = wait
 
         // Detect hardware: which mode key exists?
         // M5 Max uses F%dmd (lowercase), M1-M4 use F%dMd (uppercase)
@@ -173,10 +179,15 @@ public final class FanControl {
     /// On M1-M4: writes Ftst=1, then polls until mode write succeeds.
     /// On M5+: Ftst doesn't exist, attempts direct mode write.
     private func unlockFans(count: Int) throws {
+        try unlockFans(Array(0..<count))
+    }
+
+    private func unlockFans(_ indices: [Int]) throws {
         // Fast path: if every fan is already in manual mode the unlock happened
         // on an earlier command — skip the Ftst write + 0.5s sleep + poll loop.
         // (Ftst/mode stay set until resetAuto, so thermalmonitord stays off.)
-        if count > 0 && (0..<count).allSatisfy({ isManualMode($0) }) {
+        let lockedIndices = indices.filter { !isManualMode($0) }
+        guard !lockedIndices.isEmpty else {
             return
         }
 
@@ -187,43 +198,15 @@ public final class FanControl {
                     "Failed to write Ftst=1. Run with sudo."
                 )
             }
-            Thread.sleep(forTimeInterval: 0.5)
+            wait(0.5)
         }
 
-        // Set each fan to manual mode
-        for i in 0..<count {
-            if isManualMode(i) { continue }   // already manual — skip the poll loop
-            let modeKey = SMCFanKey.key(modeKeyTemplate, fan: i)
-            let deadline = Date().addingTimeInterval(10.0)
-            var success = false
-
-            while Date() < deadline {
-                if smc.writeKey(modeKey, bytes: [1]) {
-                    success = true
-                    break
-                }
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-
-            if !success {
-                throw ThermalForgeError.unlockFailed(
-                    "Timed out setting fan \(i) to manual mode. Run with sudo."
-                )
-            }
+        for index in lockedIndices {
+            try unlockFan(index)
         }
     }
 
-    /// Unlock a single fan for manual control
-    private func unlockSingleFan(_ index: Int) throws {
-        if hasFtst {
-            guard smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
-                throw ThermalForgeError.unlockFailed(
-                    "Failed to write Ftst=1. Run with sudo."
-                )
-            }
-            Thread.sleep(forTimeInterval: 0.5)
-        }
-
+    private func unlockFan(_ index: Int) throws {
         let modeKey = SMCFanKey.key(modeKeyTemplate, fan: index)
         let deadline = Date().addingTimeInterval(10.0)
 
@@ -231,7 +214,7 @@ public final class FanControl {
             if smc.writeKey(modeKey, bytes: [1]) {
                 return
             }
-            Thread.sleep(forTimeInterval: 0.1)
+            wait(0.1)
         }
 
         throw ThermalForgeError.unlockFailed(
@@ -240,6 +223,30 @@ public final class FanControl {
     }
 
     // MARK: - Set Speed
+
+    private func validate(rpm: Float, limits: (min: Float, max: Float)) throws {
+        if limits.min > 0, rpm < limits.min {
+            throw ThermalForgeError.rpmOutOfRange(
+                requested: rpm,
+                min: limits.min,
+                max: limits.max
+            )
+        }
+        if limits.max > 0, rpm > limits.max {
+            throw ThermalForgeError.rpmOutOfRange(
+                requested: rpm,
+                min: limits.min,
+                max: limits.max
+            )
+        }
+    }
+
+    private func writeTarget(fan index: Int, rpm: Float) throws {
+        let targetKey = SMCFanKey.key(SMCFanKey.target, fan: index)
+        guard smc.writeKey(targetKey, bytes: floatToSMCBytes(rpm)) else {
+            throw ThermalForgeError.writeFailed(targetKey)
+        }
+    }
 
     /// Set all fans to maximum RPM
     public func setMax() throws {
@@ -250,10 +257,7 @@ public final class FanControl {
             let info = try fanInfo(i)
             let maxRPM = info.maxRPM > 0 ? info.maxRPM : 7826
 
-            let targetKey = SMCFanKey.key(SMCFanKey.target, fan: i)
-            guard smc.writeKey(targetKey, bytes: floatToSMCBytes(maxRPM)) else {
-                throw ThermalForgeError.writeFailed(targetKey)
-            }
+            try writeTarget(fan: i, rpm: maxRPM)
             log("Set fan \(i) to max (\(Int(maxRPM)) RPM)")
         }
     }
@@ -262,28 +266,13 @@ public final class FanControl {
     public func setSpeed(fan index: Int, rpm: Float) throws {
         let info = try fanInfo(index)
 
-        // Safety: never below minimum
-        if info.minRPM > 0 && rpm < info.minRPM {
-            throw ThermalForgeError.rpmOutOfRange(
-                requested: rpm, min: info.minRPM, max: info.maxRPM
-            )
-        }
-
-        // Safety: never above maximum
-        if info.maxRPM > 0 && rpm > info.maxRPM {
-            throw ThermalForgeError.rpmOutOfRange(
-                requested: rpm, min: info.minRPM, max: info.maxRPM
-            )
-        }
+        try validate(rpm: rpm, limits: (info.minRPM, info.maxRPM))
 
         if info.mode != "manual" {
-            try unlockSingleFan(index)
+            try unlockFans([index])
         }
 
-        let targetKey = SMCFanKey.key(SMCFanKey.target, fan: index)
-        guard smc.writeKey(targetKey, bytes: floatToSMCBytes(rpm)) else {
-            throw ThermalForgeError.writeFailed(targetKey)
-        }
+        try writeTarget(fan: index, rpm: rpm)
         log("Set fan \(index) to \(Int(rpm)) RPM")
     }
 
@@ -291,26 +280,15 @@ public final class FanControl {
     public func setAllFans(rpm: Float) throws {
         let count = try fanCount()
 
-        // Validate against first fan's limits
-        let info = try fanInfo(0)
-        if info.minRPM > 0 && rpm < info.minRPM {
-            throw ThermalForgeError.rpmOutOfRange(
-                requested: rpm, min: info.minRPM, max: info.maxRPM
-            )
-        }
-        if info.maxRPM > 0 && rpm > info.maxRPM {
-            throw ThermalForgeError.rpmOutOfRange(
-                requested: rpm, min: info.minRPM, max: info.maxRPM
-            )
+        for index in 0..<count {
+            let limits = fanLimits(index)
+            try validate(rpm: rpm, limits: limits)
         }
 
         try unlockFans(count: count)
 
         for i in 0..<count {
-            let targetKey = SMCFanKey.key(SMCFanKey.target, fan: i)
-            guard smc.writeKey(targetKey, bytes: floatToSMCBytes(rpm)) else {
-                throw ThermalForgeError.writeFailed(targetKey)
-            }
+            try writeTarget(fan: i, rpm: rpm)
             log("Set fan \(i) to \(Int(rpm)) RPM")
         }
     }

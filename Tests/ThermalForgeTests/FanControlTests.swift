@@ -18,6 +18,7 @@ final class FakeSMC: SMCReading {
     private struct Entry { var bytes: [UInt8]; var size: UInt32 }
     private var table: [String: Entry] = [:]
     private(set) var readCounts: [String: Int] = [:]
+    private(set) var writeCounts: [String: Int] = [:]
 
     func setFloat(_ key: String, _ value: Float) {
         table[key] = Entry(bytes: floatToSMCBytes(value), size: 4)
@@ -34,6 +35,7 @@ final class FakeSMC: SMCReading {
     }
 
     func reads(_ key: String) -> Int { readCounts[key, default: 0] }
+    func writes(_ key: String) -> Int { writeCounts[key, default: 0] }
 
     // MARK: SMCReading
     func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32) {
@@ -42,6 +44,7 @@ final class FakeSMC: SMCReading {
         return (true, e.bytes, e.size)
     }
     func writeKey(_ key: String, bytes: [UInt8]) -> Bool {
+        writeCounts[key, default: 0] += 1
         if table[key] != nil { table[key]!.bytes = bytes }
         return true
     }
@@ -75,6 +78,25 @@ private func makeFakeMachine() -> FakeSMC {
     smc.setFloat("Tm02", 40.0)
     smc.setFloat("TH0A", 45.0)
     smc.setFloat("TA0P", 30.0)
+    return smc
+}
+
+private func makeTwoFanMachine(hasFtst: Bool, manual: Bool = false) -> FakeSMC {
+    let smc = FakeSMC()
+    smc.setByte("FNum", 2)
+    let modeKey = hasFtst ? "F0Md" : "F0md"
+    let secondModeKey = hasFtst ? "F1Md" : "F1md"
+    smc.setByte(modeKey, manual ? 1 : 0)
+    smc.setByte(secondModeKey, manual ? 1 : 0)
+    if hasFtst {
+        smc.setByte("Ftst", 0)
+    }
+    for (index, minimum, maximum) in [(0, 2000, 8000), (1, 2500, 7000)] {
+        smc.setFloat("F\(index)Ac", Float(minimum))
+        smc.setFloat("F\(index)Tg", Float(minimum))
+        smc.setFloat("F\(index)Mn", Float(minimum))
+        smc.setFloat("F\(index)Mx", Float(maximum))
+    }
     return smc
 }
 
@@ -157,5 +179,83 @@ struct FanControlTests {
         smc.setFloat("F0Mx", 7826)   // a fan key, but no temperature keys
         let fc = FanControl(smc: smc)
         #expect(fc.controlTemps() == nil)
+    }
+
+    @Test("All-fan RPM validation checks each fan before writing")
+    func allFanValidationUsesEveryFan() {
+        let smc = makeTwoFanMachine(hasFtst: false, manual: true)
+        let fanControl = FanControl(smc: smc, wait: { _ in })
+
+        do {
+            try fanControl.setAllFans(rpm: 7500)
+            Issue.record("Expected fan 1's maximum to reject 7500 RPM")
+        } catch let ThermalForgeError.rpmOutOfRange(requested, minimum, maximum) {
+            #expect(requested == 7500)
+            #expect(minimum == 2500)
+            #expect(maximum == 7000)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(smc.writes("F0Tg") == 0)
+        #expect(smc.writes("F1Tg") == 0)
+    }
+
+    @Test("All-fan RPM validation checks every fan minimum")
+    func allFanValidationUsesEveryMinimum() {
+        let smc = makeTwoFanMachine(hasFtst: false, manual: true)
+        let fanControl = FanControl(smc: smc, wait: { _ in })
+
+        do {
+            try fanControl.setAllFans(rpm: 2200)
+            Issue.record("Expected fan 1's minimum to reject 2200 RPM")
+        } catch let ThermalForgeError.rpmOutOfRange(requested, minimum, maximum) {
+            #expect(requested == 2200)
+            #expect(minimum == 2500)
+            #expect(maximum == 7000)
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        #expect(smc.writes("F0Tg") == 0)
+        #expect(smc.writes("F1Tg") == 0)
+    }
+
+    @Test("Ftst unlock prepares once and unlocks each requested fan")
+    func ftstUnlockUsesPerFanPrimitive() throws {
+        let smc = makeTwoFanMachine(hasFtst: true)
+        let fanControl = FanControl(smc: smc, wait: { _ in })
+
+        try fanControl.setAllFans(rpm: 3000)
+
+        #expect(smc.writes("Ftst") == 1)
+        #expect(smc.writes("F0Md") == 1)
+        #expect(smc.writes("F1Md") == 1)
+        #expect(smc.writes("F0Tg") == 1)
+        #expect(smc.writes("F1Tg") == 1)
+    }
+
+    @Test("Direct-mode hardware unlocks without Ftst")
+    func directModeUnlockSkipsFtst() throws {
+        let smc = makeTwoFanMachine(hasFtst: false)
+        let fanControl = FanControl(smc: smc, wait: { _ in })
+
+        try fanControl.setSpeed(fan: 0, rpm: 3000)
+
+        #expect(smc.writes("Ftst") == 0)
+        #expect(smc.writes("F0md") == 1)
+        #expect(smc.writes("F0Tg") == 1)
+    }
+
+    @Test("Already-manual fans skip both unlock paths")
+    func manualFastPathSkipsUnlock() throws {
+        let smc = makeTwoFanMachine(hasFtst: true, manual: true)
+        let fanControl = FanControl(smc: smc, wait: { _ in })
+
+        try fanControl.setAllFans(rpm: 3000)
+
+        #expect(smc.writes("Ftst") == 0)
+        #expect(smc.writes("F0Md") == 0)
+        #expect(smc.writes("F1Md") == 0)
     }
 }
