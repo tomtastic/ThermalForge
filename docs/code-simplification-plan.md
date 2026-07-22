@@ -6,7 +6,7 @@ future work only.
 
 Current verified baseline:
 
-- 107 tests pass across 21 suites.
+- 111 tests pass across 22 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, uninstall ownership, lid detection,
@@ -23,19 +23,8 @@ Current verified baseline:
 
 ## Phase 3: Split Calibration by Responsibility
 
-`Calibration.swift` still combines intensity discovery, equilibrium
-measurement, curve construction, CSV logging, and top-level orchestration.
-
-### 8. Extract intensity discovery
-
-- Move bracketing, cooldown decisions, equilibrium projection, and safe/useful
-  classification into `WorkloadIntensityFinder`.
-- Inject temperature sampling, workload control, fan control, and time/sleep
-  behavior.
-- Add deterministic tests for hot rejection, safe selection, cooldown timeout,
-  and minimum-intensity failure.
-
-Commit boundary: finder extraction and deterministic phase-one tests.
+`Calibration.swift` still combines equilibrium measurement, curve
+construction, CSV logging, and top-level orchestration.
 
 ### 9. Extract equilibrium sweep and curve construction
 
