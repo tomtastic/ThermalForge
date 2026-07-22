@@ -368,179 +368,122 @@ struct Calibrate: ParsableCommand {
             )
         }
 
-        // Stop the ThermalForge daemon and menu bar app — they conflict with calibration fan control.
-        // Resume the daemon on every normal exit, including validation or setup failures below.
-        let daemonWasRunning = thermalforgeDaemonWasStopped()
-        defer {
-            if daemonWasRunning {
-                resumeThermalforgeDaemon()
+        // Stop the daemon and menu bar app while calibration has direct fan
+        // control, then restore the daemon on every exit path.
+        let lifecycle = CalibrationSystemLifecycle()
+        try lifecycle.withPausedServices(onEvent: { event in
+            switch event {
+            case let .daemonStopped(pid):
+                if let pid {
+                    print("Stopping ThermalForge daemon (PID \(pid)) — will resume after calibration...")
+                } else {
+                    print("Stopping ThermalForge daemon — will resume after calibration...")
+                }
+                Thread.sleep(forTimeInterval: 1)
+            case .daemonResuming:
+                print("Resuming ThermalForge daemon...")
             }
-        }
-        killThermalForgeApp()
-
-        let fc = try FanControl()
-        let currentAmbient = (try? fc.status()).flatMap {
-            TemperatureSummary($0.temperatures).ambient
-        }
-
-        let existingCalibration = CalibrationData.load()
-        let reusableIntensity: Float?
-        if intensity == nil,
-           !rediscoverIntensity,
-           existingCalibration?.isValid == true,
-           existingCalibration?.stressType == calStress.rawValue,
-           let previous = existingCalibration?.workloadIntensity,
-           (0.001 ... 0.5).contains(previous),
-           let previousAmbient = existingCalibration?.ambientTemperature,
-           let currentAmbient,
-           abs(previousAmbient - currentAmbient) <= 3
-        {
-            reusableIntensity = previous
-        } else {
-            reusableIntensity = nil
-        }
-        let selectedIntensity = intensity ?? reusableIntensity
-
-        print("ThermalForge Calibration")
-        print("========================")
-        print("Mode: \(calMode.description)")
-        print("Stress: \(calStress.description)")
-        if let selectedIntensity {
-            let source = intensity == nil ? "saved calibration" : "command line"
-            print("Workload: \(String(format: "%.5f", selectedIntensity)) (reused from \(source); Phase 1 skipped)")
-        } else if rediscoverIntensity {
-            print("Workload: rediscovering intensity (saved value ignored)")
-        }
-        print("")
-        print("This will stress your \(calStress == .combined ? "CPU and GPU" : calStress == .cpu ? "CPU" : "GPU") and measure thermal response at 5 fan speed levels.")
-        print("Fans will be loud during the test.")
-        print("")
-        print("DISCLAIMER: Calibration pushes your Mac to full load and cycles fan speeds.")
-        print("This is within normal operating parameters but ThermalForge is provided")
-        print("as-is with no warranty. Use at your own risk.")
-        print("")
-        print("Press Ctrl-C at any time to stop. Fans will reset to Apple defaults.\n")
-
-        let cancellationToken = CancellationToken()
-        let runner = CalibrationRunner(
-            fanControl: fc,
-            mode: calMode,
-            stressType: calStress,
-            workloadIntensity: selectedIntensity,
-            cancellationToken: cancellationToken
-        )
-
-        let interruptSource = InterruptSignalSource {
-            if cancellationToken.cancel() {
-                print("\n\nCalibration interruption requested; cleaning up...")
+        }) {
+            let fc = try FanControl()
+            let currentAmbient = (try? fc.status()).flatMap {
+                TemperatureSummary($0.temperatures).ambient
             }
-        }
-        defer { interruptSource.cancel() }
 
-        runner.onProgress = { message in
-            print(message)
-        }
+            let existingCalibration = CalibrationData.load()
+            let reusableIntensity: Float?
+            if intensity == nil,
+               !rediscoverIntensity,
+               existingCalibration?.isValid == true,
+               existingCalibration?.stressType == calStress.rawValue,
+               let previous = existingCalibration?.workloadIntensity,
+               (0.001 ... 0.5).contains(previous),
+               let previousAmbient = existingCalibration?.ambientTemperature,
+               let currentAmbient,
+               abs(previousAmbient - currentAmbient) <= 3
+            {
+                reusableIntensity = previous
+            } else {
+                reusableIntensity = nil
+            }
+            let selectedIntensity = intensity ?? reusableIntensity
 
-        do {
-            let data = try runner.run()
-            if cancellationToken.isCancelled {
+            print("ThermalForge Calibration")
+            print("========================")
+            print("Mode: \(calMode.description)")
+            print("Stress: \(calStress.description)")
+            if let selectedIntensity {
+                let source = intensity == nil ? "saved calibration" : "command line"
+                print("Workload: \(String(format: "%.5f", selectedIntensity)) (reused from \(source); Phase 1 skipped)")
+            } else if rediscoverIntensity {
+                print("Workload: rediscovering intensity (saved value ignored)")
+            }
+            print("")
+            print("This will stress your \(calStress == .combined ? "CPU and GPU" : calStress == .cpu ? "CPU" : "GPU") and measure thermal response at 5 fan speed levels.")
+            print("Fans will be loud during the test.")
+            print("")
+            print("DISCLAIMER: Calibration pushes your Mac to full load and cycles fan speeds.")
+            print("This is within normal operating parameters but ThermalForge is provided")
+            print("as-is with no warranty. Use at your own risk.")
+            print("")
+            print("Press Ctrl-C at any time to stop. Fans will reset to Apple defaults.\n")
+
+            let cancellationToken = CancellationToken()
+            let runner = CalibrationRunner(
+                fanControl: fc,
+                mode: calMode,
+                stressType: calStress,
+                workloadIntensity: selectedIntensity,
+                cancellationToken: cancellationToken
+            )
+
+            let interruptSource = InterruptSignalSource {
+                if cancellationToken.cancel() {
+                    print("\n\nCalibration interruption requested; cleaning up...")
+                }
+            }
+            defer { interruptSource.cancel() }
+
+            runner.onProgress = { message in
+                print(message)
+            }
+
+            do {
+                let data = try runner.run()
+                if cancellationToken.isCancelled {
+                    if let logPath = runner.logPath {
+                        try? FileManager.default.removeItem(at: logPath)
+                    }
+                    throw CalibrationError.cancelled
+                }
+                let savedPaths = try data.save()
+
+                print("\nCalibration complete.")
+                print("\nSaved to:")
+                for path in savedPaths {
+                    print("  \(path.path)")
+                }
+                if let logPath = runner.logPath {
+                    print("  \(logPath.path)")
+                }
+                print("\nResults:")
+                for m in data.measurements {
+                    print("  \(Int(m.targetTemp))°C → \(Int(m.holdingRPMPercent * 100))% fan speed")
+                }
+                print("\nThe Smart profile will now use these measurements for this machine.")
+                if runner.logPath != nil {
+                    print("The CSV log contains every sensor reading taken during calibration.")
+                }
+            } catch CalibrationError.cancelled {
                 if let logPath = runner.logPath {
                     try? FileManager.default.removeItem(at: logPath)
                 }
-                throw CalibrationError.cancelled
+                print("Fans reset to Apple defaults. No calibration data was saved.")
+                throw ExitCode(130)
+            } catch {
+                throw ValidationError("Calibration failed: \(error.localizedDescription)")
             }
-            let savedPaths = try data.save()
-
-            print("\nCalibration complete.")
-            print("\nSaved to:")
-            for path in savedPaths {
-                print("  \(path.path)")
-            }
-            if let logPath = runner.logPath {
-                print("  \(logPath.path)")
-            }
-            print("\nResults:")
-            for m in data.measurements {
-                print("  \(Int(m.targetTemp))°C → \(Int(m.holdingRPMPercent * 100))% fan speed")
-            }
-            print("\nThe Smart profile will now use these measurements for this machine.")
-            if runner.logPath != nil {
-                print("The CSV log contains every sensor reading taken during calibration.")
-            }
-        } catch CalibrationError.cancelled {
-            if let logPath = runner.logPath {
-                try? FileManager.default.removeItem(at: logPath)
-            }
-            print("Fans reset to Apple defaults. No calibration data was saved.")
-            throw ExitCode(130)
-        } catch {
-            // Propagate failure so scripts and shells receive a non-zero exit
-            // status. The defer above still resumes the daemon.
-            throw ValidationError("Calibration failed: \(error.localizedDescription)")
-        }
-
-    }
-}
-
-// MARK: - Daemon Management for Calibration
-
-/// Check if the ThermalForge daemon is running, stop it if so, and return whether it was running.
-private func thermalforgeDaemonWasStopped() -> Bool {
-    let check = Process()
-    check.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-    check.arguments = ["list", ThermalForgeDaemon.label]
-    let pipe = Pipe()
-    check.standardOutput = pipe
-    check.standardError = pipe
-    try? check.run()
-    check.waitUntilExit()
-
-    let outputData = try? pipe.fileHandleForReading.readToEnd()
-    let output = String(data: outputData ?? Data(), encoding: .utf8) ?? ""
-
-    // launchctl list output: PID column is non-zero when running
-    // Format: <PID>	0	com.thermalforge.daemon  (when running)
-    //         -	0	com.thermalforge.daemon      (when not running)
-    let lines = output.components(separatedBy: .newlines)
-    for line in lines where line.contains(ThermalForgeDaemon.label) {
-        let fields = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-        if fields.first == "-" {
-            return false // not running
-        }
-        if let pid = Int(fields.first ?? "") , pid > 0 {
-            // Daemon is running — stop it
-            print("Stopping ThermalForge daemon (PID \(pid)) — will resume after calibration...")
-            let stop = Process()
-            stop.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            stop.arguments = ["bootout", "system", ThermalForgeDaemon.label]
-            try? stop.run()
-            stop.waitUntilExit()
-            Thread.sleep(forTimeInterval: 1) // brief pause for daemon to release fan control
-            return true
         }
     }
-    return false
-}
-
-/// Resume the ThermalForge daemon after calibration.
-private func resumeThermalforgeDaemon() {
-    print("Resuming ThermalForge daemon...")
-    let start = Process()
-    start.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-    start.arguments = ["bootstrap", "system", ThermalForgeDaemon.plistPath]
-    try? start.run()
-    start.waitUntilExit()
-}
-
-/// Kill the ThermalForge menu bar app if running.
-private func killThermalForgeApp() {
-    let kill = Process()
-    kill.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-    kill.arguments = ["ThermalForgeApp"]
-    // No running app is the expected case for many CLI calibrations.
-    kill.standardError = FileHandle.nullDevice
-    try? kill.run()
-    kill.waitUntilExit()
 }
 
 // MARK: - Log

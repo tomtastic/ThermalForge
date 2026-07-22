@@ -6,7 +6,7 @@ future work only.
 
 Current verified baseline:
 
-- 83 tests pass across 18 suites.
+- 92 tests pass across 19 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, and uninstall ownership have
@@ -37,10 +37,7 @@ Plan:
   command failures.
 - Ensure failed install/resume operations produce a non-zero CLI exit status.
 
-Remaining commit boundaries:
-
-1. Calibration lifecycle migration.
-2. Install/uninstall migration.
+Remaining commit boundary: install/uninstall migration.
 
 ## Phase 2: Consolidate Rule Handling
 
