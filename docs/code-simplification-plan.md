@@ -4,12 +4,13 @@ This document tracks the remaining work from the July 2026 code-simplification
 audit. Completed audit fixes are recorded in git history; this file describes
 future work only.
 
-Baseline after the first audit batch:
+Current verified baseline:
 
-- 68 tests pass across 14 suites.
+- 79 tests pass across 17 suites.
 - A production build succeeds.
-- Calibration persistence, temperature classification, monitor timing, and
-  daemon client transport have dedicated components or test seams.
+- Calibration persistence, temperature classification, monitor timing, daemon
+  client transport, cancellation cleanup, and uninstall ownership have
+  dedicated components or test seams.
 
 ## Working Rules
 
@@ -20,43 +21,7 @@ Baseline after the first audit batch:
 - Do not mix visualization, update notifications, or unrelated feature work
   into these refactors.
 
-## Phase 1: Remaining Lifecycle and Ownership Fixes
-
-### 1. Resume the daemon after interrupted calibration
-
-Calibration currently stops the daemon and relies on `defer` to restart it.
-The SIGINT handler calls `Darwin.exit`, which bypasses that `defer`, so Ctrl-C
-can leave the daemon stopped.
-
-Plan:
-
-- Convert SIGINT into cooperative cancellation using a dispatch signal source;
-  never run SMC, logging, or process operations inside a POSIX signal handler.
-- Make normal completion, thrown errors, and interruption unwind through the
-  same cleanup and daemon-restoration path.
-- Make calibration waits interruptible so stress and fan cleanup begin promptly.
-- Delete partial CSV output on interruption without touching the last completed
-  calibration profile.
-- Add tests for success, failure, and interruption cleanup decisions without
-  requiring real SMC hardware or launchd.
-
-Commit boundary: lifecycle coordinator, regression tests, and CLI integration.
-
-### 2. Correct uninstall data ownership
-
-`sudo thermalforge uninstall` resolves the effective home directory as root and
-can leave the console user's application-support data and logs behind.
-
-Plan:
-
-- Reuse a shared root/console-user path resolver.
-- Enumerate every removal target before deleting anything.
-- Remove root and console-user ThermalForge data while retaining explicit,
-  narrow paths.
-- Report which locations were removed and which were already absent.
-- Add path-injected tests; do not exercise real user directories in tests.
-
-Commit boundary: shared user-path resolver and complete uninstall cleanup.
+## Phase 1: Explicit Process and Launchd Failures
 
 ### 3. Make process and launchd failures explicit
 

@@ -1,12 +1,6 @@
 import Darwin
 import Foundation
 
-private struct ConsoleUserInfo {
-    let uid: uid_t
-    let gid: gid_t
-    let homeDirectory: URL
-}
-
 // MARK: - Calibration Persistence
 
 extension CalibrationData {
@@ -38,18 +32,17 @@ extension CalibrationData {
     }
 
     static func resetFilePaths(currentHome: URL, consoleHome: URL?) -> [URL] {
-        var homes = [currentHome]
-        if let consoleHome, consoleHome.standardizedFileURL != currentHome.standardizedFileURL {
-            homes.append(consoleHome)
-        }
-        return homes.flatMap(allFilePaths(homeDirectory:))
+        UserHomeDirectoryResolver.homeDirectories(
+            currentHome: currentHome,
+            consoleHome: consoleHome
+        ).flatMap(allFilePaths(homeDirectory:))
     }
 
     /// Remove lid-open, lid-closed, and legacy calibration files for root and
     /// the active console user. The CLI requires root before invoking this.
     @discardableResult
     public static func clearAllStoredCalibration() throws -> [URL] {
-        let consoleHome = activeConsoleUser()?.homeDirectory
+        let consoleHome = UserHomeDirectoryResolver.activeConsoleUser()?.homeDirectory
         let paths = resetFilePaths(
             currentHome: FileManager.default.homeDirectoryForCurrentUser,
             consoleHome: consoleHome
@@ -83,7 +76,7 @@ extension CalibrationData {
 
         var savedPaths = [path]
         if geteuid() == 0,
-           let consoleUser = Self.activeConsoleUser(),
+           let consoleUser = UserHomeDirectoryResolver.activeConsoleUser(),
            let userPath = try copyToConsoleUser(data: data, consoleUser: consoleUser)
         {
             savedPaths.append(userPath)
@@ -151,17 +144,4 @@ extension CalibrationData {
         return calibration
     }
 
-    private static func activeConsoleUser() -> ConsoleUserInfo? {
-        var consoleStat = stat()
-        guard stat("/dev/console", &consoleStat) == 0, consoleStat.st_uid != 0,
-              let passwd = getpwuid(consoleStat.st_uid),
-              let home = String(validatingUTF8: passwd.pointee.pw_dir)
-        else { return nil }
-
-        return ConsoleUserInfo(
-            uid: consoleStat.st_uid,
-            gid: passwd.pointee.pw_gid,
-            homeDirectory: URL(fileURLWithPath: home, isDirectory: true)
-        )
-    }
 }

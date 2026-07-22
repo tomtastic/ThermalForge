@@ -889,8 +889,11 @@ struct Uninstall: ParsableCommand {
             throw ValidationError("Run with sudo: sudo thermalforge uninstall")
         }
 
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
+        let cleanup = UninstallCleanup()
+        print("Removal targets:")
+        for target in cleanup.targets {
+            print("  \(target.path)")
+        }
 
         // Kill app if running
         let kill = Process()
@@ -911,19 +914,24 @@ struct Uninstall: ParsableCommand {
         try? process.run()
         process.waitUntilExit()
 
-        // Remove daemon files
-        try? fm.removeItem(atPath: ThermalForgeDaemon.plistPath)
-        try? fm.removeItem(atPath: ThermalForgeDaemon.installPath)
-        try? fm.removeItem(atPath: ThermalForgeDaemon.socketPath)
+        let results = cleanup.remove()
+        print("Removal results:")
+        var failures: [UninstallRemovalResult] = []
+        for result in results {
+            switch result.outcome {
+            case .removed:
+                print("  Removed: \(result.path.path)")
+            case .alreadyAbsent:
+                print("  Already absent: \(result.path.path)")
+            case let .failed(message):
+                print("  Failed: \(result.path.path) — \(message)")
+                failures.append(result)
+            }
+        }
 
-        // Remove user data
-        let appSupport = home.appendingPathComponent("Library/Application Support/ThermalForge")
-        let logs = home.appendingPathComponent("Library/Logs/ThermalForge")
-        try? fm.removeItem(at: appSupport)
-        try? fm.removeItem(at: logs)
-
-        // Remove app bundle
-        try? fm.removeItem(atPath: "/Applications/ThermalForge.app")
+        guard failures.isEmpty else {
+            throw ValidationError("Uninstall incomplete: \(failures.count) path(s) could not be removed")
+        }
 
         print("ThermalForge fully uninstalled.")
         print("Removed: daemon, binary, app, calibration data, logs.")
