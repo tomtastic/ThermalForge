@@ -62,11 +62,7 @@ struct Auto: ParsableCommand {
     func run() throws {
         // Kill the menu bar app first — if it's running with a profile active,
         // it will override the fan reset within seconds
-        let kill = Process()
-        kill.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        kill.arguments = ["ThermalForgeApp"]
-        try? kill.run()
-        kill.waitUntilExit()
+        _ = try ApplicationLifecycleCoordinator().stop(applicationName: "ThermalForgeApp")
 
         let fc = try FanControl()
         try fc.resetAuto()
@@ -758,11 +754,13 @@ struct Install: ParsableCommand {
 
         // Copy binary to /usr/local/bin
         let fm = FileManager.default
-        try? fm.createDirectory(
+        try fm.createDirectory(
             atPath: "/usr/local/bin",
             withIntermediateDirectories: true
         )
-        try? fm.removeItem(atPath: installPath)
+        if fm.fileExists(atPath: installPath) {
+            try fm.removeItem(atPath: installPath)
+        }
         try fm.copyItem(atPath: binaryPath, toPath: installPath)
 
         // Write launchd plist
@@ -794,21 +792,16 @@ struct Install: ParsableCommand {
             toFile: ThermalForgeDaemon.plistPath,
             atomically: true, encoding: .utf8
         )
-        // Always try to stop old daemon first.
-        // Do not gate on socket health checks because socket paths can change between versions.
-        let unload = Process()
-        unload.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        unload.arguments = ["bootout", "system/\(ThermalForgeDaemon.label)"]
-        try? unload.run()
-        unload.waitUntilExit()
-        Thread.sleep(forTimeInterval: 0.5)
+        // Stop a loaded older daemon before bootstrapping the replacement. Do
+        // not gate on socket health because socket paths can change by version.
+        let launchd = LaunchdCoordinator()
+        if case .loaded = try launchd.serviceState(label: ThermalForgeDaemon.label) {
+            try launchd.bootout(label: ThermalForgeDaemon.label)
+            Thread.sleep(forTimeInterval: 0.5)
+        }
 
         // Start new daemon
-        let load = Process()
-        load.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        load.arguments = ["bootstrap", "system", ThermalForgeDaemon.plistPath]
-        try load.run()
-        load.waitUntilExit()
+        try launchd.bootstrap(plistPath: ThermalForgeDaemon.plistPath)
 
         // Verify
         Thread.sleep(forTimeInterval: 1.0)
@@ -838,24 +831,24 @@ struct Uninstall: ParsableCommand {
             print("  \(target.path)")
         }
 
-        // Kill app if running
-        let kill = Process()
-        kill.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        kill.arguments = ["ThermalForgeApp"]
-        try? kill.run()
-        kill.waitUntilExit()
+        // Stop the app if running so it cannot reassert fan control.
+        _ = try ApplicationLifecycleCoordinator().stop(applicationName: "ThermalForgeApp")
 
         // Reset fans
-        if let fc = try? FanControl() {
-            try? fc.resetAuto()
+        do {
+            try FanControl().resetAuto()
+        } catch {
+            print("Warning: unable to reset fans to Apple defaults: \(error.localizedDescription)")
         }
 
-        // Unload daemon (bootout is the modern replacement for unload)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["bootout", "system/\(ThermalForgeDaemon.label)"]
-        try? process.run()
-        process.waitUntilExit()
+        let launchd = LaunchdCoordinator()
+        switch try launchd.serviceState(label: ThermalForgeDaemon.label) {
+        case .notLoaded:
+            print("Daemon already stopped.")
+        case .loaded:
+            try launchd.bootout(label: ThermalForgeDaemon.label)
+            print("Daemon stopped.")
+        }
 
         let results = cleanup.remove()
         print("Removal results:")

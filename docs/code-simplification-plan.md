@@ -6,7 +6,7 @@ future work only.
 
 Current verified baseline:
 
-- 92 tests pass across 19 suites.
+- 95 tests pass across 19 suites.
 - A production build succeeds.
 - Calibration persistence, temperature classification, monitor timing, daemon
   client transport, cancellation cleanup, and uninstall ownership have
@@ -20,24 +20,6 @@ Current verified baseline:
 - Run `swift test` before every commit and a release build after each phase.
 - Do not mix visualization, update notifications, or unrelated feature work
   into these refactors.
-
-## Phase 1: Explicit Process and Launchd Failures
-
-### 3. Make process and launchd failures explicit
-
-Calibration, installation, and uninstallation repeat `Process` setup and often
-discard launch errors or non-zero termination statuses with `try?`.
-
-Plan:
-
-- Add a small process runner returning stdout, stderr, and termination status.
-- Add a launchd coordinator for list, bootout, and bootstrap operations.
-- Centralize stopping the menu-bar app.
-- Distinguish expected conditions such as "process not running" from actual
-  command failures.
-- Ensure failed install/resume operations produce a non-zero CLI exit status.
-
-Remaining commit boundary: install/uninstall migration.
 
 ## Phase 2: Consolidate Rule Handling
 
