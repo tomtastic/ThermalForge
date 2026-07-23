@@ -1,5 +1,10 @@
 # ThermalForge
 
+[![CI](https://github.com/tomtastic/ThermalForge/actions/workflows/ci.yml/badge.svg)](https://github.com/tomtastic/ThermalForge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)](https://www.apple.com/macos/)
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%E2%80%93M5-orange)](https://support.apple.com/en-us/116943)
+
 Low-level fan control for Apple Silicon macOS (14+), implemented in Swift.
 
 - Menu bar app (`ThermalForgeApp`)
@@ -21,31 +26,18 @@ The main changes maintained by this fork are:
 - persistent profile selection and a responsive, low-overhead menu bar app
 - adaptive sensor polling, cached SMC reads, coalesced daemon commands, and reduced hidden-UI work, incorporating the performance work from [ProducerGuy/ThermalForge#16](https://github.com/ProducerGuy/ThermalForge/pull/16) by **[arttttt](https://github.com/arttttt)**
 - hardened fan recovery on launch, profile changes, app exit, lost heartbeats, and sleep/wake
-- machine-specific Smart-profile calibration with safe workload selection, three accuracy modes, CSV diagnostics, and separate lid-open and lid-closed curves
+- machine-specific Smart calibration with safe workload selection, three accuracy modes, CSV diagnostics, and separate lid-open and lid-closed curves
 - calibration and daemon status in the menu bar, plus a bundled CLI and one-click daemon installation
-- typed daemon transport, prioritized/latching rules, structured event logging, and expanded tests
+- typed daemon transport, runtime control decision extraction, anomaly observation, fan unlock/write consolidation, framed socket handling, and expanded tests
 
 ## Architecture
 
-`ThermalForgeCore` is split into explicit layers:
+`ThermalForgeCore` is organized into four layers:
 
-1. **Hardware**
-- SMC adapter (`FanControl`)
-- sensor test seam (`SensorProvider`) and injectable SMC backend
-
-2. **Control**
-- `ThermalMonitor` runtime loop
-- `ControlService`, `ControlStateMachine`
-- `RuleEngine`, `RulePersistence`
-
-3. **Transport**
-- daemon socket: `/var/run/thermalforge.sock`
-- protocol: `DaemonRequest`, `DaemonResponse`, `DaemonCodec`
-
-4. **Observability**
-- rotating text logs (`~/Library/Logs/ThermalForge`)
-- structured events (`thermalforge-events-YYYY-MM-DD.jsonl`)
-- research logger (`thermalforge log`)
+- Hardware: `FanControl` for SMC reads/writes, plus `SensorProvider` and the injectable SMC backend for testability.
+- Control: `ThermalMonitor`, `RuntimeControlDecisionEngine`, `ControlService`, `ControlStateMachine`, `RuleEngine`, `RulePersistence`, and `ThermalAnomalyObserver`.
+- Transport: typed `DaemonRequest` / `DaemonResponse`, `DaemonCodec`, newline-delimited socket framing, and a legacy text fallback for compatibility.
+- Observability: rotating text logs (`~/Library/Logs/ThermalForge`), structured events (`thermalforge-events-YYYY-MM-DD.jsonl`), and the research logger (`thermalforge log`).
 
 ## Safety Model
 
@@ -57,8 +49,10 @@ Execution precedence:
 4. profile curve logic
 
 The hard override watches the hottest CPU or GPU sensor. It clears only below
-`90°C`, providing a 5°C hysteresis band. Silent is hands-off during normal use,
-but it remains monitored and is still subject to the hard override.
+`90°C`, providing a 5°C hysteresis band. Safety evaluation happens before rule
+and profile logic in the runtime decision engine, so there is a single path
+from sensor state to fan command. Silent is hands-off during normal use, but it
+remains monitored and is still subject to the hard override.
 
 Daemon boundary:
 
@@ -184,13 +178,13 @@ band preserves the current fan state to prevent rapid start/stop cycling.
 
 Control loop:
 
-- thermal/control polling starts at 1 second while ramping, engaging, in a
-  safety override, or at/above `85°C`
+- thermal/control polling starts at 1 second while a fan-controlling profile is
+  ramping, while the hard safety override is active, or at/above `85°C`
 - after 8 consecutive non-busy ticks, steady fan-controlling profiles relax to
   2 seconds and hands-off Silent relaxes to 5 seconds; activity returns the loop
   to 1 second immediately
 - full status and UI callbacks target 500ms, but cannot run faster than the
-  current thermal poll (therefore 1s, 2s, or 5s with the default app cadence)
+  current thermal poll
 - process capture, anomaly detection, and Smart temperature-history sampling
   target 2 seconds but, like UI updates, cannot run faster than the current
   thermal poll; process capture is skipped below `50°C`
