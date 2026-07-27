@@ -33,7 +33,9 @@ final class FakeDaemon: @unchecked Sendable {
 
     init?(_ behavior: Behavior) {
         self.behavior = behavior
-        self.path = "/tmp/tf-test-\(UUID().uuidString.prefix(8)).sock"
+        self.path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tf-test-\(UUID().uuidString.prefix(8)).sock")
+            .path
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
@@ -67,6 +69,11 @@ final class FakeDaemon: @unchecked Sendable {
         guard !stopped else { lock.unlock(); return }
         stopped = true
         lock.unlock()
+        // Closing a listening descriptor from another thread is not guaranteed
+        // to wake a blocking accept(2) on every macOS version. shutdown(2)
+        // reliably releases the test server before the Swift Testing process
+        // waits for its worker queues during teardown.
+        shutdown(listenFD, SHUT_RDWR)
         close(listenFD)
         unlink(path)
     }

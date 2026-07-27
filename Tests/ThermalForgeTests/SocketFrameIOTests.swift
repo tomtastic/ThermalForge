@@ -11,6 +11,7 @@ struct SocketFrameIOTests {
     func partialRead() throws {
         let sockets = try socketPair()
         defer { sockets.close() }
+        try sockets.setTimeout(seconds: 2)
 
         try SocketFrameIO.writeAll(Array("{\"command\":".utf8), to: sockets.writer)
         DispatchQueue.global().async {
@@ -30,6 +31,7 @@ struct SocketFrameIOTests {
     func legacyEOFFrame() throws {
         let sockets = try socketPair()
         defer { sockets.close() }
+        try sockets.setTimeout(seconds: 2)
 
         try SocketFrameIO.writeAll(Array("status".utf8), to: sockets.writer)
         shutdown(sockets.writer, SHUT_WR)
@@ -43,6 +45,7 @@ struct SocketFrameIOTests {
     func oversizedFrame() throws {
         let sockets = try socketPair()
         defer { sockets.close() }
+        try sockets.setTimeout(seconds: 2)
         let maximum = 32
         try SocketFrameIO.writeAll(
             [UInt8](repeating: 0x61, count: maximum + 1),
@@ -62,6 +65,7 @@ struct SocketFrameIOTests {
     func completeWrite() throws {
         let sockets = try socketPair()
         defer { sockets.close() }
+        try sockets.setTimeout(seconds: 2)
         var sendBuffer: Int32 = 1024
         setsockopt(
             sockets.writer,
@@ -93,7 +97,10 @@ struct SocketFrameIOTests {
             }
             received.append(contentsOf: buffer[0..<count])
         }
-        completion.wait()
+        #expect(
+            completion.wait(timeout: .now() + 2) == .success,
+            "Socket writer did not finish after the payload was received"
+        )
 
         #expect(result.error == nil)
         #expect(received == payload)
@@ -111,6 +118,28 @@ struct SocketFrameIOTests {
 private struct SocketPair: @unchecked Sendable {
     let reader: Int32
     let writer: Int32
+
+    func setTimeout(seconds: Int) throws {
+        var timeout = timeval(tv_sec: seconds, tv_usec: 0)
+        for descriptor in [reader, writer] {
+            guard setsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &timeout,
+                socklen_t(MemoryLayout<timeval>.size)
+            ) == 0,
+            setsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_SNDTIMEO,
+                &timeout,
+                socklen_t(MemoryLayout<timeval>.size)
+            ) == 0 else {
+                throw SocketFrameIOError.readFailed(errno)
+            }
+        }
+    }
 
     func close() {
         Darwin.close(reader)

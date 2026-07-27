@@ -9,6 +9,7 @@ on:
 jobs:
   build-and-test:
     runs-on: macos-15
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -16,7 +17,7 @@ jobs:
         run: swift build
 
       - name: Test
-        run: swift test
+        run: swift test --no-parallel
 
   package-smoke:
     runs-on: macos-15
