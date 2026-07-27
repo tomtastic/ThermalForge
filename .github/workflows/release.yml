@@ -10,7 +10,7 @@ jobs:
   build-release-artifacts:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build release binaries
         run: swift build -c release

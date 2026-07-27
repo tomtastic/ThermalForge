@@ -11,7 +11,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build
         run: swift build
@@ -23,7 +23,7 @@ jobs:
     runs-on: macos-15
     needs: build-and-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Package smoke
         run: ./Scripts/ci-smoke.sh
