@@ -198,18 +198,20 @@ final class AppState {
             return
         }
 
-        let targetPath = "/usr/local/bin/thermalforge"
-
-        // Use osascript to request elevation and copy the binary, then install the daemon
-        let script = """
-do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPath)' && '\(targetPath)' install" with administrator privileges
-"""
+        // Run the bundled installer directly. Copying it over an existing,
+        // previously executed binary before launch can make taskgated reject
+        // the new image as having an invalid code signature.
+        let script = DaemonInstallationCommand.administratorAppleScript(
+            executablePath: bundledURL.path
+        )
         // Run the blocking Process on a background queue to avoid
         // "semaphore.wait unavailable from async contexts" warning.
         DispatchQueue.global(qos: .utility).async {
             let task = Process()
             task.launchPath = "/usr/bin/osascript"
             task.arguments = ["-e", script]
+            let errorPipe = Pipe()
+            task.standardError = errorPipe
             let semaphore = DispatchSemaphore(value: 0)
             task.terminationHandler = { _ in semaphore.signal() }
             do {
@@ -222,7 +224,11 @@ do shell script "cp '\(bundledURL.path)' '\(targetPath)' && chmod +x '\(targetPa
                         self.checkDaemonAvailability()
                     }
                 } else {
-                    TFLogger.shared.error("Install failed with code \(task.terminationStatus)")
+                    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                    let detail = String(decoding: errorData, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let suffix = detail.isEmpty ? "" : ": \(detail)"
+                    TFLogger.shared.error("Install failed with code \(task.terminationStatus)\(suffix)")
                 }
             } catch {
                 TFLogger.shared.error("Install failed: \(error)")

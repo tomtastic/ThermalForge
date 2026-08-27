@@ -22,10 +22,14 @@ struct Install: ParsableCommand {
             atPath: "/usr/local/bin",
             withIntermediateDirectories: true
         )
-        if fm.fileExists(atPath: installPath) {
-            try fm.removeItem(atPath: installPath)
+        let sourceURL = URL(fileURLWithPath: binaryPath).standardizedFileURL
+        let installURL = URL(fileURLWithPath: installPath).standardizedFileURL
+        if sourceURL != installURL {
+            if fm.fileExists(atPath: installPath) {
+                try fm.removeItem(atPath: installPath)
+            }
+            try fm.copyItem(at: sourceURL, to: installURL)
         }
-        try fm.copyItem(atPath: binaryPath, toPath: installPath)
 
         // Write launchd plist
         let plist = """
