@@ -59,8 +59,16 @@ public struct ProcessRunner: ProcessRunning {
 
         process.executableURL = command.executableURL
         process.arguments = command.arguments
-        process.currentDirectoryURL = command.currentDirectoryURL
-        process.environment = command.environment
+        // Foundation's elevated root context rejects assigning nil to
+        // currentDirectoryURL (NSInvalidArgumentException: "must provide a
+        // directory path"). Preserve Process's defaults when no override was
+        // requested instead of invoking the optional property setters.
+        if let currentDirectoryURL = command.currentDirectoryURL {
+            process.currentDirectoryURL = currentDirectoryURL
+        }
+        if let environment = command.environment {
+            process.environment = environment
+        }
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 

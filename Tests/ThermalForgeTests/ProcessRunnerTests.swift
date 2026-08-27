@@ -28,6 +28,17 @@ struct ProcessRunnerTests {
         #expect(result.terminationStatus == 0)
     }
 
+    @Test("Uses an explicitly supplied working directory")
+    func usesCurrentDirectory() throws {
+        let result = try ProcessRunner().run(
+            executableURL: URL(fileURLWithPath: "/bin/pwd"),
+            currentDirectoryURL: URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+        )
+
+        #expect(result.succeeded)
+        #expect(result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "/private/tmp")
+    }
+
     @Test("Propagates launch failures")
     func propagatesLaunchFailure() {
         #expect(throws: (any Error).self) {
