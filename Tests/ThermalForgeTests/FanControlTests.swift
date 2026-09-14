@@ -37,6 +37,10 @@ final class FakeSMC: SMCReading {
     func reads(_ key: String) -> Int { readCounts[key, default: 0] }
     func writes(_ key: String) -> Int { writeCounts[key, default: 0] }
 
+    func keyAvailability(_ key: String) -> SMCKeyAvailability {
+        table[key].map { .present(size: $0.size) } ?? .absent
+    }
+
     // MARK: SMCReading
     func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32) {
         readCounts[key, default: 0] += 1

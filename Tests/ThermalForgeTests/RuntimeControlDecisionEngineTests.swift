@@ -63,6 +63,23 @@ struct RuntimeControlDecisionEngineTests {
         #expect(engine.state == .active(profileName: "Smart"))
     }
 
+    @Test("A profile-selection rule evaluates custom curves while it remains active")
+    func customProfileSelectionRule() {
+        let custom = FanProfile(id: "custom", name: "Custom", curve: .init(
+            stopTemp: 40, startTemp: 45, ceilingTemp: 50, maxRPMPercent: 0.7,
+            sustainedTriggerSec: 0, instantEngage: true))
+        let rule = ThermalRule(id: "select", name: "Select custom", condition: .init(
+            metric: .maxTemp, comparator: .greaterThan, valueCelsius: 50), action: .selectProfile("custom"))
+        let engine = RuntimeControlDecisionEngine(profile: .silent,
+            controlService: ControlService(ruleEngine: RuleEngine(rules: [rule])),
+            profiles: FanProfile.builtIn + [custom])
+        let first = engine.evaluate(input(temp: 70, now: 0))
+        #expect(first.command == .setRPM(7826 * 0.7))
+        #expect(engine.activeProfile.id == "custom")
+        #expect(engine.state == .active(profileName: "Custom"))
+        #expect(engine.evaluate(input(temp: 70, now: 1)).command == nil)
+    }
+
     private func makeEngine(
         profile: FanProfile,
         rules: [ThermalRule] = []

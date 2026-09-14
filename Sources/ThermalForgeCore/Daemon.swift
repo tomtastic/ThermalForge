@@ -15,26 +15,21 @@ import IOKit.pwr_mgt
 public enum ThermalForgeDaemon {
     public static let socketPath = "/var/run/thermalforge.sock"
     public static let plistPath = "/Library/LaunchDaemons/com.thermalforge.daemon.plist"
-    public static let installPath = "/usr/local/bin/thermalforge"
+    public static let installPath = "/Library/PrivilegedHelperTools/com.thermalforge/thermalforge"
+    public static let cliPath = "/usr/local/bin/thermalforge"
+    public static let recoveryLabel = "com.thermalforge.recovery"
+    public static let recoveryPlistPath = "/Library/LaunchDaemons/com.thermalforge.recovery.plist"
+    public static let stateDirectory = "/Library/Application Support/ThermalForge"
     public static let label = "com.thermalforge.daemon"
 
-    /// Check if the daemon socket exists and accepts connections.
+    /// Bounded read-only health check; observation never renews a lease.
     public static var isRunning: Bool {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
-        defer { close(fd) }
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        setPath(&addr, socketPath)
-
-        let result = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        return result == 0
+        guard let data = try? JSONEncoder().encode(BackendRequest(operation: .status)),
+              let response = try? UnixSocketTransport.roundTrip(data, path: socketPath),
+              let decoded = try? JSONDecoder().decode(BackendResponse.self, from: response) else { return false }
+        return decoded.ok && decoded.version == 2
     }
+
 }
 
 // MARK: - Daemon Client
@@ -63,13 +58,12 @@ public enum DaemonError: Error, CustomStringConvertible {
 }
 
 public final class DaemonClient {
-    private static let maximumResponseBytes = 64 * 1024
     private let socketPath: String
     /// Hard ceiling on a single daemon round-trip. A misbehaving or busy daemon
     /// (e.g. a slow SMC unlock) can never block the caller longer than this.
     private let timeoutSeconds: Int
 
-    public init(socketPath: String = ThermalForgeDaemon.socketPath, timeoutSeconds: Int = 5) {
+    public init(socketPath: String = ThermalForgeDaemon.socketPath, timeoutSeconds: Int = 2) {
         self.socketPath = socketPath
         self.timeoutSeconds = timeoutSeconds
     }
@@ -122,45 +116,14 @@ public final class DaemonClient {
     }
 
     private func roundTrip(_ payload: Data) throws -> Data {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw DaemonError.connectionFailed }
-        defer { close(fd) }
-        configureClientSocket(fd)
-
-        // Bound send/recv so a stuck daemon can't block the caller forever.
-        var tv = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        setPath(&addr, socketPath)
-
-        let connectResult = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard connectResult == 0 else { throw DaemonError.notRunning }
-
-        let bytes = [UInt8](payload + [0x0A])
-        do {
-            try SocketFrameIO.writeAll(bytes, to: fd)
-        } catch {
-            throw DaemonError.connectionFailed
-        }
-
-        // Read response — 64KB handles status JSON on sensor-rich machines
-        return try readResponse(fd)
+        try UnixSocketTransport.roundTrip(payload, path: socketPath, timeout: TimeInterval(timeoutSeconds))
     }
 
     private func shouldRetryLegacy(error: DaemonError, for request: DaemonRequest) -> Bool {
-        guard legacyCommand(for: request) != nil else { return false }
+        guard ["status", "auto"].contains(request.command), legacyCommand(for: request) != nil else { return false }
         switch error {
         case .commandFailed(let code, let message):
             return code == "legacy_error" && message.contains("unknown command")
-        case .timedOut:
-            return true
         default:
             return false
         }
@@ -201,30 +164,6 @@ public final class DaemonClient {
         let responseData = try roundTrip(Data(command.utf8))
         return String(decoding: responseData, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func configureClientSocket(_ fd: Int32) {
-        var noSigPipe: Int32 = 1
-        withUnsafePointer(to: &noSigPipe) { ptr in
-            _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, ptr, socklen_t(MemoryLayout<Int32>.size))
-        }
-    }
-
-    private func readResponse(_ fd: Int32) throws -> Data {
-        do {
-            return try SocketFrameIO.readFrame(
-                from: fd,
-                maximumBytes: Self.maximumResponseBytes
-            )
-        } catch SocketFrameIOError.timedOut {
-            throw DaemonError.timedOut
-        } catch let SocketFrameIOError.frameTooLarge(maximumBytes) {
-            throw DaemonError.protocolError(
-                "response exceeded \(maximumBytes) bytes"
-            )
-        } catch {
-            throw DaemonError.connectionFailed
-        }
     }
 
     public func execute(_ command: FanCommand) throws {
@@ -273,402 +212,114 @@ public final class DaemonClient {
     }
 }
 
-// MARK: - Daemon Server
+// MARK: - Version two request routing
 
-enum HeartbeatWatchdog {
-    static let timeout: TimeInterval = 10
+public final class BackendRequestRouter {
+    private let backend: BackendRequestHandling
+    public init(backend: BackendRequestHandling) { self.backend = backend }
 
-    static func shouldReset(
-        lastHeartbeat: Date?,
-        hasManualControl: Bool,
-        now: Date = Date()
-    ) -> Bool {
-        guard let lastHeartbeat, hasManualControl else { return false }
-        return now.timeIntervalSince(lastHeartbeat) > timeout
+    public func handle(_ data: Data, peer: AuthenticatedPeer) -> Data {
+        let encoder = JSONEncoder()
+        if let request = try? JSONDecoder().decode(BackendRequest.self, from: data) {
+            return (try? encoder.encode(backend.handle(request, peer: peer))) ?? Data()
+        }
+        let legacy: DaemonRequest
+        if let request = try? DaemonCodec.decodeRequest(data) {
+            legacy = request
+        } else if data.first == 123 {
+            let error = BackendResponse(requestID: "invalid", ok: false,
+                error: DaemonErrorPayload(code: "invalid_request", message: "Invalid version two request"))
+            return (try? encoder.encode(error)) ?? Data()
+        } else {
+            let command = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            legacy = DaemonRequest(command: command)
+        }
+        let response: DaemonResponse
+        if legacy.version != 1 {
+            response = DaemonResponse(requestID: legacy.requestID, ok: false,
+                error: DaemonErrorPayload(code: "unsupported_version", message: "Use protocol version 2"))
+        } else if legacy.command == "status" {
+            let current = backend.handle(BackendRequest(operation: .status), peer: peer)
+            response = DaemonResponse(requestID: legacy.requestID, ok: current.ok,
+                message: current.snapshot?.sensors == nil ? "Sensors unavailable" : nil,
+                status: current.snapshot?.sensors, error: current.error)
+        } else if legacy.command == "auto" || legacy.command == "reset" {
+            let current = backend.handle(BackendRequest(operation: .restoreApple), peer: peer)
+            response = DaemonResponse(requestID: legacy.requestID, ok: current.ok,
+                message: current.snapshot?.restoration == .verified ? "Apple control verified" : "Restoration accepted; verification pending",
+                error: current.error)
+        } else {
+            response = DaemonResponse(requestID: legacy.requestID, ok: false,
+                error: DaemonErrorPayload(code: "session_required", message: "Manual control requires a version 2 foreground session"))
+        }
+        return (try? DaemonCodec.encodeResponse(response)) ?? Data()
     }
 }
 
 public final class DaemonServer {
-    static let maximumRequestBytes = 64 * 1024
-
-    private let socketFD: Int32
-    private let fanControl: FanControl
-
-    /// Serializes all SMC access — prevents data race between client handler and watchdog.
-    private let smcLock = NSLock()
-    /// Manual-control state, shared by requests, wake handling, and the watchdog.
-    private let controlStateLock = NSLock()
-    /// Last fan command — re-applied after sleep/wake.
-    private var lastCommand: FanCommand?
-    /// Heartbeat: last time the app checked in.
-    private var lastHeartbeat: Date?
-    private let authorizedUID: uid_t?
-
-    public init(fanControl: FanControl) throws {
-        self.fanControl = fanControl
-        self.authorizedUID = currentConsoleUID()
-
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else {
-            throw ThermalForgeError.smcConnectionFailed
-        }
-        self.socketFD = fd
-
-        unlink(ThermalForgeDaemon.socketPath)
-
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        setPath(&addr, ThermalForgeDaemon.socketPath)
-
-        let bindResult = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard bindResult == 0 else {
-            close(fd)
-            throw ThermalForgeError.writeFailed("bind() failed: \(errno)")
-        }
-
-        if let uid = authorizedUID {
-            _ = chown(ThermalForgeDaemon.socketPath, uid, 0)
-            chmod(ThermalForgeDaemon.socketPath, 0o600)
-        } else {
-            chmod(ThermalForgeDaemon.socketPath, 0o600)
-        }
-
-        guard listen(fd, 5) == 0 else {
-            close(fd)
-            throw ThermalForgeError.writeFailed("listen() failed")
-        }
-    }
-
-    /// Run the server loop (blocks forever).
-    public func run() {
-        NSLog("ThermalForge daemon: listening on %@", ThermalForgeDaemon.socketPath)
-
-        registerWakeNotification()
-        startHeartbeatWatchdog()
-
-        DispatchQueue.global(qos: .utility).async { [self] in
-            while true {
-                // Drain per-iteration temporaries — this block never returns, so
-                // without an explicit pool every autoreleased object accumulates
-                // for the daemon's lifetime (multi-GB leak over days).
-                autoreleasepool {
-                    let clientFD = accept(socketFD, nil, nil)
-                    guard clientFD >= 0 else { return }
-                    handleClient(clientFD)
-                    close(clientFD)
-                }
-            }
-        }
-
-        RunLoop.main.run()
-    }
-
-    // MARK: - Heartbeat Watchdog
-
-    private func startHeartbeatWatchdog() {
-        DispatchQueue.global(qos: .utility).async { [self] in
-            while true {
-                autoreleasepool {
-                    Thread.sleep(forTimeInterval: 2)
-
-                    let snapshot = controlStateSnapshot()
-
-                    // Only reset if: app has connected before (lastBeat != nil),
-                    // fans are in manual mode, and heartbeat is stale
-                    if HeartbeatWatchdog.shouldReset(
-                        lastHeartbeat: snapshot.heartbeat,
-                        hasManualControl: snapshot.command != nil
-                    ) {
-                        NSLog("ThermalForge daemon: heartbeat stale — resetting fans to auto")
-                        smcLock.lock()
-                        defer { smcLock.unlock() }
-
-                        // A fresh request may have arrived while the watchdog was
-                        // waiting for SMC access. Recheck before overriding it.
-                        let current = controlStateSnapshot()
-                        guard HeartbeatWatchdog.shouldReset(
-                            lastHeartbeat: current.heartbeat,
-                            hasManualControl: current.command != nil
-                        ) else { return }
-
-                        let resetSucceeded: Bool
-                        do {
-                            try fanControl.resetAuto()
-                            resetSucceeded = true
-                        } catch {
-                            NSLog("ThermalForge daemon: watchdog reset failed: %@, will retry", "\(error)")
-                            resetSucceeded = false
-                        }
-
-                        // Only clear state if reset actually worked — otherwise retry next cycle
-                        if resetSucceeded {
-                            clearControlState()
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func controlStateSnapshot() -> (command: FanCommand?, heartbeat: Date?) {
-        controlStateLock.lock()
-        defer { controlStateLock.unlock() }
-        return (lastCommand, lastHeartbeat)
-    }
-
-    private func recordManualControl(_ command: FanCommand) {
-        controlStateLock.lock()
-        lastCommand = command
-        lastHeartbeat = Date()
-        controlStateLock.unlock()
-    }
-
-    private func recordHeartbeat() {
-        controlStateLock.lock()
-        lastHeartbeat = Date()
-        controlStateLock.unlock()
-    }
-
-    private func clearControlState() {
-        controlStateLock.lock()
-        lastCommand = nil
-        lastHeartbeat = nil
-        controlStateLock.unlock()
-    }
-
-    // MARK: - Sleep/Wake
-
+    static let maximumRequestBytes = BackendTiming.maximumFrameBytes
+    private let listener: UnixSocketListener
+    private let coordinator: BackendCoordinator
     private var rootPort: io_connect_t = 0
     private var notifyPort: IONotificationPortRef?
     private var notifier: io_object_t = 0
 
-    private func registerWakeNotification() {
-        let refcon = Unmanaged.passUnretained(self).toOpaque()
-        rootPort = IORegisterForSystemPower(
-            refcon, &notifyPort, { (refcon, _, messageType, messageArgument) in
-                guard let refcon = refcon else { return }
+    public init(coordinator: BackendCoordinator, socketPath: String = ThermalForgeDaemon.socketPath,
+                authorize: @escaping (AuthenticatedPeer) -> Bool = DaemonServer.isAuthorized) throws {
+        self.coordinator = coordinator
+        let router = BackendRequestRouter(backend: coordinator)
+        listener = try UnixSocketListener(path: socketPath, mode: 0o666, authorize: authorize,
+                                         handler: router.handle)
+    }
+
+    public static func isAuthorized(_ peer: AuthenticatedPeer) -> Bool {
+        peer.uid == 0 || peer.uid == currentConsoleUID()
+    }
+
+    public func run() {
+        start()
+        RunLoop.main.run()
+    }
+
+    public func start() {
+        registerPowerNotifications()
+        coordinator.start()
+        listener.start()
+    }
+
+    public func stop() { listener.stop(); coordinator.stop() }
+
+    private func registerPowerNotifications() {
+        rootPort = IORegisterForSystemPower(Unmanaged.passUnretained(self).toOpaque(), &notifyPort,
+            { refcon, _, message, argument in
+                guard let refcon else { return }
                 let server = Unmanaged<DaemonServer>.fromOpaque(refcon).takeUnretainedValue()
-
-                let kSystemHasPoweredOn: UInt32 = 0xe0000300
-                let kSystemWillSleep: UInt32 = 0xe0000280
-                let kCanSystemSleep: UInt32 = 0xe0000270
-
-                switch messageType {
-                case kSystemHasPoweredOn:
-                    server.handleWake()
-                case kSystemWillSleep, kCanSystemSleep:
-                    IOAllowPowerChange(server.rootPort, numericCast(Int(bitPattern: messageArgument)))
-                default:
-                    break
+                switch message {
+                case 0xe0000280: // will sleep: invalidate sessions immediately
+                    server.coordinator.prepareForSleep()
+                    IOAllowPowerChange(server.rootPort, numericCast(Int(bitPattern: argument)))
+                case 0xe0000270:
+                    IOAllowPowerChange(server.rootPort, numericCast(Int(bitPattern: argument)))
+                case 0xe0000300:
+                    server.coordinator.resumeAfterWake()
+                default: break
                 }
-            }, &notifier
-        )
-
-        guard rootPort != 0, let notifyPort = notifyPort else {
-            NSLog("ThermalForge daemon: failed to register for power notifications")
-            return
+            }, &notifier)
+        if rootPort != 0, let notifyPort {
+            CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue(), .defaultMode)
         }
-
-        let source = IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue()
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
-        NSLog("ThermalForge daemon: registered for wake notifications")
-    }
-
-    private func handleWake() {
-        guard controlStateSnapshot().command != nil else {
-            NSLog("ThermalForge daemon: woke — no profile to re-apply")
-            return
-        }
-
-        NSLog("ThermalForge daemon: woke — re-applying previous fan command")
-
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) { [self] in
-            smcLock.lock()
-            defer { smcLock.unlock() }
-            guard let command = controlStateSnapshot().command else {
-                NSLog("ThermalForge daemon: wake re-apply cancelled — fan control returned to auto")
-                return
-            }
-            do {
-                switch command {
-                case .setMax:
-                    try fanControl.setMax()
-                case .setRPM(let rpm):
-                    try fanControl.setAllFans(rpm: rpm)
-                case .resetAuto:
-                    try fanControl.resetAuto()
-                }
-                NSLog("ThermalForge daemon: re-applied after wake")
-            } catch {
-                NSLog("ThermalForge daemon: wake re-apply failed: %@", "\(error)")
-            }
-        }
-    }
-
-    private func handleClient(_ fd: Int32) {
-        guard isAuthorizedClient(fd) else {
-            TFLogger.shared.event(ThermalEvent(type: .daemonCommandRejected, details: "unauthorized client"))
-            writeResponse(fd, fallbackText: "error: unauthorized client")
-            return
-        }
-
-        let bytes: Data
-        do {
-            bytes = try SocketFrameIO.readFrame(
-                from: fd,
-                maximumBytes: Self.maximumRequestBytes
-            )
-        } catch let SocketFrameIOError.frameTooLarge(maximumBytes) {
-            writeResponse(
-                fd,
-                fallbackText: "error: request exceeds \(maximumBytes) bytes"
-            )
-            return
-        } catch {
-            return
-        }
-        let request = decodeRequest(bytes)
-
-        let response: DaemonResponse = {
-            smcLock.lock()
-            defer { smcLock.unlock() }
-            return handleRequest(request)
-        }()
-
-        writeResponse(fd, typed: response, fallbackText: response.ok ? "ok" : "error: \(response.error?.message ?? "unknown")")
-    }
-
-    private func decodeRequest(_ data: Data) -> DaemonRequest {
-        if let req = try? DaemonCodec.decodeRequest(data) {
-            return req
-        }
-
-        let plain = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = plain.split(separator: " ")
-        guard let first = parts.first.map(String.init) else {
-            return DaemonRequest(command: "invalid")
-        }
-
-        if first == "set", parts.count >= 2, let rpm = Int(parts[1]) {
-            return DaemonRequest(command: "set", rpm: rpm)
-        }
-        return DaemonRequest(command: first)
-    }
-
-    private func handleRequest(_ request: DaemonRequest) -> DaemonResponse {
-        switch request.command {
-        case "max":
-            return withErrorBoundary(requestID: request.requestID) {
-                try fanControl.setMax()
-                recordManualControl(.setMax)
-                return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
-            }
-
-        case "auto":
-            return withErrorBoundary(requestID: request.requestID) {
-                try fanControl.resetAuto()
-                clearControlState()
-                return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
-            }
-
-        case "set":
-            guard let rpm = request.rpm else {
-                return DaemonResponse(
-                    requestID: request.requestID,
-                    ok: false,
-                    error: DaemonErrorPayload(code: "validation_error", message: "usage: set <rpm>")
-                )
-            }
-            return withErrorBoundary(requestID: request.requestID) {
-                try fanControl.setAllFans(rpm: Float(rpm))
-                recordManualControl(.setRPM(Float(rpm)))
-                return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
-            }
-
-        case "status":
-            return withErrorBoundary(requestID: request.requestID) {
-                let status = try fanControl.status()
-                return DaemonResponse(requestID: request.requestID, ok: true, status: status)
-            }
-
-        case "heartbeat":
-            recordHeartbeat()
-            return DaemonResponse(requestID: request.requestID, ok: true, message: "ok")
-
-        default:
-            TFLogger.shared.event(ThermalEvent(type: .daemonCommandRejected, details: "unknown command: \(request.command)"))
-            return DaemonResponse(
-                requestID: request.requestID,
-                ok: false,
-                error: DaemonErrorPayload(code: "unknown_command", message: "unknown command '\(request.command)'")
-            )
-        }
-    }
-
-    private func withErrorBoundary(requestID: String, _ body: () throws -> DaemonResponse) -> DaemonResponse {
-        do {
-            return try body()
-        } catch {
-            TFLogger.shared.event(ThermalEvent(type: .daemonCommandFailed, details: "request failed: \(error)"))
-            return DaemonResponse(
-                requestID: requestID,
-                ok: false,
-                error: DaemonErrorPayload(code: "command_failed", message: "\(error)")
-            )
-        }
-    }
-
-    private func writeResponse(_ fd: Int32, typed: DaemonResponse? = nil, fallbackText: String) {
-        let responseBytes: [UInt8]
-        if let typed, let data = try? DaemonCodec.encodeResponse(typed) {
-            responseBytes = [UInt8](data) + [0x0A]
-        } else {
-            responseBytes = Array((fallbackText + "\n").utf8)
-        }
-
-        do {
-            try SocketFrameIO.writeAll(responseBytes, to: fd)
-        } catch {
-            TFLogger.shared.error("Daemon response write failed: \(error)")
-        }
-    }
-
-    private func isAuthorizedClient(_ fd: Int32) -> Bool {
-        var peerUID: uid_t = 0
-        var peerGID: gid_t = 0
-        guard getpeereid(fd, &peerUID, &peerGID) == 0 else {
-            return false
-        }
-
-        if peerUID == 0 { return true }
-        guard let authorizedUID else { return false }
-        return peerUID == authorizedUID
     }
 
     deinit {
-        close(socketFD)
-        unlink(ThermalForgeDaemon.socketPath)
+        listener.stop()
+        if notifier != 0 { IODeregisterForSystemPower(&notifier) }
+        if rootPort != 0 { IOServiceClose(rootPort) }
+        if let notifyPort { IONotificationPortDestroy(notifyPort) }
     }
 }
-
-// MARK: - Helpers
 
 private func currentConsoleUID() -> uid_t? {
     var st = stat()
-    guard stat("/dev/console", &st) == 0 else { return nil }
-    guard st.st_uid != 0 else { return nil }
+    guard stat("/dev/console", &st) == 0, st.st_uid != 0 else { return nil }
     return st.st_uid
-}
-
-/// Copy a path string into sockaddr_un.sun_path.
-private func setPath(_ addr: inout sockaddr_un, _ path: String) {
-    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-        ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
-            _ = strlcpy(dest, path, 104)
-        }
-    }
 }

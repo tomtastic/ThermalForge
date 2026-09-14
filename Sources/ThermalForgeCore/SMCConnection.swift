@@ -73,12 +73,24 @@ struct SMCParamStruct {
 
 /// The subset of SMC operations FanControl depends on. Abstracted so tests can
 /// inject a fake key table instead of touching real hardware.
+public enum SMCKeyAvailability: Equatable {
+    case present(size: UInt32), absent, unknown
+}
+
 public protocol SMCReading: AnyObject {
+    func keyAvailability(_ key: String) -> SMCKeyAvailability
     func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32)
     func writeKey(_ key: String, bytes: [UInt8]) -> Bool
     func getKeyInfo(_ key: String) -> (size: UInt32, type: String)?
     func getKeyCount() -> UInt32
     func getKeyAtIndex(_ index: UInt32) -> String?
+}
+
+public extension SMCReading {
+    func keyAvailability(_ key: String) -> SMCKeyAvailability {
+        guard let info = getKeyInfo(key), info.size > 0, info.size <= 32 else { return .unknown }
+        return .present(size: info.size)
+    }
 }
 
 // MARK: - SMC Connection
@@ -88,6 +100,13 @@ public protocol SMCReading: AnyObject {
 public final class SMCConnection {
 
     private let connection: io_connect_t
+    private let injectedTransport: ((inout SMCParamStruct, inout SMCParamStruct, inout Int) -> kern_return_t)?
+
+    /// Hardware-free seam exercises the actual size/result validation path.
+    init(transport: @escaping (inout SMCParamStruct, inout SMCParamStruct, inout Int) -> kern_return_t) {
+        self.connection = 0
+        self.injectedTransport = transport
+    }
 
     /// A key's data size is fixed by firmware, so cache it to skip the
     /// `readKeyInfo` IOKit round trip on repeat reads/writes. Only present keys
@@ -126,10 +145,11 @@ public final class SMCConnection {
             return nil
         }
         self.connection = conn
+        self.injectedTransport = nil
     }
 
     deinit {
-        IOServiceClose(connection)
+        if connection != 0 { IOServiceClose(connection) }
     }
 
     // MARK: - Public API
@@ -151,7 +171,7 @@ public final class SMCConnection {
                 return (false, [], 0)
             }
             let size = output.keyInfo.dataSize
-            guard size > 0 else { return (false, [], 0) }
+            guard size > 0, size <= 32 else { return (false, [], 0) }
             setCachedSize(code, size)
             dataSize = size
         }
@@ -184,8 +204,11 @@ public final class SMCConnection {
                 return false
             }
             dataSize = output.keyInfo.dataSize
-            if dataSize > 0 { setCachedSize(code, dataSize) }
+            guard dataSize > 0, dataSize <= 32 else { return false }
+            setCachedSize(code, dataSize)
         }
+
+        guard bytes.count == Int(dataSize), dataSize <= 32 else { return false }
 
         // Write value
         input.data8 = SMCCommand.writeBytes.rawValue
@@ -238,21 +261,47 @@ public final class SMCConnection {
             return nil
         }
 
+        guard output.keyInfo.dataSize > 0, output.keyInfo.dataSize <= 32 else { return nil }
         return (output.keyInfo.dataSize, fourCharString(output.keyInfo.dataType))
+    }
+
+    /// Only the firmware's explicit key-not-found result proves absence.
+    public func keyAvailability(_ key: String) -> SMCKeyAvailability {
+        var input = SMCParamStruct()
+        var output = SMCParamStruct()
+        input.key = fourCharCode(key)
+        input.data8 = SMCCommand.readKeyInfo.rawValue
+        let transport = callSMC(&input, &output, acceptFirmwareError: true)
+        guard transport == kIOReturnSuccess else { return .unknown }
+        if output.result == 0x84 { return .absent }
+        guard output.result == 0, output.keyInfo.dataSize > 0,
+              output.keyInfo.dataSize <= 32 else { return .unknown }
+        return .present(size: output.keyInfo.dataSize)
     }
 
     // MARK: - Private
 
-    private func callSMC(_ input: inout SMCParamStruct, _ output: inout SMCParamStruct) -> kern_return_t {
+    private func callSMC(_ input: inout SMCParamStruct, _ output: inout SMCParamStruct,
+                         acceptFirmwareError: Bool = false) -> kern_return_t {
         var outputSize = MemoryLayout<SMCParamStruct>.stride
-        return IOConnectCallStructMethod(
+        output = SMCParamStruct()
+        let result: kern_return_t
+        if let injectedTransport {
+            result = injectedTransport(&input, &output, &outputSize)
+        } else {
+            result = IOConnectCallStructMethod(
             connection,
             kSMCHandleIndex,
             &input,
             MemoryLayout<SMCParamStruct>.stride,
             &output,
             &outputSize
-        )
+            )
+        }
+        guard result == kIOReturnSuccess else { return result }
+        guard outputSize == MemoryLayout<SMCParamStruct>.stride else { return kIOReturnUnderrun }
+        guard acceptFirmwareError || output.result == 0 else { return kIOReturnError }
+        return kIOReturnSuccess
     }
 
     private func fourCharCode(_ key: String) -> UInt32 {

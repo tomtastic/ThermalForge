@@ -2,7 +2,7 @@ import ArgumentParser
 import Foundation
 import ThermalForgeCore
 
-struct Rules: ParsableCommand {
+struct Rules: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "rules",
         abstract: "Manage IF/THEN/ELSE thermal rules",
@@ -17,14 +17,14 @@ struct Rules: ParsableCommand {
     )
 }
 
-struct RulesList: ParsableCommand {
+struct RulesList: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "list",
         abstract: "List all persisted rules"
     )
 
-    func run() throws {
-        let rules = RulePersistence.load().sorted { lhs, rhs in
+    func run() async throws {
+        let rules = (try await BackendClient().configuration()).rules.sorted { lhs, rhs in
             if lhs.priority == rhs.priority { return lhs.name < rhs.name }
             return lhs.priority > rhs.priority
         }
@@ -36,7 +36,7 @@ struct RulesList: ParsableCommand {
     }
 }
 
-struct RulesAdd: ParsableCommand {
+struct RulesAdd: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "add",
         abstract: "Add a rule (example: IF temp >= 55 THEN max until <= 65)"
@@ -60,7 +60,7 @@ struct RulesAdd: ParsableCommand {
     @Option(name: .long, help: "Set explicit RPM instead of max (when --max is false)")
     var rpm: Int = 0
 
-    func run() throws {
+    func run() async throws {
         let action: ThermalRuleAction = max ? .setMax : .setRPM(rpm)
         let rule = ThermalRule(
             name: name,
@@ -75,13 +75,16 @@ struct RulesAdd: ParsableCommand {
             untilTempBelowC: until
         )
 
-        try RulePersistence.add(rule)
+        let client = BackendClient()
+        var configuration = try await client.configuration()
+        configuration.rules.append(rule)
+        _ = try await client.updateConfiguration(configuration)
 
         print("Added rule: \(rule.id)")
     }
 }
 
-struct RulesRemove: ParsableCommand {
+struct RulesRemove: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "remove",
         abstract: "Remove a rule by ID"
@@ -90,13 +93,17 @@ struct RulesRemove: ParsableCommand {
     @Argument(help: "Rule ID")
     var id: String
 
-    func run() throws {
-        let result = try RulePersistence.remove(id: id)
-        print(result.removedCount > 0 ? "Removed \(result.removedCount) rule(s)." : "No matching rule.")
+    func run() async throws {
+        let client = BackendClient()
+        var configuration = try await client.configuration()
+        let count = configuration.rules.count
+        configuration.rules.removeAll { $0.id == id }
+        _ = try await client.updateConfiguration(configuration)
+        print(count != configuration.rules.count ? "Rule removed." : "No matching rule.")
     }
 }
 
-struct RulesEnable: ParsableCommand {
+struct RulesEnable: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "enable",
         abstract: "Enable a rule by ID"
@@ -105,15 +112,19 @@ struct RulesEnable: ParsableCommand {
     @Argument(help: "Rule ID")
     var id: String
 
-    func run() throws {
-        guard try RulePersistence.enable(id: id) != nil else {
+    func run() async throws {
+        let client = BackendClient()
+        var configuration = try await client.configuration()
+        guard let index = configuration.rules.firstIndex(where: { $0.id == id }) else {
             throw ValidationError("Rule not found: \(id)")
         }
+        configuration.rules[index].enabled = true
+        _ = try await client.updateConfiguration(configuration)
         print("Enabled rule: \(id)")
     }
 }
 
-struct RulesDisable: ParsableCommand {
+struct RulesDisable: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "disable",
         abstract: "Disable a rule by ID"
@@ -122,15 +133,19 @@ struct RulesDisable: ParsableCommand {
     @Argument(help: "Rule ID")
     var id: String
 
-    func run() throws {
-        guard try RulePersistence.disable(id: id) != nil else {
+    func run() async throws {
+        let client = BackendClient()
+        var configuration = try await client.configuration()
+        guard let index = configuration.rules.firstIndex(where: { $0.id == id }) else {
             throw ValidationError("Rule not found: \(id)")
         }
+        configuration.rules[index].enabled = false
+        _ = try await client.updateConfiguration(configuration)
         print("Disabled rule: \(id)")
     }
 }
 
-struct RulesTest: ParsableCommand {
+struct RulesTest: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "test",
         abstract: "Evaluate rules against synthetic temperatures"
@@ -142,8 +157,8 @@ struct RulesTest: ParsableCommand {
     @Option(name: .long, help: "GPU temperature in Celsius")
     var gpu: Float = 58
 
-    func run() throws {
-        let rules = RulePersistence.load()
+    func run() async throws {
+        let rules = try await BackendClient().configuration().rules
         let engine = RuleEngine(rules: rules, isEnabled: true)
         let maxTemp = max(cpu, gpu)
         let context = RuleEvaluationContext(cpuTemp: cpu, gpuTemp: gpu, maxTemp: maxTemp)

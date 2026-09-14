@@ -64,6 +64,7 @@ final class RuntimeControlDecisionEngine {
     private static let smartStopTemp: Float = 50
 
     private let controlService: ControlService
+    private let availableProfiles: [FanProfile]
 
     private(set) var activeProfile: FanProfile
     private(set) var state: MonitorState = .idle
@@ -76,8 +77,9 @@ final class RuntimeControlDecisionEngine {
     private var lastSafetyCommandAppliedAt: TimeInterval?
     private var temperatureHistory = TemperatureRateHistory()
 
-    init(profile: FanProfile, controlService: ControlService) {
+    init(profile: FanProfile, controlService: ControlService, profiles: [FanProfile] = FanProfile.builtIn) {
         activeProfile = profile
+        availableProfiles = profiles
         self.controlService = controlService
     }
 
@@ -206,15 +208,19 @@ final class RuntimeControlDecisionEngine {
 
         let decisionChanged = decision != lastRuleDecision
         var preempted = false
+        var selectedProfile = false
         var command: FanCommand?
         var updatedNotices = notices
 
         if let profileID = decision.profileID,
-           let targetProfile = FanProfile.builtIn.first(where: { $0.id == profileID })
+           let targetProfile = availableProfiles.first(where: { $0.id == profileID })
         {
             if decisionChanged || activeProfile.id != targetProfile.id {
                 activeProfile = targetProfile
+                sustainedAboveCount = input.maxTemp >= targetProfile.curve.startTemp ? 1 : 0
+                temperatureHistory.removeAll()
             }
+            selectedProfile = true
             preempted = true
         }
 
@@ -245,6 +251,19 @@ final class RuntimeControlDecisionEngine {
             ))
         }
         lastRuleDecision = decision
+
+        if selectedProfile, command == nil {
+            // Selecting a profile changes the policy to evaluate; it must not
+            // suppress that profile's curve on every matching rule tick.
+            let appliedBefore = lastAppliedRPMPercent
+            let runningBefore = fansCurrentlyRunning
+            let result = activeProfile.id == "smart"
+                ? evaluateSmart(input: input) : evaluateCurve(input: input)
+            return RuntimeControlOutput(command: result.command,
+                fanChanged: lastAppliedRPMPercent != appliedBefore || fansCurrentlyRunning != runningBefore,
+                shouldApplyCadence: true, isEngaging: isEngaging,
+                notices: updatedNotices + result.notices)
+        }
 
         return RuntimeControlOutput(
             command: command,

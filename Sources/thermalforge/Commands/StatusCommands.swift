@@ -2,15 +2,23 @@ import ArgumentParser
 import Foundation
 import ThermalForgeCore
 
-struct Status: ParsableCommand {
+struct Status: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "status",
         abstract: "Print current fan speeds and temperatures as JSON"
     )
 
-    func run() throws {
-        let fc = try FanControl()
-        let status = try fc.status()
+    func run() async throws {
+        let status: ThermalStatus
+        do {
+            guard let measured = try await BackendClient().status().sensors else {
+                throw ValidationError("Backend sensors are unavailable.")
+            }
+            status = measured
+        } catch {
+            // Read-only fallback preserves the established sensor JSON schema.
+            status = try FanControl().status()
+        }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

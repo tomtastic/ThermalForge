@@ -9,7 +9,7 @@ import ArgumentParser
 import ThermalForgeCore
 
 @main
-struct ThermalForge: ParsableCommand {
+struct ThermalForge: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "thermalforge",
         abstract: "Fan control for Apple Silicon MacBooks",
@@ -27,6 +27,7 @@ struct ThermalForge: ParsableCommand {
             Install.self,
             Uninstall.self,
             Daemon.self,
+            Recovery.self,
         ]
     )
 }

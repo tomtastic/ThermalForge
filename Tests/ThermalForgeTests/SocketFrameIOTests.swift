@@ -58,7 +58,7 @@ struct SocketFrameIOTests {
                 maximumBytes: maximum
             )
         }
-        #expect(DaemonServer.maximumRequestBytes == 64 * 1024)
+        #expect(DaemonServer.maximumRequestBytes == BackendTiming.maximumFrameBytes)
     }
 
     @Test("Complete writes deliver payloads larger than the socket buffer")

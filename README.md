@@ -9,7 +9,8 @@ Low-level fan control for Apple Silicon macOS (14+), implemented in Swift.
 
 - Menu bar app (`ThermalForgeApp`)
 - CLI (`thermalforge`)
-- Privileged launchd daemon (`com.thermalforge.daemon`)
+- Privileged control backend (`com.thermalforge.daemon`)
+- Independent recovery service (`com.thermalforge.recovery`)
 
 Original creator: **[ProducerGuy](https://github.com/ProducerGuy/ThermalForge)**.
 This repository is an actively maintained fork.
@@ -24,57 +25,54 @@ The repository lineage is
 The main changes maintained by this fork are:
 
 - persistent profile selection and a responsive, low-overhead menu bar app
-- adaptive sensor polling, cached SMC reads, coalesced daemon commands, and reduced hidden-UI work, incorporating the performance work from [ProducerGuy/ThermalForge#16](https://github.com/ProducerGuy/ThermalForge/pull/16) by **[arttttt](https://github.com/arttttt)**
-- hardened fan recovery on launch, profile changes, app exit, lost heartbeats, and sleep/wake
+- centralized policy evaluation, cached SMC reads, and reduced hidden-UI work, building on earlier performance work from [ProducerGuy/ThermalForge#16](https://github.com/ProducerGuy/ThermalForge/pull/16) by **[arttttt](https://github.com/arttttt)**
+- hardened fan recovery on launch, profile changes, app exit, expired client or completed-work leases, and sleep/wake
 - machine-specific Smart calibration with safe workload selection, three accuracy modes, CSV diagnostics, and separate lid-open and lid-closed curves
 - calibration and daemon status in the menu bar, plus a bundled CLI and one-click daemon installation
 - typed daemon transport, runtime control decision extraction, anomaly observation, fan unlock/write consolidation, framed socket handling, and expanded tests
 
 ## Architecture
 
-`ThermalForgeCore` is organized into four layers:
+The app and CLI are clients of one serialized control backend. It owns profiles,
+rules, calibration, and normal fan writes. An independent process owns recovery
+from a stopped or failed backend. Both processes use one root-owned executable
+under `/Library/PrivilegedHelperTools/com.thermalforge/`.
 
-- Hardware: `FanControl` for SMC reads/writes, plus `SensorProvider` and the injectable SMC backend for testability.
-- Control: `ThermalMonitor`, `RuntimeControlDecisionEngine`, `ControlService`, `ControlStateMachine`, `RuleEngine`, `RulePersistence`, and `ThermalAnomalyObserver`.
-- Transport: typed `DaemonRequest` / `DaemonResponse`, `DaemonCodec`, newline-delimited socket framing, and a legacy text fallback for compatibility.
-- Observability: rotating text logs (`~/Library/Logs/ThermalForge`), structured events (`thermalforge-events-YYYY-MM-DD.jsonl`), and the research logger (`thermalforge log`).
+The version 2 socket protocol distinguishes requested intent, acknowledged fan
+control, measured sensors, session ownership, and verified Apple handback. See
+[architecture-v2.md](docs/architecture-v2.md) for the protocol and process model.
 
 ## Safety Model
 
-Execution precedence:
+The hottest CPU/GPU temperature drives the 95°C maximum-fan override, which
+clears below 90°C. Rules run before profile curves. Even the Silent profile needs
+a live client session for its temperature override; observers cannot cause writes.
 
-1. hard safety override (`>=95°C` → maximum fans)
-2. the app's custom temperature override, when enabled
-3. prioritized rule-engine decisions
-4. profile curve logic
+- Client ownership expires after ten seconds without renewal. CLI `set`, `max`,
+  `watch`, and calibration remain in the foreground and release their own session
+  on interruption.
+- Recovery uses a separate ten-second monotonic lease. Only completed sensing and
+  control advances it; responsive status requests cannot conceal a stalled controller.
+- Recovery durably records its obligation before the first manual write. On
+  failure it revokes permission, sends SIGTERM, escalates after one second, and
+  positively confirms controller exit before touching SMC.
+- Every fan and any diagnostic override must report verified system/automatic
+  ownership. Partial failures remain unverified and are retried; new control is blocked.
+- Sleep invalidates sessions. Wake verifies Apple handback before fresh evaluation.
+- Requests use an absolute two-second socket deadline. Root and the current console
+  user are authorized using credentials supplied by the operating system.
+- `--takeover` allows a CLI to revoke the GUI's session. The GUI remains open as an
+  observer; it requires a fresh profile selection after takeover or explicit `auto`.
+  A second controlling CLI receives a busy response.
 
-The hard override watches the hottest CPU or GPU sensor. It clears only below
-`90°C`, providing a 5°C hysteresis band. Safety evaluation happens before rule
-and profile logic in the runtime decision engine, so there is a single path
-from sensor state to fan command. Silent is hands-off during normal use, but it
-remains monitored and is still subject to the hard override.
+The app can display local read-only sensors during an outage and marks fan ownership
+unknown. GUI profile recovery after communication/backend failures cannot override
+an explicit restoration or takeover, including across backend restarts.
 
-Daemon boundary:
-
-- launchd system daemon (`root`)
-- local Unix socket at `/var/run/thermalforge.sock` with mode `0600`; when an
-  active console user is available, the socket is assigned to that user
-- peer UID authorization restricted to root or the console user recorded when
-  the daemon starts
-- selecting a fan-controlling profile starts 5-second app heartbeats; selecting
-  Silent stops them
-- watchdog checks every 2 seconds and resets manually controlled fans to Apple
-  auto after a heartbeat is more than 10 seconds stale (normally within about
-  10–12 seconds)
-- failed watchdog resets are retried; successful resets clear the saved manual
-  command
-- the app resets fans to Apple auto on launch, when selecting Silent, and on
-  termination (with a 3-second client timeout)
-- after wake, the daemon re-applies the last manual command after 2 seconds
-
-Daemon calls have bounded socket send/receive timeouts and app-side fan commands
-run off the UI thread through a serial coalescer. The menu bar warns when the
-daemon is unavailable because manual fan commands cannot be applied without it.
+Physical handback verification on direct-mode and `Ftst` hardware is a separate
+release gate. Simulated tests verify software ordering, not firmware behavior.
+Permanent SMC failures or a controller that cannot be terminated leave restoration
+unverified and new manual control blocked.
 
 ## Calibration
 
@@ -86,7 +84,7 @@ the current lid state, Smart uses its built-in S-curve.
 Run the default Standard calibration with combined CPU and GPU stress:
 
 ```bash
-sudo thermalforge calibrate
+thermalforge calibrate
 ```
 
 Available modes use the same 60-second minimum evidence window but increasingly
@@ -103,15 +101,16 @@ the mode-specific limit:
 Choose a mode or isolate the stress source when needed:
 
 ```bash
-sudo thermalforge calibrate --mode optimized
-sudo thermalforge calibrate --mode optimized --intensity 0.00221
-sudo thermalforge calibrate --mode optimized --rediscover-intensity
-sudo thermalforge calibrate --stress cpu
-sudo thermalforge calibrate --stress gpu
+thermalforge calibrate --mode optimized
+thermalforge calibrate --mode optimized --intensity 0.00221
+thermalforge calibrate --mode optimized --rediscover-intensity
+thermalforge calibrate --stress cpu
+thermalforge calibrate --stress gpu
 ```
 
-Calibration stops the menu bar app and temporarily stops a running daemon to
-avoid competing fan commands. It begins workload discovery at 5%, adjusts the
+Calibration runs as an exclusive backend job. The app and other clients can
+observe progress; cancellation and explicit Apple restoration remain available.
+Use `--takeover` when the GUI owns control. It begins workload discovery at 5%, adjusts the
 intensity geometrically, and makes early decisions when the result is clearly
 safe or unsafe. Low CPU intensities use fractional duty cycling instead of
 jumping directly to one fully loaded core. CPU, GPU, and combined runs use their
@@ -121,9 +120,9 @@ The sweep tests five fan levels. Unstable timeouts are excluded rather than
 saved as equilibrium measurements, at least three converged points are required,
 and the generated curve cannot reduce fan speed as temperature rises. The CSV
 records selected, CPU, and GPU temperatures plus convergence diagnostics in the
-console output. Calibration always stops the workload and returns fans to Apple
-auto when the run ends. `Ctrl-C` also resets the fans and exits without saving.
-An existing calibration cannot be replaced by a lower-ranked mode.
+console output. Completion and cancellation require confirmed workload termination
+before verified Apple handback. Interrupted runs never save partial results or restart
+automatically. `--force` is required to replace a higher-ranked calibration.
 
 The selected stress type, workload intensity, and ambient temperature are saved
 with the result. Later calibrations using the same stress type reuse that
@@ -138,28 +137,17 @@ A calibration is saved only when its converged sweep reaches at least 80°C,
 providing measured coverage for the Smart control range. Underpowered sweeps and
 all-maximum curves are rejected, leaving the previous calibration untouched.
 
-Lid-open and clamshell operation are calibrated independently. Run calibration
-once in each configuration you use; the result is stored in:
-
-- `~/Library/Application Support/ThermalForge/calibration_lid_open.json`
-- `~/Library/Application Support/ThermalForge/calibration_lid_closed.json`
-
-The embedded lid state must match the filename. A missing or mismatched file is
-treated as uncalibrated rather than falling back to the legacy
-`calibration.json`. The monitor checks for a lid-state change every 60 seconds
-and reloads the matching curve. Calibration run as root also copies its result
-to the active console user's application-support directory, gives the file back
-to that user, and prints both paths. Smart uses the matching lid-state file the
-next time the app starts.
-
-To delete all lid-specific and legacy calibration data:
+Lid-open and clamshell operation are calibrated independently. The backend stores
+both curves in `/Library/Application Support/ThermalForge/machine-calibration-v2.json`.
+It prefers valid state-specific legacy root data, then authenticated user imports.
+Lid-ambiguous data is never imported. Original files remain intact.
 
 ```bash
-sudo thermalforge calibrate --reset
+thermalforge calibrate --reset
 ```
 
-This removes the root-owned calibration used by the CLI and the matching files
-copied into the active console user's application-support directory.
+Reset clears both machine curves and records a tombstone so a later legacy import
+cannot resurrect them. A new completed calibration can still be saved.
 
 ## Profiles
 
@@ -176,24 +164,18 @@ Built-in profiles:
 Active profiles return to Apple auto at or below `50°C`; the 50–start-temperature
 band preserves the current fan state to prevent rapid start/stop cycling.
 
-Control loop:
-
-- thermal/control polling starts at 1 second while a fan-controlling profile is
-  ramping, while the hard safety override is active, or at/above `85°C`
-- after 8 consecutive non-busy ticks, steady fan-controlling profiles relax to
-  2 seconds and hands-off Silent relaxes to 5 seconds; activity returns the loop
-  to 1 second immediately
-- full status and UI callbacks target 500ms, but cannot run faster than the
-  current thermal poll
-- process capture, anomaly detection, and Smart temperature-history sampling
-  target 2 seconds but, like UI updates, cannot run faster than the current
-  thermal poll; process capture is skipped below `50°C`
-- timer leeway is 20% of the active interval to allow macOS to coalesce wakeups
+The backend samples and evaluates control every second. Client display and lease
+maintenance are independent; a slow CLI display interval does not expire its session.
+Only acknowledged hardware operations update the published control state. Failures
+return to Apple control and rebuild policy state before another evaluation.
 
 ## Rules (IF/THEN)
 
-Rules are persisted at:
-- `~/Library/Application Support/ThermalForge/rules.json`
+Profiles, rules, selected profile, and rule preferences are authoritative in
+`/Library/Application Support/ThermalForge/users/<console-uid>/configuration.json`.
+The first GUI connection imports validated legacy values atomically and preserves
+the original files; explicit backend edits take precedence. Fahrenheit and launch
+at login remain local preferences.
 
 CLI:
 ```bash
@@ -206,12 +188,6 @@ thermalforge rules test --cpu 70 --gpu 62
 ```
 
 ## Install
-
-### Homebrew
-```bash
-brew install ProducerGuy/tap/thermalforge
-sudo thermalforge install
-```
 
 ### Source
 ```bash
@@ -246,13 +222,20 @@ CI workflows:
 
 ```bash
 thermalforge status
-thermalforge max
-thermalforge auto
-thermalforge set 4000
-thermalforge watch --profile smart
+thermalforge max --takeover  # foreground; Ctrl-C releases this session
+thermalforge auto             # explicit verified Apple restoration
+thermalforge set 4000 --takeover
+thermalforge watch --profile smart --takeover
 thermalforge discover
 thermalforge log --rate 10 --duration 1h --no-expire
 ```
+
+`set` controls all fans; per-fan `--fan` commands are rejected. Legacy status/reset
+requests remain supported, while manual requests without protected sessions are rejected.
+
+Installation fences old controllers and verifies handback before enabling either new
+service. Recovery starts successfully before the backend. Failed uninstall restoration
+retains recovery and reports the failure. Automated tests do not replace installed services.
 
 ## Troubleshooting
 

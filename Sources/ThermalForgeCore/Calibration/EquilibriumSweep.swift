@@ -74,11 +74,17 @@ final class EquilibriumSweep {
     }
 
     func run() throws -> EquilibriumSweepResult {
+        let result: Result<EquilibriumSweepResult, Error>
+        do { result = .success(try runSweep()) } catch { result = .failure(error) }
+        guard workload.stop() else { throw CalibrationError.workloadShutdownFailed }
+        return try result.get()
+    }
+
+    private func runSweep() throws -> EquilibriumSweepResult {
         _ = workload.start(intensity: workloadIntensity)
         if let warning = workloadWarning() {
             log(warning)
         }
-        defer { workload.stop() }
 
         var measurements: [CalibrationEquilibriumMeasurement] = []
         var unstableFanLevels: [Int] = []

@@ -221,7 +221,7 @@ struct CalibrationConvergenceTests {
         #expect(!workload.start(intensity: 0, coreCount: 8))
         #expect(workload.stop())
         #expect(!workload.isRunning)
-        #expect(!workload.stop())
+        #expect(workload.stop())
     }
 
     @Test("Combined workload start and stop are ordered and idempotent")
@@ -235,7 +235,7 @@ struct CalibrationConvergenceTests {
         #expect(workload.start(intensity: 0.25))
         #expect(!workload.start(intensity: 0.5))
         #expect(workload.stop())
-        #expect(!workload.stop())
+        #expect(workload.stop())
         #expect(recorder.snapshot == [
             .started("cpu", 0.25),
             .started("gpu", 0.25),
@@ -251,7 +251,7 @@ struct CalibrationConvergenceTests {
         #expect(!workload.start(intensity: 0.25))
         #expect(!workload.isRunning)
         #expect(workload.lastWarning == "Warning: Metal device not available, running CPU-only stress")
-        #expect(!workload.stop())
+        #expect(workload.stop())
     }
 
     @Test("All-maximum calibration curves are rejected")

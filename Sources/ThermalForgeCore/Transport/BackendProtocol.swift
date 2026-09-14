@@ -39,16 +39,18 @@ public struct BackendConfiguration: Codable, Equatable {
     public var selectedProfileID: String
     public var rulesEnabled: Bool
     public var importedLegacy: Bool
+    public var recoveryEpoch: String?
 
     public init(revision: Int = 0, profiles: [FanProfile] = FanProfile.builtIn,
                 rules: [ThermalRule] = [], selectedProfileID: String = "silent",
-                rulesEnabled: Bool = true, importedLegacy: Bool = false) {
+                rulesEnabled: Bool = true, importedLegacy: Bool = false, recoveryEpoch: String? = nil) {
         self.revision = revision
         self.profiles = profiles
         self.rules = rules
         self.selectedProfileID = selectedProfileID
         self.rulesEnabled = rulesEnabled
         self.importedLegacy = importedLegacy
+        self.recoveryEpoch = recoveryEpoch
     }
 }
 
@@ -67,12 +69,14 @@ public struct CalibrationJobParameters: Codable, Equatable {
     public var stressType: String
     public var force: Bool
     public var rediscoverIntensity: Bool
+    public var workloadIntensity: Float?
     public init(mode: String = "standard", stressType: String = "cpu", force: Bool = false,
-                rediscoverIntensity: Bool = false) {
+                rediscoverIntensity: Bool = false, workloadIntensity: Float? = nil) {
         self.mode = mode
         self.stressType = stressType
         self.force = force
         self.rediscoverIntensity = rediscoverIntensity
+        self.workloadIntensity = workloadIntensity
     }
 }
 
@@ -90,13 +94,16 @@ public struct BackendRequest: Codable {
     public var clientKind: ControlClientKind?
     public var intent: ControlIntent?
     public var takeover: Bool
+    public var automaticRecovery: Bool
+    public var recoveryEpoch: String?
     public var configuration: BackendConfiguration?
     public var legacyImport: LegacyConfigurationImport?
     public var calibration: CalibrationJobParameters?
 
     public init(operation: BackendOperation, session: ControlSession? = nil,
                 clientKind: ControlClientKind? = nil, intent: ControlIntent? = nil,
-                takeover: Bool = false, configuration: BackendConfiguration? = nil,
+                takeover: Bool = false, automaticRecovery: Bool = false, recoveryEpoch: String? = nil,
+                configuration: BackendConfiguration? = nil,
                 legacyImport: LegacyConfigurationImport? = nil,
                 calibration: CalibrationJobParameters? = nil,
                 version: Int = 2, requestID: String = UUID().uuidString) {
@@ -107,6 +114,8 @@ public struct BackendRequest: Codable {
         self.clientKind = clientKind
         self.intent = intent
         self.takeover = takeover
+        self.automaticRecovery = automaticRecovery
+        self.recoveryEpoch = recoveryEpoch
         self.configuration = configuration
         self.legacyImport = legacyImport
         self.calibration = calibration
@@ -149,6 +158,7 @@ public struct CalibrationJobSnapshot: Codable {
 
 public struct BackendSnapshot: Codable {
     public var generation: String
+    public var recoveryEpoch: String?
     public var requestedIntent: ControlIntent?
     public var acknowledgedControl: AcknowledgedControl
     public var sensors: ThermalStatus?
@@ -158,20 +168,23 @@ public struct BackendSnapshot: Codable {
     public var restoration: RestorationState
     public var restorationErrors: [String]
     public var lastSessionEndReason: SessionEndReason?
+    public var endedSessions: [String: SessionEndReason]
     public var calibration: CalibrationJobSnapshot?
     public var configurationRevision: Int
     public var activeProfileID: String?
     public var calibrationLidClosed: Bool?
 
-    public init(generation: String, requestedIntent: ControlIntent? = nil,
+    public init(generation: String, recoveryEpoch: String? = nil, requestedIntent: ControlIntent? = nil,
                 acknowledgedControl: AcknowledgedControl = .unknown,
                 sensors: ThermalStatus? = nil, sampledAt: TimeInterval? = nil,
                 owner: ControlSession? = nil, ownerKind: ControlClientKind? = nil,
                 restoration: RestorationState = .unknown, restorationErrors: [String] = [],
                 lastSessionEndReason: SessionEndReason? = nil,
+                endedSessions: [String: SessionEndReason] = [:],
                 calibration: CalibrationJobSnapshot? = nil, configurationRevision: Int = 0,
                 activeProfileID: String? = nil, calibrationLidClosed: Bool? = nil) {
         self.generation = generation
+        self.recoveryEpoch = recoveryEpoch
         self.requestedIntent = requestedIntent
         self.acknowledgedControl = acknowledgedControl
         self.sensors = sensors
@@ -181,6 +194,7 @@ public struct BackendSnapshot: Codable {
         self.restoration = restoration
         self.restorationErrors = restorationErrors
         self.lastSessionEndReason = lastSessionEndReason
+        self.endedSessions = endedSessions
         self.calibration = calibration
         self.configurationRevision = configurationRevision
         self.activeProfileID = activeProfileID

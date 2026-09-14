@@ -32,7 +32,7 @@ final class GPUStressWorkload: CalibrationWorkload {
     @discardableResult
     func start(intensity: Float) -> Bool {
         lock.lock()
-        guard !running else {
+        guard !running, thread?.isFinished != false else {
             lock.unlock()
             return false
         }
@@ -110,16 +110,16 @@ final class GPUStressWorkload: CalibrationWorkload {
     @discardableResult
     func stop() -> Bool {
         lock.lock()
-        let wasRunning = running
         running = false
         let activeThread = thread
         lock.unlock()
-        guard wasRunning else { return false }
 
         let deadline = Date().addingTimeInterval(2)
         while activeThread?.isFinished == false, Date() < deadline {
             Thread.sleep(forTimeInterval: 0.01)
         }
+
+        guard activeThread?.isFinished != false else { return false }
 
         lock.lock()
         thread = nil

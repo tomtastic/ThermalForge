@@ -27,7 +27,7 @@ final class CPUStressWorkload: CalibrationWorkload {
         coreCount: Int
     ) -> Bool {
         lock.lock()
-        guard !running else {
+        guard !running, threads.allSatisfy(\.isFinished) else {
             lock.unlock()
             return false
         }
@@ -52,11 +52,9 @@ final class CPUStressWorkload: CalibrationWorkload {
     @discardableResult
     func stop(timeout: TimeInterval) -> Bool {
         lock.lock()
-        let wasRunning = running
         running = false
         let activeThreads = threads
         lock.unlock()
-        guard wasRunning else { return false }
 
         let deadline = Date().addingTimeInterval(timeout)
         while activeThreads.contains(where: { !$0.isFinished }), Date() < deadline {
@@ -66,7 +64,7 @@ final class CPUStressWorkload: CalibrationWorkload {
         lock.lock()
         threads.removeAll(where: \.isFinished)
         lock.unlock()
-        return true
+        return activeThreads.allSatisfy(\.isFinished)
     }
 
     static func plan(intensity: Float, coreCount: Int) -> CalibrationCPUStressPlan {

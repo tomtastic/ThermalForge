@@ -99,17 +99,23 @@ public struct CalibrationData: Codable {
     /// Validate that calibration data is physically consistent.
     /// Returns nil if valid, or a description of what's wrong.
     public var validationError: String? {
+        guard fans > 0, maxRPM > 0, minRPM >= 0, minRPM <= maxRPM else {
+            return "Invalid fan capabilities"
+        }
+        if let workloadIntensity, !workloadIntensity.isFinite || workloadIntensity <= 0 || workloadIntensity > 1 {
+            return "Invalid workload intensity"
+        }
         guard !measurements.isEmpty else {
             return "No measurements"
         }
 
         for m in measurements {
             // Target temp should be in sane range
-            if m.targetTemp < 40 || m.targetTemp > 100 {
+            if !m.targetTemp.isFinite || m.targetTemp < 40 || m.targetTemp > 100 {
                 return "Target temp \(m.targetTemp)°C is out of range (40-100°C)"
             }
             // Holding RPM should be 0-1
-            if m.holdingRPMPercent < 0 || m.holdingRPMPercent > 1 {
+            if !m.holdingRPMPercent.isFinite || m.holdingRPMPercent < 0 || m.holdingRPMPercent > 1 {
                 return "Holding RPM \(m.holdingRPMPercent) at \(Int(m.targetTemp))°C is out of range (0-1)"
             }
         }
@@ -198,6 +204,7 @@ public enum CalibrationMode: String, CaseIterable {
 public enum CalibrationError: LocalizedError {
     case insufficientData(reason: String)
     case cancelled
+    case workloadShutdownFailed
 
     public var errorDescription: String? {
         switch self {
@@ -205,6 +212,8 @@ public enum CalibrationError: LocalizedError {
             return reason
         case .cancelled:
             return "Calibration was interrupted"
+        case .workloadShutdownFailed:
+            return "Calibration workload did not terminate; controller exit and independent recovery are required"
         }
     }
 }
@@ -236,7 +245,10 @@ struct CalibrationTemperatureSample: Equatable {
 // MARK: - Calibration Runner
 
 public final class CalibrationRunner {
-    private let fanControl: FanControl
+    private let readStatus: () throws -> ThermalStatus
+    private let applyCommand: (FanCommand) throws -> Void
+    private let restoreOnCompletion: (() throws -> Void)?
+    private let logDirectory: URL
     private let mode: CalibrationMode
     private let stressType: CalibrationStressType
     private let workloadIntensityOverride: Float?
@@ -256,7 +268,7 @@ public final class CalibrationRunner {
     // CSV log handle — written to in real time during calibration
     private var csvHandle: FileHandle?
 
-    public init(
+    public convenience init(
         fanControl: FanControl,
         mode: CalibrationMode = .standard,
         stressType: CalibrationStressType = .combined,
@@ -264,7 +276,37 @@ public final class CalibrationRunner {
         cancellationToken: CancellationToken = CancellationToken(),
         lidStateProvider: any LidStateProvider = MacLidStateProvider()
     ) {
-        self.fanControl = fanControl
+        self.init(
+            readStatus: { try fanControl.status() },
+            applyCommand: { command in
+                switch command {
+                case .setMax: try fanControl.setMax()
+                case .setRPM(let rpm): try fanControl.setAllFans(rpm: rpm)
+                case .resetAuto: try fanControl.resetAuto()
+                }
+            },
+            mode: mode, stressType: stressType, workloadIntensity: workloadIntensity,
+            cancellationToken: cancellationToken, lidStateProvider: lidStateProvider,
+            restoreOnCompletion: { try fanControl.resetAuto() }
+        )
+    }
+
+    /// Backend injection keeps sensing, fan writes, and handback under its gate.
+    public init(
+        readStatus: @escaping () throws -> ThermalStatus,
+        applyCommand: @escaping (FanCommand) throws -> Void,
+        mode: CalibrationMode = .standard,
+        stressType: CalibrationStressType = .combined,
+        workloadIntensity: Float? = nil,
+        cancellationToken: CancellationToken = CancellationToken(),
+        lidStateProvider: any LidStateProvider = MacLidStateProvider(),
+        restoreOnCompletion: (() throws -> Void)? = nil,
+        logDirectory: URL = CalibrationData.applicationSupportDirectory
+    ) {
+        self.readStatus = readStatus
+        self.applyCommand = applyCommand
+        self.restoreOnCompletion = restoreOnCompletion
+        self.logDirectory = logDirectory
         self.mode = mode
         self.stressType = stressType
         self.workloadIntensityOverride = workloadIntensity
@@ -306,7 +348,7 @@ public final class CalibrationRunner {
             temperature: { [self] in calibrationTemperature()?.selected },
             workload: calibrationWorkload,
             workloadWarning: { [self] in gpuStressWorkload?.lastWarning },
-            setMaximumFans: { [self] in try fanControl.setAllFans(rpm: maxRPM) },
+            setMaximumFans: { [self] in try applyCommand(.setRPM(maxRPM)) },
             now: {
                 TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
             },
@@ -318,20 +360,25 @@ public final class CalibrationRunner {
     }
 
     private func calibrationTemperature() -> CalibrationTemperatureSample? {
-        guard let status = try? fanControl.status() else { return nil }
+        guard let status = try? readStatus() else { return nil }
         return temperatureSelector.select(from: status.temperatures)
     }
 
-    /// Cleanup: always stop stress, reset fans, close CSV on any exit path
-    private func cleanup() {
+    public func stopWorkloads() -> Bool {
         calibrationWorkload.stop()
-        try? fanControl.resetAuto()
+    }
+
+    /// Never hand back or report completion before workload termination is known.
+    private func cleanup() throws {
+        let stopped = stopWorkloads()
         csvHandle?.closeFile()
         csvHandle = nil
-        if cancellationToken.isCancelled {
+        if cancellationToken.isCancelled || !stopped {
             Self.discardPartialLog(at: logPath)
             logPath = nil
         }
+        guard stopped else { throw CalibrationError.workloadShutdownFailed }
+        try restoreOnCompletion?()
     }
 
     static func discardPartialLog(at url: URL?) {
@@ -346,8 +393,14 @@ public final class CalibrationRunner {
     }
 
     private func wait(for interval: TimeInterval) throws {
-        if cancellationToken.waitUntilCancelled(for: interval) {
-            throw CalibrationError.cancelled
+        var remaining = interval
+        while remaining > 0 {
+            let duration = min(remaining, BackendTiming.progressInterval)
+            if cancellationToken.waitUntilCancelled(for: duration) { throw CalibrationError.cancelled }
+            // Long cooldowns still complete real sensing work. Client renewal
+            // and workload execution alone never count as controller progress.
+            _ = try readStatus()
+            remaining -= duration
         }
     }
 
@@ -361,13 +414,26 @@ public final class CalibrationRunner {
 
     /// Run full calibration. Blocks until complete.
     public func run() throws -> CalibrationData {
-        defer { cleanup() }
+        // A job cancelled before it starts has neither workloads nor hardware
+        // ownership to clean up. In particular, do not touch SMC here.
+        try throwIfCancelled()
+        let result: Result<CalibrationData, Error>
+        do { result = .success(try runBody()) } catch { result = .failure(error) }
+        try cleanup()
+        return try result.get()
+    }
+
+    private func runBody() throws -> CalibrationData {
         try throwIfCancelled()
 
-        let fanCount = try fanControl.fanCount()
-        let fan0 = try fanControl.fanInfo(0)
-        let maxRPM = fan0.maxRPM > 0 ? fan0.maxRPM : 7826
-        let minRPM = fan0.minRPM > 0 ? fan0.minRPM : 2317
+        let initialStatus = try readStatus()
+        let fanCount = initialStatus.fans.count
+        guard let fan0 = initialStatus.fans.first, fan0.maxRPM > 0,
+              fan0.minRPM >= 0, fan0.minRPM <= fan0.maxRPM else {
+            throw CalibrationError.insufficientData(reason: "Readable fan capabilities are required")
+        }
+        let maxRPM = Float(fan0.maxRPM)
+        let minRPM = Float(fan0.minRPM)
         let minPct = minRPM / maxRPM
 
         // Machine info
@@ -389,7 +455,7 @@ public final class CalibrationRunner {
 
         // Record ambient temperature
         var ambientTemp: Float = 0
-        if let status = try? fanControl.status() {
+        if let status = try? readStatus() {
             ambientTemp = temperatureSelector.ambient(from: status.temperatures) ?? 0
         }
         if ambientTemp > 0 {
@@ -406,7 +472,7 @@ public final class CalibrationRunner {
         if let workloadIntensityOverride {
             baselineIntensity = workloadIntensityOverride
             log("Phase 1: Using supplied/reused safe workload intensity \(String(format: "%.5f", baselineIntensity))")
-            try fanControl.setMax()
+            try applyCommand(.setMax)
         } else {
             // Phase 1: Find max safe stress intensity
             log("Phase 1: Finding max safe stress intensity...")
@@ -437,12 +503,12 @@ public final class CalibrationRunner {
             } else {
                 // Preserve the useful final safe-probe state instead of resetting
                 // to Apple auto and paying for an unnecessary cooldown/reheat.
-                try fanControl.setMax()
+                try applyCommand(.setMax)
             }
         }
 
         // Set up CSV log
-        let logDir = CalibrationData.applicationSupportDirectory
+        let logDir = logDirectory
         try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
         let timestamp = isoFormatter.string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
@@ -463,14 +529,13 @@ public final class CalibrationRunner {
             workload: calibrationWorkload,
             workloadWarning: { [self] in gpuStressWorkload?.lastWarning },
             convergence: convergenceModel,
-            setFanRPM: { [self] rpm in try fanControl.setAllFans(rpm: rpm) },
-            setMaximumFans: { [self] in try fanControl.setMax() },
+            setFanRPM: { [self] rpm in try applyCommand(.setRPM(rpm)) },
+            setMaximumFans: { [self] in try applyCommand(.setMax) },
             sample: { [self] in calibrationTemperature() },
             onSample: { [self] fanPercent, temperature in
-                let fan0RPM = (try? fanControl.fanInfo(0))?.actualRPM ?? 0
-                let fan1RPM = fanCount > 1
-                    ? ((try? fanControl.fanInfo(1))?.actualRPM ?? 0)
-                    : 0
+                let currentFans = (try? readStatus())?.fans ?? []
+                let fan0RPM = currentFans.first?.actualRPM ?? 0
+                let fan1RPM = currentFans.count > 1 ? currentFans[1].actualRPM : 0
                 let timestamp = isoFormatter.string(from: Date())
                 csvWrite(
                     "\(timestamp),\(String(format: "%.2f", fanPercent)),"
@@ -562,7 +627,7 @@ public final class CalibrationRunner {
     private func waitForCooldown(below threshold: Float) throws {
         let cooldown = CalibrationCooldown(
             convergence: convergenceModel,
-            setMaximumFans: { [self] in try fanControl.setMax() },
+            setMaximumFans: { [self] in try applyCommand(.setMax) },
             temperature: { [self] in calibrationTemperature()?.selected },
             wait: { [self] interval in try wait(for: interval) },
             checkCancellation: { [self] in try throwIfCancelled() },

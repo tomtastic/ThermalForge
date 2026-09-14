@@ -14,10 +14,14 @@ public enum ThermalForgeError: Error, CustomStringConvertible {
     case unlockFailed(String)
     case readFailed(String)
     case writeFailed(String)
+    case cancelled
+    case restorationFailed([String])
     case rpmOutOfRange(requested: Float, min: Float, max: Float)
 
     public var description: String {
         switch self {
+        case .cancelled: return "Fan operation cancelled"
+        case .restorationFailed(let errors): return "Apple restoration unverified: " + errors.joined(separator: "; ")
         case .smcConnectionFailed:
             return "Failed to connect to AppleSMC. Is this a Mac with SMC?"
         case .unlockFailed(let detail):
@@ -68,9 +72,8 @@ public final class FanControl {
     private let smc: SMCReading
     private let wait: (TimeInterval) -> Void
     /// Which mode key works on this hardware (detected at init)
-    private let modeKeyTemplate: String
-    /// Whether Ftst unlock is available (M1-M4) or not (M5+)
-    private let hasFtst: Bool
+    private var modeKeys: [Int: String] = [:]
+    private let now: () -> TimeInterval
 
     // Hardware facts that never change for a session — read once, then cached.
     // FanControl is only ever accessed serially (monitor queue / daemon smcLock /
@@ -92,25 +95,30 @@ public final class FanControl {
         self.init(smc: smc, wait: Thread.sleep(forTimeInterval:))
     }
 
-    init(smc: SMCReading, wait: @escaping (TimeInterval) -> Void) {
+    public init(smc: SMCReading, wait: @escaping (TimeInterval) -> Void,
+                now: @escaping () -> TimeInterval = { BackendTiming.monotonicNow }) {
         self.smc = smc
         self.wait = wait
+        self.now = now
+    }
 
-        // Detect hardware: which mode key exists?
-        // M5 Max uses F%dmd (lowercase), M1-M4 use F%dMd (uppercase)
-        let lowerResult = smc.readKey(SMCFanKey.key(SMCFanKey.modeLower, fan: 0))
-        if lowerResult.success {
-            self.modeKeyTemplate = SMCFanKey.modeLower
-        } else {
-            self.modeKeyTemplate = SMCFanKey.modeUpper
+    private func modeKey(_ index: Int) -> String? {
+        if let key = modeKeys[index] { return key }
+        var knownPresent: String?
+        for template in [SMCFanKey.modeLower, SMCFanKey.modeUpper] {
+            let key = SMCFanKey.key(template, fan: index)
+            let result = smc.readKey(key)
+            if result.success, result.size == 1, result.bytes.count == 1 {
+                modeKeys[index] = key
+                return key
+            }
+            // Metadata can identify the mode key even when its current value
+            // is unreadable. Recovery still attempts the write, then requires
+            // a readable automatic/system value to verify handback.
+            if case .present(size: 1) = smc.keyAvailability(key) { knownPresent = knownPresent ?? key }
         }
-
-        // Check if Ftst exists (M1-M4 unlock mechanism)
-        if let info = smc.getKeyInfo(SMCFanKey.forceTest), info.size > 0 {
-            self.hasFtst = true
-        } else {
-            self.hasFtst = false
-        }
+        if let knownPresent { modeKeys[index] = knownPresent }
+        return knownPresent
     }
 
     // MARK: - Fan Count
@@ -118,10 +126,11 @@ public final class FanControl {
     public func fanCount() throws -> Int {
         if let cached = cachedFanCount { return cached }
         let result = smc.readKey(SMCFanKey.count)
-        guard result.success, !result.bytes.isEmpty else {
+        guard result.success, result.size == 1, result.bytes.count == 1 else {
             throw ThermalForgeError.readFailed(SMCFanKey.count)
         }
         let count = Int(result.bytes[0])
+        guard count <= 16 else { throw ThermalForgeError.readFailed(SMCFanKey.count) }
         cachedFanCount = count
         return count
     }
@@ -148,20 +157,31 @@ public final class FanControl {
     /// at startup isn't latched.
     private func fanLimits(_ index: Int) -> (min: Float, max: Float) {
         if let cached = cachedLimits[index] { return cached }
-        let minimum = readFanFloat(index, template: SMCFanKey.minimum)
-        let maximum = readFanFloat(index, template: SMCFanKey.maximum)
-        if maximum > 0 { cachedLimits[index] = (minimum, maximum) }
-        return (minimum, maximum)
+        let minimum = readFanFloatValue(index, template: SMCFanKey.minimum)
+        let maximum = readFanFloatValue(index, template: SMCFanKey.maximum)
+        if let minimum, let maximum, maximum > 0, maximum >= minimum {
+            cachedLimits[index] = (minimum, maximum)
+        }
+        return (minimum ?? 0, maximum ?? 0)
+    }
+
+    private func verifiedFanLimits(_ index: Int) throws -> (min: Float, max: Float) {
+        let limits = fanLimits(index)
+        guard cachedLimits[index] != nil else {
+            throw ThermalForgeError.readFailed("fan \(index) RPM limits")
+        }
+        return limits
     }
 
     private func readMode(_ index: Int) -> String {
-        let modeResult = smc.readKey(SMCFanKey.key(modeKeyTemplate, fan: index))
-        let modeValue = modeResult.success && !modeResult.bytes.isEmpty ? modeResult.bytes[0] : 0
-        switch modeValue {
+        guard let key = modeKey(index) else { return "unknown" }
+        let result = smc.readKey(key)
+        guard result.success, result.size == 1, result.bytes.count == 1 else { return "unknown" }
+        switch result.bytes[0] {
         case 0: return "auto"
         case 1: return "manual"
         case 3: return "system"
-        default: return "unknown(\(modeValue))"
+        default: return "unknown(\(result.bytes[0]))"
         }
     }
 
@@ -175,56 +195,59 @@ public final class FanControl {
 
     // MARK: - Unlock
 
-    /// Unlock fans for manual control.
-    /// On M1-M4: writes Ftst=1, then polls until mode write succeeds.
-    /// On M5+: Ftst doesn't exist, attempts direct mode write.
-    private func unlockFans(count: Int) throws {
-        try unlockFans(Array(0..<count))
+    private func checkCancellation(_ cancellation: CancellationToken, deadline: TimeInterval) throws {
+        guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
+        guard now() < deadline else { throw ThermalForgeError.unlockFailed("Eight-second preparation budget expired") }
     }
 
-    private func unlockFans(_ indices: [Int]) throws {
-        // Fast path: if every fan is already in manual mode the unlock happened
-        // on an earlier command — skip the Ftst write + 0.5s sleep + poll loop.
-        // (Ftst/mode stay set until resetAuto, so thermalmonitord stays off.)
-        let lockedIndices = indices.filter { !isManualMode($0) }
-        guard !lockedIndices.isEmpty else {
-            return
+    private func unlockFans(_ indices: [Int], cancellation: CancellationToken) throws {
+        let deadline = now() + BackendTiming.unlockBudget
+        try checkCancellation(cancellation, deadline: deadline)
+        let ftstAvailability = smc.keyAvailability(SMCFanKey.forceTest)
+        switch ftstAvailability {
+        case .absent, .present(size: 1): break
+        default: throw ThermalForgeError.readFailed(SMCFanKey.forceTest)
         }
-
-        if hasFtst {
-            // M1-M4 path: Ftst unlock suppresses thermalmonitord
-            guard smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
-                throw ThermalForgeError.unlockFailed(
-                    "Failed to write Ftst=1. Run with sudo."
-                )
+        var lockedIndices: [Int] = []
+        for index in indices {
+            let mode = readMode(index)
+            guard ["auto", "manual", "system"].contains(mode) else {
+                throw ThermalForgeError.unlockFailed("Fan \(index) mode is unreadable or unsupported")
             }
-            wait(0.5)
+            if mode != "manual" { lockedIndices.append(index) }
         }
-
+        guard !lockedIndices.isEmpty else { return }
+        // Resolve every mode before enabling the diagnostic override.
         for index in lockedIndices {
-            try unlockFan(index)
+            guard modeKey(index) != nil else { throw ThermalForgeError.readFailed("fan \(index) mode") }
         }
-    }
-
-    private func unlockFan(_ index: Int) throws {
-        let modeKey = SMCFanKey.key(modeKeyTemplate, fan: index)
-        let deadline = Date().addingTimeInterval(10.0)
-
-        while Date() < deadline {
-            if smc.writeKey(modeKey, bytes: [1]) {
-                return
+        switch ftstAvailability {
+        case .present(size: 1):
+            guard smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
+                throw ThermalForgeError.unlockFailed("Ftst write rejected")
             }
-            wait(0.1)
+            for _ in 0..<5 {
+                try checkCancellation(cancellation, deadline: deadline)
+                wait(0.1)
+            }
+        case .absent: break
+        default: throw ThermalForgeError.readFailed(SMCFanKey.forceTest)
         }
-
-        throw ThermalForgeError.unlockFailed(
-            "Timed out setting fan \(index) to manual mode. Run with sudo."
-        )
+        for index in lockedIndices {
+            guard let key = modeKey(index) else { throw ThermalForgeError.readFailed("fan mode") }
+            while true {
+                try checkCancellation(cancellation, deadline: deadline)
+                if smc.writeKey(key, bytes: [1]), readMode(index) == "manual" { break }
+                wait(0.1)
+            }
+        }
     }
 
     // MARK: - Set Speed
 
     private func validate(rpm: Float, limits: (min: Float, max: Float)) throws {
+        guard rpm.isFinite, limits.min.isFinite, limits.max.isFinite,
+              limits.min >= 0, limits.max > 0 else { throw ThermalForgeError.readFailed("fan RPM limits") }
         if limits.min > 0, rpm < limits.min {
             throw ThermalForgeError.rpmOutOfRange(
                 requested: rpm,
@@ -246,48 +269,57 @@ public final class FanControl {
         guard smc.writeKey(targetKey, bytes: floatToSMCBytes(rpm)) else {
             throw ThermalForgeError.writeFailed(targetKey)
         }
+        let acknowledged = smc.readKey(targetKey)
+        guard acknowledged.success, acknowledged.size == 4, acknowledged.bytes.count == 4,
+              abs(smcBytesToFloat(acknowledged.bytes, size: acknowledged.size) - rpm) <= 1 else {
+            throw ThermalForgeError.writeFailed("\(targetKey) acknowledgement")
+        }
     }
 
     /// Set all fans to maximum RPM
-    public func setMax() throws {
+    public func setMax(cancellation: CancellationToken = CancellationToken()) throws {
         let count = try fanCount()
-        try unlockFans(count: count)
-
-        for i in 0..<count {
-            let info = try fanInfo(i)
-            let maxRPM = info.maxRPM > 0 ? info.maxRPM : 7826
-
-            try writeTarget(fan: i, rpm: maxRPM)
-            log("Set fan \(i) to max (\(Int(maxRPM)) RPM)")
+        guard count > 0 else { throw ThermalForgeError.unlockFailed("No controllable fans") }
+        var maxima: [Float] = []
+        for index in 0..<count {
+            let limits = try verifiedFanLimits(index)
+            try validate(rpm: limits.max, limits: limits)
+            maxima.append(limits.max)
+        }
+        try unlockFans(Array(0..<count), cancellation: cancellation)
+        for index in 0..<count {
+            guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
+            try writeTarget(fan: index, rpm: maxima[index])
+            log("Set fan \(index) to max (\(Int(maxima[index])) RPM)")
         }
     }
 
     /// Set a single fan to a specific RPM
-    public func setSpeed(fan index: Int, rpm: Float) throws {
-        let info = try fanInfo(index)
+    public func setSpeed(fan index: Int, rpm: Float, cancellation: CancellationToken = CancellationToken()) throws {
+        guard index >= 0, index < (try fanCount()) else { throw ThermalForgeError.readFailed("fan index") }
+        try validate(rpm: rpm, limits: verifiedFanLimits(index))
 
-        try validate(rpm: rpm, limits: (info.minRPM, info.maxRPM))
+        try unlockFans([index], cancellation: cancellation)
 
-        if info.mode != "manual" {
-            try unlockFans([index])
-        }
-
+        guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
         try writeTarget(fan: index, rpm: rpm)
         log("Set fan \(index) to \(Int(rpm)) RPM")
     }
 
     /// Set all fans to a specific RPM
-    public func setAllFans(rpm: Float) throws {
+    public func setAllFans(rpm: Float, cancellation: CancellationToken = CancellationToken()) throws {
         let count = try fanCount()
+        guard count > 0 else { throw ThermalForgeError.unlockFailed("No controllable fans") }
 
         for index in 0..<count {
-            let limits = fanLimits(index)
+            let limits = try verifiedFanLimits(index)
             try validate(rpm: rpm, limits: limits)
         }
 
-        try unlockFans(count: count)
+        try unlockFans(Array(0..<count), cancellation: cancellation)
 
         for i in 0..<count {
+            guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
             try writeTarget(fan: i, rpm: rpm)
             log("Set fan \(i) to \(Int(rpm)) RPM")
         }
@@ -295,23 +327,58 @@ public final class FanControl {
 
     // MARK: - Reset
 
-    /// Reset all fans to Apple defaults (auto mode, thermalmonitord resumes)
+    /// Continue through every fan and Ftst even after partial failure. A stale
+    /// target is cleared only after its fan is observed outside manual mode.
+    public func restoreApple() -> RestorationResult {
+        var errors: [String] = []
+        var indices: [Int] = []
+        do { indices = Array(0..<(try fanCount())) }
+        catch { errors.append(String(describing: error)) }
+        for index in indices {
+            guard let key = modeKey(index) else {
+                errors.append("Fan \(index) mode unreadable")
+                continue
+            }
+            if !smc.writeKey(key, bytes: [0]) { errors.append("Failed restoring \(key)") }
+        }
+        // This is independent of fan enumeration and individual mode failures.
+        let ftst = smc.keyAvailability(SMCFanKey.forceTest)
+        switch ftst {
+        case .present(size: 1):
+            if !smc.writeKey(SMCFanKey.forceTest, bytes: [0]) { errors.append("Failed clearing Ftst") }
+        case .absent: break
+        default: errors.append("Ftst capability unreadable")
+        }
+        for index in indices {
+            let mode = readMode(index)
+            guard mode == "auto" || mode == "system" else {
+                errors.append("Fan \(index) restoration unverified (\(mode))")
+                continue
+            }
+            let key = SMCFanKey.key(SMCFanKey.target, fan: index)
+            if !smc.writeKey(key, bytes: floatToSMCBytes(0)) { errors.append("Failed clearing \(key)") }
+        }
+        // Clearing targets is itself a firmware write. Verify final ownership
+        // again afterwards rather than relying on the prerequisite read.
+        for index in indices {
+            let mode = readMode(index)
+            if mode != "auto" && mode != "system" {
+                errors.append("Fan \(index) final ownership unverified (\(mode))")
+            }
+        }
+        if case .present = ftst {
+            let result = smc.readKey(SMCFanKey.forceTest)
+            if !result.success || result.size != 1 || result.bytes != [0] {
+                errors.append("Ftst restoration unverified")
+            }
+        }
+        return RestorationResult(verified: errors.isEmpty, errors: errors)
+    }
+
     public func resetAuto() throws {
-        let count = try fanCount()
-
-        for i in 0..<count {
-            let modeKey = SMCFanKey.key(modeKeyTemplate, fan: i)
-            _ = smc.writeKey(modeKey, bytes: [0])
-
-            let targetKey = SMCFanKey.key(SMCFanKey.target, fan: i)
-            _ = smc.writeKey(targetKey, bytes: floatToSMCBytes(0))
-        }
-
-        // Reset Ftst if it exists — thermalmonitord reclaims control
-        if hasFtst {
-            _ = smc.writeKey(SMCFanKey.forceTest, bytes: [0])
-        }
-        log("Reset to Apple defaults")
+        let result = restoreApple()
+        guard result.verified else { throw ThermalForgeError.restorationFailed(result.errors) }
+        log("Verified Apple fan ownership")
     }
 
     // MARK: - Status
@@ -452,28 +519,43 @@ public final class FanControl {
 
     /// Returns detected hardware capabilities
     public var hardwareInfo: String {
-        let ftst = hasFtst ? "yes (M1-M4 path)" : "no (M5+ direct mode)"
-        let modeKey = modeKeyTemplate == SMCFanKey.modeLower ? "F%dmd (lowercase)" : "F%dMd (uppercase)"
-        return "Ftst unlock: \(ftst), Mode key: \(modeKey)"
+        let capability: String
+        switch smc.keyAvailability(SMCFanKey.forceTest) {
+        case .present: capability = "present"
+        case .absent: capability = "absent (direct mode)"
+        case .unknown: capability = "unknown"
+        }
+        return "Ftst unlock: \(capability), Mode key: \(modeKey(0) ?? "unknown")"
     }
 
     // MARK: - Private Helpers
 
     private func readFanFloat(_ fan: Int, template: String) -> Float {
-        let key = SMCFanKey.key(template, fan: fan)
-        let result = smc.readKey(key)
-        guard result.success else { return 0 }
-        return smcBytesToFloat(result.bytes, size: result.size)
+        readFanFloatValue(fan, template: template) ?? 0
     }
 
-    /// True if the fan is currently in manual mode (mode key == 1).
-    private func isManualMode(_ index: Int) -> Bool {
-        let modeKey = SMCFanKey.key(modeKeyTemplate, fan: index)
-        let result = smc.readKey(modeKey)
-        return result.success && !result.bytes.isEmpty && result.bytes[0] == 1
+    private func readFanFloatValue(_ fan: Int, template: String) -> Float? {
+        let key = SMCFanKey.key(template, fan: fan)
+        let result = smc.readKey(key)
+        guard result.success, result.size == 4, result.bytes.count == 4 else { return nil }
+        let value = smcBytesToFloat(result.bytes, size: result.size)
+        return value.isFinite && value >= 0 ? value : nil
     }
 
     private func log(_ message: String) {
         TFLogger.shared.fan(message)
+    }
+}
+
+// Only the backend coordinator calls this actuator during normal operation.
+// Recovery uses restoreApple only after fencing the backend process.
+extension FanControl: BackendActuating {
+    public func apply(_ command: FanCommand, cancellation: CancellationToken) throws {
+        guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
+        switch command {
+        case .setMax: try setMax(cancellation: cancellation)
+        case .setRPM(let rpm): try setAllFans(rpm: rpm, cancellation: cancellation)
+        case .resetAuto: try resetAuto()
+        }
     }
 }

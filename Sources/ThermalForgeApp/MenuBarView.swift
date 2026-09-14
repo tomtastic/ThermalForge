@@ -53,6 +53,21 @@ struct MenuBarView: View {
 
             Divider()
 
+            Text(appState.ownershipDescription)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+            Text(appState.sensorDescription)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+            if let message = appState.calibrationMessage, !message.isEmpty {
+                Text(message).font(.caption).padding(.horizontal, 12)
+            }
+            if let error = appState.lastError {
+                Text(error).font(.caption2).foregroundStyle(.red).padding(.horizontal, 12)
+            }
+
             // Fan speeds
             if let status = appState.latestStatus {
                 let temperatures = TemperatureSummary(status.temperatures)
@@ -91,12 +106,12 @@ struct MenuBarView: View {
             Picker("Profile", selection: Binding(
                 get: { appState.activeProfile.id },
                 set: { id in
-                    if let profile = FanProfile.builtIn.first(where: { $0.id == id }) {
+                    if let profile = appState.profiles.first(where: { $0.id == id }) {
                         appState.selectProfile(profile)
                     }
                 }
             )) {
-                ForEach(FanProfile.builtIn) { profile in
+                ForEach(appState.profiles) { profile in
                     HStack {
                         Text(profile.name)
                         Spacer()

@@ -5,6 +5,7 @@ protocol CalibrationWorkload: AnyObject {
     func start(intensity: Float) -> Bool
 
     @discardableResult
+    /// Returns true only when termination is confirmed (including already stopped).
     func stop() -> Bool
 }
 
@@ -12,6 +13,7 @@ final class CalibrationWorkloadGroup: CalibrationWorkload {
     private let workloads: [any CalibrationWorkload]
     private let lock = NSLock()
     private var running = false
+    private var shutdownIncomplete = false
 
     init(workloads: [any CalibrationWorkload]) {
         self.workloads = workloads
@@ -20,7 +22,7 @@ final class CalibrationWorkloadGroup: CalibrationWorkload {
     @discardableResult
     func start(intensity: Float) -> Bool {
         lock.lock()
-        guard !running else {
+        guard !running, !shutdownIncomplete else {
             lock.unlock()
             return false
         }
@@ -36,14 +38,18 @@ final class CalibrationWorkloadGroup: CalibrationWorkload {
     @discardableResult
     func stop() -> Bool {
         lock.lock()
-        let wasRunning = running
+        let needsStop = running || shutdownIncomplete
         running = false
         lock.unlock()
-        guard wasRunning else { return false }
+        guard needsStop else { return true }
 
+        var stopped = true
         for workload in workloads.reversed() {
-            workload.stop()
+            if !workload.stop() { stopped = false }
         }
-        return true
+        lock.lock()
+        shutdownIncomplete = !stopped
+        lock.unlock()
+        return stopped
     }
 }

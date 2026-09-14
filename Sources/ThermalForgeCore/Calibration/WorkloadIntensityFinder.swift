@@ -94,7 +94,7 @@ final class WorkloadIntensityFinder {
         log("  Baseline: \(format(baselineTemperature, decimals: 1))°C")
 
         // Maximum cooling is retained for every probe and its cooldown.
-        try? setMaximumFans()
+        try setMaximumFans()
 
         var probe = configuration.initialIntensity
         var safeIntensity: Float?
@@ -160,6 +160,14 @@ final class WorkloadIntensityFinder {
         intensity: Float,
         baselineTemperature: Float
     ) throws -> CheckResult {
+        let result: Result<CheckResult, Error>
+        do { result = .success(try runCheck(intensity: intensity, baselineTemperature: baselineTemperature)) }
+        catch { result = .failure(error) }
+        guard workload.stop() else { throw CalibrationError.workloadShutdownFailed }
+        return try result.get()
+    }
+
+    private func runCheck(intensity: Float, baselineTemperature: Float) throws -> CheckResult {
         try waitForTemperatureReturn(to: baselineTemperature)
         let actualStartTemperature = temperature() ?? 0
 
@@ -172,7 +180,6 @@ final class WorkloadIntensityFinder {
         if let warning = workloadWarning() {
             log(warning)
         }
-        defer { workload.stop() }
 
         var readings: [(time: TimeInterval, temperature: Float)] = []
         let startTime = now()

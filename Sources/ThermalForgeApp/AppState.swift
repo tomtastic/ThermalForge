@@ -1,10 +1,3 @@
-//
-//  AppState.swift
-//  ThermalForge
-//
-//  Observable bridge between ThermalMonitor and SwiftUI.
-//
-
 import Observation
 import ServiceManagement
 import SwiftUI
@@ -13,30 +6,34 @@ import SwiftUI
 @MainActor
 @Observable
 final class AppState {
+    static let client = BackendClient(kind: .gui)
+    private static weak var current: AppState?
     var latestStatus: ThermalStatus?
     var activeProfile: FanProfile = .silent
+    var profiles: [FanProfile] = FanProfile.builtIn
     var monitorState: MonitorState = .idle
     var calibrationState: CalibrationState = .none
+    var calibrationMessage: String?
     var maxTemp: Float?
-
-    var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
+    var daemonAvailable = false
+    var ownershipDescription = "Fan ownership unknown"
+    var sensorDescription = "Sensors unavailable"
+    var lastError: String?
+    var useFahrenheit = UserDefaults.standard.bool(forKey: "useFahrenheit") {
         didSet { UserDefaults.standard.set(useFahrenheit, forKey: "useFahrenheit") }
     }
-
-    var launchAtLogin: Bool = false {
-        didSet { updateLoginItem() }
+    var launchAtLogin = false { didSet { updateLoginItem() } }
+    var rulesEnabled = true {
+        didSet {
+            guard !applyingConfiguration else { return }
+            let enabled = rulesEnabled
+            editConfiguration { $0.rulesEnabled = enabled }
+        }
     }
+    var rules: [ThermalRule] = []
     var quickRuleTriggerTempC: Double {
         get { Double(quickTemperatureRule?.condition.valueCelsius ?? 55) }
-        set {
-            updateQuickTemperatureRule {
-                $0.condition = ThermalRuleCondition(
-                    metric: .maxTemp,
-                    comparator: .greaterThanOrEqual,
-                    valueCelsius: Float(newValue)
-                )
-            }
-        }
+        set { updateQuickTemperatureRule { $0.condition = ThermalRuleCondition(metric: .maxTemp, comparator: .greaterThanOrEqual, valueCelsius: Float(newValue)) } }
     }
     var quickRuleReleaseTempC: Double {
         get { Double(quickTemperatureRule?.untilTempBelowC ?? 50) }
@@ -49,147 +46,167 @@ final class AppState {
         }
         set { updateQuickTemperatureRule { $0.action = .setFanPercent(Float(newValue / 100)) } }
     }
-
-    var hasQuickTemperatureRule: Bool {
-        quickTemperatureRule != nil
-    }
-
-    var rulesEnabled: Bool = UserDefaults.standard.object(forKey: "rulesEnabled") as? Bool ?? true {
-        didSet {
-            UserDefaults.standard.set(rulesEnabled, forKey: "rulesEnabled")
-            pushRulesToMonitor()
-        }
-    }
-
-    var rules: [ThermalRule] = [] {
-        didSet {
-            pushRulesToMonitor()
-        }
-    }
-
-    @ObservationIgnored private var monitor: ThermalMonitor?
-    @ObservationIgnored private let executor = PrivilegedExecutor()
-    @ObservationIgnored private let daemonQueue = DispatchQueue(label: "com.thermalforge.app.daemon", qos: .utility)
-    @ObservationIgnored private var heartbeatTimer: Timer?
-    /// Whether the dropdown panel is currently shown. The panel's hosting view
-    /// stays alive while hidden and re-renders on any observed change, so we
-    /// only feed it the per-tick `latestStatus` while it's actually visible.
-    /// Whether the privileged daemon is running. Without it, fan commands fail.
-    var daemonAvailable: Bool = ThermalForgeDaemon.isRunning
+    var hasQuickTemperatureRule: Bool { quickTemperatureRule != nil }
+    @ObservationIgnored private var pollingTask: Task<Void, Never>?
+    @ObservationIgnored private var configuration = BackendConfiguration()
+    @ObservationIgnored private var applyingConfiguration = false
     @ObservationIgnored private var menuOpen = false
     @ObservationIgnored private var lastStatus: ThermalStatus?
-    @ObservationIgnored private var daemonCheckTimer: Timer?
 
     init() {
-        launchAtLogin = (SMAppService.mainApp.status == .enabled)
-
-        // Load all available profiles (built-in + custom)
-        let allProfiles = FanProfile.loadAll()
-
-        // Attempt to restore the last used profile ID from UserDefaults
-        let lastProfileID = UserDefaults.standard.string(forKey: "lastProfileID")
-
-        // Find the profile in the loaded list, or fallback to .silent if not found/invalid
-        if let lastID = lastProfileID, let savedProfile = allProfiles.first(where: { $0.id == lastID }) {
-            activeProfile = savedProfile
-            TFLogger.shared.info("Restored profile: \(savedProfile.name)")
-        } else {
-            activeProfile = .silent
-            if let lastProfileID {
-                TFLogger.shared.info("Stored profile ID '\(lastProfileID)' was invalid. Falling back to .silent")
-            }
-        }
-
-        runDaemonTask(
-            action: { [executor] in try executor.execute(.resetAuto) },
-            successMessage: "App launched — fans reset to auto",
-            failureContext: "Startup reset failed"
-        )
-
-        // Clean expired logs.
+        launchAtLogin = SMAppService.mainApp.status == .enabled
+        let legacy = LegacyConfigurationReader.read()
         ThermalLogger.cleanExpired()
-
-        do {
-            try LegacyTemperatureRuleMigration.migrate()
-        } catch {
-            TFLogger.shared.error("Legacy temperature-rule migration failed: \(error)")
+        pollingTask = Task { [weak self] in
+            var initialized = false
+            var startupProfile: String?
+            while !Task.isCancelled {
+                do {
+                    var importError: String?
+                    if !initialized {
+                        do {
+                            let configuration = try await Self.client.importLegacy(legacy)
+                            self?.applyConfiguration(configuration)
+                            startupProfile = configuration.selectedProfileID
+                            initialized = true
+                        } catch let error as DaemonError {
+                            // A busy calibration can postpone migration while status
+                            // remains available to this observing application.
+                            if case .commandFailed = error { importError = String(describing: error) }
+                            else { throw error }
+                        }
+                    }
+                    if Task.isCancelled { break }
+                    var state = try await Self.client.maintain()
+                    if Task.isCancelled { break }
+                    if let profile = startupProfile {
+                        // Wait for startup reconciliation; joining another owner or an
+                        // explicit Apple restoration leaves the app observing.
+                        if state.owner != nil || state.lastSessionEndReason == .explicitAuto || state.lastSessionEndReason == .takeover {
+                            startupProfile = nil
+                        } else if state.restoration == .verified {
+                            startupProfile = nil
+                            state = try await Self.client.acquire(.profile(profile))
+                        }
+                    }
+                    self?.publish(state)
+                    if let importError { self?.lastError = importError }
+                    if self?.configuration.revision != state.configurationRevision {
+                        let configuration = try await Self.client.configuration()
+                        self?.applyConfiguration(configuration)
+                    }
+                } catch {
+                    self?.daemonAvailable = false
+                    self?.ownershipDescription = "Fan ownership unknown"
+                    self?.monitorState = .idle
+                    self?.lastError = String(describing: error)
+                    let status = await Self.readLocalSensors()
+                    self?.publishSensors(status, description: status == nil ? "Sensors unavailable" : "Live local sensors · fan ownership unknown")
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
         }
-        rules = RulePersistence.load()
-
-        startMonitoring()
-        // A restored fan-controlling profile can issue its first command without
-        // passing through selectProfile(). Start its heartbeat immediately so
-        // the daemon watchdog does not mistake the live app for an abandoned
-        // controller and reset the fans every ten seconds.
-        syncHeartbeat(for: activeProfile)
-
-        // Periodically check if daemon became available or went away
-        startDaemonCheck()
+        Self.current = self
     }
 
-    deinit {
-        heartbeatTimer?.invalidate()
-        daemonCheckTimer?.invalidate()
+    deinit { pollingTask?.cancel() }
+
+    static func releaseForTermination() async throws {
+        current?.pollingTask?.cancel()
+        _ = try await client.release()
     }
 
-    // MARK: - Heartbeat
-
-    /// The daemon watchdog ignores heartbeats unless a manual fan command was
-    /// sent, so hands-off (Silent) needs no heartbeat — running it there is a
-    /// pure 5s wake on both processes for nothing. Run it only for fan-
-    /// controlling profiles.
-    private func syncHeartbeat(for profile: FanProfile) {
-        if profile.requiresDaemonHeartbeat {
-            startHeartbeat()
-        } else {
-            stopHeartbeat()
+    private func publish(_ state: BackendSnapshot) {
+        daemonAvailable = true
+        lastError = state.restorationErrors.isEmpty ? nil : state.restorationErrors.joined(separator: "; ")
+        if let profile = profiles.first(where: { $0.id == state.activeProfileID }) { activeProfile = profile }
+        switch state.acknowledgedControl {
+        case .unknown: ownershipDescription = "Fan ownership unknown"; monitorState = .idle
+        case .apple: ownershipDescription = "Apple fan control"; monitorState = .idle
+        case let .manualRPM(rpm): ownershipDescription = "Backend control · \(rpm) RPM acknowledged"; monitorState = .active(profileName: activeProfile.name)
+        case .maximum: ownershipDescription = "Backend control · maximum acknowledged"; monitorState = .active(profileName: activeProfile.name)
         }
+        if state.restoration == .pending { ownershipDescription = "Restoring Apple control…" }
+        if state.restoration == .failed { ownershipDescription = "Apple restoration unverified" }
+        if state.ownerKind == .cli { ownershipDescription += " · CLI session (observing)" }
+        calibrationState = state.calibrationLidClosed.map { CalibrationState(active: true, lidClosed: $0) } ?? .none
+        calibrationMessage = state.calibration?.message
+        let fresh = state.sampledAt.map { BackendTiming.monotonicNow - $0 < BackendTiming.clientLease } ?? false
+        publishSensors(fresh ? state.sensors : nil, description: fresh ? "Live backend sensors" : "Backend sensors stale or unavailable")
     }
 
-    private func startHeartbeat() {
-        guard heartbeatTimer == nil else { return }
-        let timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-            // Off the main thread — a blocking daemon round-trip must never stall the UI.
+    private func publishSensors(_ status: ThermalStatus?, description: String) {
+        lastStatus = status
+        sensorDescription = description
+        if menuOpen { latestStatus = status }
+        maxTemp = status.flatMap { TemperatureSummary($0.temperatures).controlPeak?.rounded() }
+    }
+
+    private static func readLocalSensors() async -> ThermalStatus? {
+        await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                _ = try? DaemonClient().send("heartbeat")
-            }
-        }
-        timer.tolerance = 1.0 // let the OS coalesce the wakeup
-        heartbeatTimer = timer
-    }
-
-    private func stopHeartbeat() {
-        heartbeatTimer?.invalidate()
-        heartbeatTimer = nil
-    }
-
-    // MARK: - Daemon Availability
-
-    private func startDaemonCheck() {
-        // Check immediately, then poll every 30s to detect if daemon starts/stops
-        checkDaemonAvailability()
-        let timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
-            Task { @MainActor in
-                self.checkDaemonAvailability()
-            }
-        }
-        timer.tolerance = 5
-        daemonCheckTimer = timer
-    }
-
-    private func checkDaemonAvailability() {
-        let wasAvailable = daemonAvailable
-        daemonAvailable = ThermalForgeDaemon.isRunning
-        if daemonAvailable != wasAvailable {
-            if daemonAvailable {
-                TFLogger.shared.info("Daemon became available")
-            } else {
-                TFLogger.shared.info("Daemon not running — fan control unavailable")
+                continuation.resume(returning: try? FanControl().status())
             }
         }
     }
 
-    // MARK: - Install Daemon
+    private func applyConfiguration(_ value: BackendConfiguration) {
+        applyingConfiguration = true
+        configuration = value
+        profiles = value.profiles
+        rules = value.rules
+        rulesEnabled = value.rulesEnabled
+        if let selected = profiles.first(where: { $0.id == value.selectedProfileID }) { activeProfile = selected }
+        applyingConfiguration = false
+    }
+
+    private func editConfiguration(_ mutation: @escaping (inout BackendConfiguration) -> Void) {
+        var proposed = configuration
+        mutation(&proposed)
+        Task {
+            do { applyConfiguration(try await Self.client.updateConfiguration(proposed)) }
+            catch {
+                lastError = String(describing: error)
+                if let latest = try? await Self.client.configuration() { applyConfiguration(latest) }
+            }
+        }
+    }
+
+    func menuDidOpen() { menuOpen = true; latestStatus = lastStatus }
+    func menuDidClose() { menuOpen = false }
+    func setSmart() { selectProfile(.smart) }
+    func resetAuto() {
+        Task {
+            do { publish(try await Self.client.restoreApple()) }
+            catch { lastError = String(describing: error) }
+        }
+    }
+    func selectProfile(_ profile: FanProfile) {
+        Task {
+            do {
+                publish(try await Self.client.acquire(.profile(profile.id)))
+                applyConfiguration(try await Self.client.configuration())
+            } catch { lastError = String(describing: error) }
+        }
+    }
+    func addQuickRule() { updateQuickTemperatureRule { $0.enabled = true } }
+    func removeRule(_ id: String) { editConfiguration { $0.rules.removeAll { $0.id == id } } }
+    func toggleRule(_ id: String, enabled: Bool) {
+        editConfiguration { value in
+            if let index = value.rules.firstIndex(where: { $0.id == id }) { value.rules[index].enabled = enabled }
+        }
+    }
+    func moveRule(_ id: String, toPriority priority: Int) {
+        editConfiguration { value in
+            if let index = value.rules.firstIndex(where: { $0.id == id }) { value.rules[index].priority = priority }
+        }
+    }
+    private func updateLoginItem() {
+        do {
+            if launchAtLogin { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+        } catch { lastError = String(describing: error) }
+    }
 
     func installDaemon() {
         // Locate the bundled CLI binary
@@ -221,7 +238,7 @@ final class AppState {
                 if task.terminationStatus == 0 {
                     TFLogger.shared.info("Daemon installed successfully")
                     DispatchQueue.main.async {
-                        self.checkDaemonAvailability()
+                        self.lastError = nil
                     }
                 } else {
                     let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
@@ -235,160 +252,6 @@ final class AppState {
             }
         }
     }
-
-    // MARK: - Monitoring
-
-    func startMonitoring() {
-        guard let fc = try? FanControl() else { return }
-
-        let ruleEngine = RuleEngine(rules: rules, isEnabled: rulesEnabled)
-        let controlService = ControlService(ruleEngine: ruleEngine)
-        let monitor = ThermalMonitor(fanControl: fc, profile: activeProfile, controlService: controlService)
-
-        monitor.onUpdate = { [weak self] status, profile, state, calState in
-            Task { @MainActor in
-                guard let self else { return }
-                self.lastStatus = status
-                // Publish-on-change, AND only while the panel is visible. The
-                // dropdown's hosting view stays alive when hidden and re-renders
-                // on every latestStatus change — so feeding it per-tick updates
-                // while closed drives full SwiftUI layout for nothing.
-                if self.menuOpen, self.latestStatus != status { self.latestStatus = status }
-                if self.activeProfile != profile { self.activeProfile = profile }
-                if self.monitorState != state { self.monitorState = state }
-                if self.calibrationState != calState { self.calibrationState = calState }
-                // Peak across all displayed CPU and GPU sensors for the menu bar.
-                // Quantize to whole degrees: the label shows an integer, so a
-                // jittering 0.1° fraction would otherwise force a relayout (CA
-                // transaction) every update for a number that never changes.
-                let newMax = TemperatureSummary(status.temperatures)
-                    .controlPeak
-                    .map { $0.rounded() }
-                if self.maxTemp != newMax { self.maxTemp = newMax }
-            }
-        }
-
-        // Fan commands run off the main thread, coalesced. Each daemon
-        // round-trip can exceed 0.5s; routing this
-        // through the main actor (as before) starved the UI run loop and froze
-        // the app on profile switch.
-        let executor = self.executor
-        monitor.onFanCommand = { command in
-            executor.submit(command)
-        }
-
-        monitor.start()
-        self.monitor = monitor
-    }
-
-    private func pushRulesToMonitor() {
-        monitor?.updateRules(rules, enabled: rulesEnabled)
-    }
-
-    private func applyRuleMutation(
-        context: String,
-        _ mutation: () throws -> [ThermalRule]?
-    ) {
-        do {
-            if let updatedRules = try mutation() {
-                rules = updatedRules
-            }
-        } catch {
-            TFLogger.shared.error("\(context): \(error)")
-        }
-    }
-
-    // MARK: - Menu visibility
-
-    /// Called when the dropdown panel becomes visible: resume live updates and
-    /// push the latest snapshot immediately so it isn't stale on open.
-    func menuDidOpen() {
-        menuOpen = true
-        if let status = lastStatus, latestStatus != status { latestStatus = status }
-    }
-
-    /// Called when the panel is dismissed: stop feeding the hidden hosting view.
-    func menuDidClose() {
-        menuOpen = false
-    }
-
-    // MARK: - Actions
-
-    func setSmart() {
-        selectProfile(.smart)
-    }
-
-    func resetAuto() {
-        selectProfile(.silent)
-        runDaemonTask(
-            action: { [executor] in try executor.execute(.resetAuto) },
-            successMessage: "Reset to Default (Silent (Apple Default))",
-            failureContext: "Reset to Default failed"
-        )
-    }
-
-    func selectProfile(_ profile: FanProfile) {
-        activeProfile = profile
-        monitor?.switchProfile(profile)
-        syncHeartbeat(for: profile)
-        TFLogger.shared.profile("Selected: \(profile.name)")
-
-        // Persist the selection to UserDefaults
-        UserDefaults.standard.set(profile.id, forKey: "lastProfileID")
-
-        // All profiles use proportional curves — tick() handles fan engagement.
-        if profile.curve.handsOff || profile.id == "silent" {
-            runDaemonTask(
-                action: { [executor] in try executor.execute(.resetAuto) },
-                failureContext: "Profile \(profile.name) failed"
-            )
-        }
-    }
-
-    func addQuickRule() {
-        updateQuickTemperatureRule { $0.enabled = true }
-    }
-
-    func removeRule(_ id: String) {
-        applyRuleMutation(context: "Failed to remove rule") {
-            let result = try RulePersistence.remove(id: id)
-            return result.removedCount > 0 ? result.rules : nil
-        }
-    }
-
-    func toggleRule(_ id: String, enabled: Bool) {
-        applyRuleMutation(context: "Failed to update rule") {
-            if enabled {
-                return try RulePersistence.enable(id: id)
-            }
-            return try RulePersistence.disable(id: id)
-        }
-    }
-
-    func moveRule(_ id: String, toPriority priority: Int) {
-        guard var rule = rules.first(where: { $0.id == id }) else { return }
-        rule.priority = priority
-        applyRuleMutation(context: "Failed to reprioritize rule") {
-            try RulePersistence.replace(rule)
-        }
-    }
-
-    // MARK: - Launch at Login
-
-    private func updateLoginItem() {
-        do {
-            if launchAtLogin {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
-        } catch {
-            TFLogger.shared.error("Launch at login toggle failed: \(error)")
-            launchAtLogin = !launchAtLogin
-        }
-    }
-
-    // MARK: - Quick IF/THEN Rule
 
     private var quickTemperatureRule: ThermalRule? {
         rules.first(where: { $0.id == LegacyTemperatureRuleMigration.ruleID })
@@ -415,11 +278,10 @@ final class AppState {
         rule.untilTempBelowC = release
         rule.name = "IF temp ≥ \(Int(trigger))°C THEN \(Int(fanPercent * 100))% until ≤ \(Int(release))°C"
 
-        applyRuleMutation(context: "Failed to update quick temperature rule") {
-            if let updatedRules = try RulePersistence.replace(rule) {
-                return updatedRules
-            }
-            return try RulePersistence.add(rule)
+        let updated = rule
+        editConfiguration { configuration in
+            configuration.rules.removeAll { $0.id == updated.id }
+            configuration.rules.append(updated)
         }
     }
 
@@ -437,22 +299,4 @@ final class AppState {
         untilTempBelowC: 50
     )
 
-    // MARK: - Daemon Calls
-
-    private func runDaemonTask(
-        action: @escaping () throws -> Void,
-        successMessage: String? = nil,
-        failureContext: String
-    ) {
-        daemonQueue.async {
-            do {
-                try action()
-                if let successMessage {
-                    TFLogger.shared.info(successMessage)
-                }
-            } catch {
-                TFLogger.shared.error("\(failureContext): \(error)")
-            }
-        }
-    }
 }

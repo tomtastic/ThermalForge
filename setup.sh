@@ -14,11 +14,6 @@ swift build -c release --quiet
 
 echo "Installing (requires admin password once)..."
 
-# Kill old app and reset fans
-pkill -x ThermalForgeApp 2>/dev/null || true
-sleep 1
-/usr/local/bin/thermalforge auto 2>/dev/null || true
-
 # Generate app icon if needed
 if [ ! -f ThermalForge.icns ]; then
     echo "Generating app icon..."
@@ -26,7 +21,7 @@ if [ ! -f ThermalForge.icns ]; then
     iconutil -c icns ThermalForge.iconset -o ThermalForge.icns
 fi
 
-# Install CLI and daemon (handles stopping old daemon if present)
+# Install protected backend and recovery (verifies legacy handback first)
 sudo xattr -cr .build/release/thermalforge
 sudo .build/release/thermalforge install
 

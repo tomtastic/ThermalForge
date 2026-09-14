@@ -62,8 +62,12 @@ public struct UninstallCleanup {
 
     private static let defaultSystemTargets = [
         URL(fileURLWithPath: ThermalForgeDaemon.plistPath),
-        URL(fileURLWithPath: ThermalForgeDaemon.installPath),
+        URL(fileURLWithPath: ThermalForgeDaemon.recoveryPlistPath),
+        URL(fileURLWithPath: ThermalForgeDaemon.installPath).deletingLastPathComponent(),
+        URL(fileURLWithPath: ThermalForgeDaemon.cliPath),
         URL(fileURLWithPath: ThermalForgeDaemon.socketPath),
+        URL(fileURLWithPath: RecoveryService.socketPath),
+        URL(fileURLWithPath: ThermalForgeDaemon.stateDirectory, isDirectory: true),
         URL(fileURLWithPath: "/Applications/ThermalForge.app", isDirectory: true),
     ]
 }
