@@ -42,7 +42,16 @@ public struct LaunchdCoordinator: LaunchdCoordinating {
             executableURL: executableURL,
             arguments: ["list", label]
         )
-        if result.terminationStatus == 1 {
+        let diagnostic = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+        // `list` reports absence either silently with status 1 (legacy behavior),
+        // or with status 113 and a service/domain diagnostic in the root context.
+        // Do not mistake permission errors or a different domain for safe absence.
+        let legacyAbsence = result.terminationStatus == 1
+            && diagnostic.isEmpty
+            && result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let systemAbsence = result.terminationStatus == 113
+            && diagnostic == "Could not find service \"\(label)\" in domain for system"
+        if legacyAbsence || systemAbsence {
             return .notLoaded
         }
         guard result.succeeded else {

@@ -26,6 +26,40 @@ struct SystemCoordinatorTests {
         #expect(absent == .notLoaded)
     }
 
+    @Test("Launchd status 113 recognizes missing system services", arguments: [
+        "com.thermalforge.daemon", "com.thermalforge.recovery",
+    ])
+    func missingSystemService(label: String) throws {
+        let runner = StubProcessRunner(results: [
+            .init(
+                standardOutput: "",
+                standardError: "Could not find service \"\(label)\" in domain for system\n",
+                terminationStatus: 113
+            ),
+        ])
+
+        let state = try LaunchdCoordinator(processRunner: runner).serviceState(label: label)
+
+        #expect(state == .notLoaded)
+        #expect(runner.commands.first?.arguments == ["list", label])
+    }
+
+    @Test("Absence exit codes do not hide errors or another service's state", arguments: [
+        ProcessResult(standardOutput: "", standardError: "Operation not permitted", terminationStatus: 1),
+        ProcessResult(standardOutput: "", standardError: "permission denied", terminationStatus: 113),
+        ProcessResult(standardOutput: "", standardError: "", terminationStatus: 113),
+        ProcessResult(standardOutput: "", standardError: "Could not find service \"com.thermalforge.recovery\" in domain for system", terminationStatus: 113),
+        ProcessResult(standardOutput: "", standardError: "Could not find service \"com.thermalforge.daemon\" in domain for gui/501", terminationStatus: 113),
+    ])
+    func absenceCodesWithUnexpectedErrors(result: ProcessResult) {
+        let runner = StubProcessRunner(results: [result])
+
+        #expect(throws: LaunchdCoordinatorError.self) {
+            try LaunchdCoordinator(processRunner: runner)
+                .serviceState(label: "com.thermalforge.daemon")
+        }
+    }
+
     @Test("Launchd list does not hide unexpected failures")
     func launchdListFailure() {
         let runner = StubProcessRunner(results: [
