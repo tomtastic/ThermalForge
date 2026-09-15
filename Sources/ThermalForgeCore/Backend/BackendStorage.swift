@@ -32,17 +32,15 @@ public final class BackendConfigurationStore: BackendConfigurationStoring {
     private func path(_ uid: UInt32) -> URL { directory.appendingPathComponent(String(uid)).appendingPathComponent("configuration.json") }
     private func read(_ uid: UInt32) throws -> Envelope {
         let url = path(uid)
-        guard FileManager.default.fileExists(atPath: url.path) else { return Envelope(configuration: BackendConfiguration()) }
-        let envelope = try JSONDecoder().decode(Envelope.self, from: Data(contentsOf: url))
+        guard let data = try BackendStateFile.read(url, root: directory) else { return Envelope(configuration: BackendConfiguration()) }
+        let envelope = try JSONDecoder().decode(Envelope.self, from: data)
         guard envelope.version == 2 else { throw BackendStorageError.invalid("Unsupported configuration storage version") }
         try Self.validate(envelope.configuration)
         return envelope
     }
     private func write(_ envelope: Envelope, uid: UInt32) throws {
         let url = path(uid)
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try JSONEncoder().encode(envelope).write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try BackendStateFile.write(JSONEncoder().encode(envelope), to: url, root: directory)
     }
     public func load(uid: UInt32) throws -> BackendConfiguration {
         lock.lock(); defer { lock.unlock() }
@@ -151,13 +149,12 @@ public final class BackendCalibrationStore: BackendCalibrationStoring {
     }
     private var path: URL { directory.appendingPathComponent("machine-calibration-v2.json") }
     private func write(_ envelope: Envelope) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try JSONEncoder().encode(envelope).write(to: path, options: .atomic)
+        try BackendStateFile.write(JSONEncoder().encode(envelope), to: path, root: directory)
     }
     private func read() throws -> Envelope {
         var envelope: Envelope
-        if FileManager.default.fileExists(atPath: path.path) {
-            envelope = try JSONDecoder().decode(Envelope.self, from: Data(contentsOf: path))
+        if let data = try BackendStateFile.read(path, root: directory) {
+            envelope = try JSONDecoder().decode(Envelope.self, from: data)
             guard envelope.version == 2 else { throw BackendStorageError.invalid("Unsupported calibration storage version") }
         } else { envelope = Envelope() }
         if !envelope.checkedRoot {

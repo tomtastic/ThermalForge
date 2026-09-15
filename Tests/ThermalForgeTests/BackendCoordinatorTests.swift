@@ -19,10 +19,11 @@ private final class BackendSensors: SensorProvider {
     var temperatures: [String: Float] = ["TC0P": 60, "TG0P": 55, "TA0P": 25]
     var entered: DispatchSemaphore?
     var unblock: DispatchSemaphore?
+    var fans: [ThermalStatus.FanStatus] = [.init(index: 0, actualRPM: 2000, targetRPM: 2000, minRPM: 2000, maxRPM: 6000, mode: "auto")]
     func status() throws -> ThermalStatus {
         entered?.signal()
         if let unblock { _ = unblock.wait(timeout: .now() + 5) }
-        return ThermalStatus(fans: [.init(index: 0, actualRPM: 2000, targetRPM: 2000, minRPM: 2000, maxRPM: 6000, mode: "auto")], temperatures: temperatures)
+        return ThermalStatus(fans: fans, temperatures: temperatures)
     }
 }
 private final class BackendActuator: BackendActuating {
@@ -76,6 +77,15 @@ private func backendCalibration(mode: String = "standard", lidClosed: Bool = fal
         stressType: "cpu", workloadIntensity: intensity, ambientTemperature: 24, lidClosed: lidClosed,
         measurements: [.init(targetTemp: 60, holdingRPMPercent: 0.4), .init(targetTemp: 80, holdingRPMPercent: 0.8)])
 }
+private final class SavingCalibrationStore: BackendCalibrationStoring {
+    let store: BackendCalibrationStore
+    let beforeSave: () -> Void
+    init(_ store: BackendCalibrationStore, beforeSave: @escaping () -> Void) { self.store = store; self.beforeSave = beforeSave }
+    func load(lidClosed: Bool) throws -> CalibrationData? { try store.load(lidClosed: lidClosed) }
+    func save(_ calibration: CalibrationData) throws { beforeSave(); try store.save(calibration) }
+    func importLegacy(_ calibrations: [CalibrationData]) throws { try store.importLegacy(calibrations) }
+    func reset() throws { try store.reset() }
+}
 private final class BackendHarness {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     let journal = BackendJournal()
@@ -89,14 +99,14 @@ private final class BackendHarness {
     let gui = AuthenticatedPeer(uid: 501, pid: 101)
     let cli = AuthenticatedPeer(uid: 501, pid: 102)
     let observer = AuthenticatedPeer(uid: 501, pid: 103)
-    init(factory: ((BackendCalibrationContext, BackendJournal) throws -> any BackendCalibrationRunning)? = nil) {
+    init(beforeSave: (() -> Void)? = nil, factory: ((BackendCalibrationContext, BackendJournal) throws -> any BackendCalibrationRunning)? = nil) {
         actuator = BackendActuator(journal)
         recovery = BackendProtection(journal)
         configuration = BackendConfigurationStore(directory: directory.appendingPathComponent("users"))
         calibration = BackendCalibrationStore(directory: directory.appendingPathComponent("machine"), legacyRoot: nil)
-        let clock = clock, journal = journal
+        let clock = clock, journal = journal, calibration = calibration
         backend = BackendCoordinator(sensorProvider: sensors, actuator: actuator, recovery: recovery,
-            configurationStore: configuration, calibrationStore: calibration,
+            configurationStore: configuration, calibrationStore: beforeSave.map { SavingCalibrationStore(calibration, beforeSave: $0) } ?? calibration as any BackendCalibrationStoring,
             lidStateProvider: FixedCalibrationLid(isLidClosed: false), generation: "generation", now: { clock.now },
             calibrationFactory: factory.map { factory in { try factory($0, journal) } },
             configurationUID: { $0.uid }, onFatalFailure: { _ in journal.append("fatal") })
@@ -119,6 +129,121 @@ private final class BackendHarness {
 
 @Suite("Central backend coordination")
 struct BackendCoordinatorTests {
+    @Test("Oversized session IDs cannot inflate durable ownership snapshots")
+    func boundedSessionIdentity() {
+        let h = BackendHarness(); defer { h.close() }
+        let response = h.request(.acquire, session: .init(id: String(repeating: "x", count: 129), generation: "generation"), kind: .cli, intent: .maximum)
+        #expect(response.error?.code == "invalidSession")
+        #expect(h.snapshot.owner == nil)
+    }
+    @Test("A missing GPU reading cannot protect or run GPU calibration using CPU temperature")
+    func missingCalibrationSensorFamily() throws {
+        let h = BackendHarness(factory: { BackendJob($0, journal: $1, waitForCancellation: false) })
+        defer { h.close() }
+        h.sensors.temperatures = ["TC0P": 60]
+        #expect(h.request(.startCalibration, session: .init(generation: "generation"), kind: .cli,
+                          parameters: .init(stressType: "gpu")).ok)
+        h.backend.drainWork()
+        #expect(!h.journal.values.contains("workload-start"))
+        #expect(!h.journal.values.contains("authorize"))
+        #expect(try h.calibration.load(lidClosed: false) == nil)
+        #expect(h.snapshot.restoration == .verified)
+    }
+    @Test("Missing idle sensors retain the error without repeatedly writing already-verified Apple modes")
+    func idleSensorFailureAvoidsRepeatedWrites() {
+        let h = BackendHarness(); defer { h.close() }
+        h.sensors.temperatures = [:]
+        let initial = h.journal.values.filter { $0 == "restore" }.count
+        h.tick(); h.tick()
+        #expect(h.journal.values.filter { $0 == "restore" }.count == initial)
+        #expect(!h.snapshot.restorationErrors.isEmpty)
+    }
+    @Test("Steady manual control skips unchanged writes but repairs target drift")
+    func steadyManualControl() {
+        let h = BackendHarness(); defer { h.close() }
+        #expect(h.acquire(intent: .rpm(3000)).ok)
+        h.backend.drainWork()
+        let initial = h.journal.values.filter { $0.hasPrefix("apply:") }.count
+        h.sensors.fans = [.init(index: 0, actualRPM: 2500, targetRPM: 3000, minRPM: 2000, maxRPM: 6000, mode: "manual")]
+        h.tick(); h.tick()
+        #expect(h.journal.values.filter { $0.hasPrefix("apply:") }.count == initial)
+        h.sensors.fans = [.init(index: 0, actualRPM: 2500, targetRPM: 2000, minRPM: 2000, maxRPM: 6000, mode: "manual")]
+        h.tick()
+        #expect(h.journal.values.filter { $0.hasPrefix("apply:") }.count == initial + 1)
+    }
+
+    @Test("Shared RPM is clamped to the intersection of every fan's limits")
+    func unequalFanLimits() {
+        let h = BackendHarness(); defer { h.close() }
+        h.sensors.fans = [
+            .init(index: 0, actualRPM: 2000, targetRPM: 2000, minRPM: 2000, maxRPM: 6000, mode: "auto"),
+            .init(index: 1, actualRPM: 2500, targetRPM: 2500, minRPM: 2500, maxRPM: 5000, mode: "auto")]
+        #expect(h.acquire(intent: .rpm(1000)).ok)
+        h.backend.drainWork()
+        #expect(h.snapshot.acknowledgedControl == .manualRPM(2500))
+    }
+
+    @Test("Saving has a defined cancellation cutoff and never publishes success before disk completion")
+    func calibrationSaveBoundary() throws {
+        let entered = DispatchSemaphore(value: 0), unblock = DispatchSemaphore(value: 0)
+        let h = BackendHarness(beforeSave: { entered.signal(); _ = unblock.wait(timeout: .now() + 3) }, factory: {
+            BackendJob($0, journal: $1, waitForCancellation: false)
+        })
+        defer { h.close() }
+        let session = ControlSession(generation: "generation")
+        #expect(h.request(.startCalibration, session: session, kind: .cli, parameters: .init()).ok)
+        #expect(entered.wait(timeout: .now() + 2) == .success)
+        #expect(h.snapshot.calibration?.phase == .saving)
+        #expect(h.snapshot.acknowledgedControl == .apple)
+        #expect(h.request(.cancelCalibration, session: session).error?.code == "alreadyFinishing")
+        #expect(h.request(.release, session: session).ok)
+        #expect(h.snapshot.calibration?.phase == .saving)
+        unblock.signal(); h.backend.drainWork()
+        #expect(h.snapshot.calibration?.phase == .completed)
+        #expect(try h.calibration.load(lidClosed: false) != nil)
+    }
+
+    @Test("Replacing an active curve with hands-off restores its previous manual target")
+    func policyReplacementRestoresOwnership() throws {
+        let h = BackendHarness(); defer { h.close() }
+        var config = try h.configuration.load(uid: h.gui.uid)
+        config.profiles.append(FanProfile(id: "custom", name: "Custom", curve: .init(alwaysOn: true)))
+        _ = try h.configuration.update(config, uid: h.gui.uid)
+        #expect(h.acquire(intent: .profile("custom")).ok)
+        h.backend.drainWork()
+        #expect(h.snapshot.acknowledgedControl != .apple)
+        config = try h.configuration.load(uid: h.gui.uid)
+        config.profiles[config.profiles.firstIndex { $0.id == "custom" }!] = FanProfile(id: "custom", name: "Custom", curve: .init(handsOff: true))
+        #expect(h.backend.handle(.init(operation: .updateConfiguration, configuration: config), peer: h.gui).ok)
+        h.backend.drainWork()
+        #expect(h.snapshot.acknowledgedControl == .apple)
+        #expect(h.snapshot.owner != nil)
+    }
+
+    @Test("An Apple-control rule retains its latch through handback and metadata edits")
+    func appleRuleKeepsLatch() throws {
+        let h = BackendHarness(); defer { h.close() }
+        var config = try h.configuration.load(uid: h.gui.uid)
+        config.profiles.append(FanProfile(id: "custom", name: "Custom", curve: .init(alwaysOn: true)))
+        config.rulesEnabled = true
+        config.rules = [.init(name: "Apple until cool", condition: .init(metric: .maxTemp, comparator: .greaterThanOrEqual, valueCelsius: 70), action: .resetAuto, untilTempBelowC: 50)]
+        _ = try h.configuration.update(config, uid: h.gui.uid)
+        h.sensors.temperatures = ["TC0P": 75]
+        #expect(h.acquire(intent: .profile("custom")).ok)
+        h.backend.drainWork()
+        #expect(h.snapshot.acknowledgedControl == .apple)
+        h.sensors.temperatures = ["TC0P": 60]
+        config = try h.configuration.load(uid: h.gui.uid)
+        #expect(h.backend.handle(.init(operation: .updateConfiguration, configuration: config), peer: h.gui).ok)
+        h.backend.drainWork()
+        h.tick()
+        #expect(h.snapshot.acknowledgedControl == .apple)
+        #expect(!h.journal.values.contains("authorize"))
+        h.sensors.temperatures = ["TC0P": 45]
+        h.tick()
+        #expect(h.snapshot.acknowledgedControl != .apple)
+    }
+
     @Test("Delayed acquire cannot reuse a session ended by explicit Apple restoration")
     func delayedAcquisitionCannotReviveEndedSession() throws {
         let h = BackendHarness()

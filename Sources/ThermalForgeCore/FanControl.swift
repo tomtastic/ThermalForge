@@ -81,6 +81,8 @@ public final class FanControl {
     private var cachedFanCount: Int?
     private var cachedLimits: [Int: (min: Float, max: Float)] = [:]
     private var liveTempKeys: [LiveTempKey]?
+    private var pendingTempKeys = FanControl.tempCandidates
+    private var nextTemperatureProbe: TimeInterval = 0
 
     /// Creates a FanControl backed by the real SMC. Throws if no SMC is present.
     public convenience init() throws {
@@ -216,11 +218,13 @@ public final class FanControl {
             }
             if mode != "manual" { lockedIndices.append(index) }
         }
+        try checkCancellation(cancellation, deadline: deadline)
         guard !lockedIndices.isEmpty else { return }
         // Resolve every mode before enabling the diagnostic override.
         for index in lockedIndices {
             guard modeKey(index) != nil else { throw ThermalForgeError.readFailed("fan \(index) mode") }
         }
+        try checkCancellation(cancellation, deadline: deadline)
         switch ftstAvailability {
         case .present(size: 1):
             guard smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
@@ -241,6 +245,7 @@ public final class FanControl {
                 wait(0.1)
             }
         }
+        try checkCancellation(cancellation, deadline: deadline)
     }
 
     // MARK: - Set Speed
@@ -273,6 +278,9 @@ public final class FanControl {
         guard acknowledged.success, acknowledged.size == 4, acknowledged.bytes.count == 4,
               abs(smcBytesToFloat(acknowledged.bytes, size: acknowledged.size) - rpm) <= 1 else {
             throw ThermalForgeError.writeFailed("\(targetKey) acknowledgement")
+        }
+        guard readMode(index) == "manual" else {
+            throw ThermalForgeError.writeFailed("fan \(index) manual ownership acknowledgement")
         }
     }
 
@@ -443,27 +451,33 @@ public final class FanControl {
         return c
     }()
 
-    /// The temperature keys actually present on this machine. Probed once (a
-    /// non-empty result is cached); absent keys are never read again, so the
-    /// hot path stops paying IOKit calls for other generations' sensors.
+    /// Cache confirmed capabilities, but retry unknown sensors after transient
+    /// failures. One readable GPU must not permanently hide an unavailable CPU.
     private func liveTemperatureKeys() -> [LiveTempKey] {
-        if let cached = liveTempKeys, !cached.isEmpty { return cached }
-        var live: [LiveTempKey] = []
-        for cand in Self.tempCandidates {
+        if let cached = liveTempKeys, pendingTempKeys.isEmpty || now() < nextTemperatureProbe { return cached }
+        var live = liveTempKeys ?? []
+        var pending: [TempCandidate] = []
+        for cand in pendingTempKeys {
             let result = smc.readKey(cand.key)
-            let present = cand.isIoft ? (result.success && result.size == 8)
-                                      : (result.success && result.size == 4)
+            let size: UInt32 = cand.isIoft ? 8 : 4
+            let availability = result.success ? SMCKeyAvailability.present(size: result.size) : smc.keyAvailability(cand.key)
+            let present = availability == .present(size: size)
             if present {
                 live.append(LiveTempKey(key: cand.key, isIoft: cand.isIoft, group: cand.group))
+            } else if availability == .unknown {
+                pending.append(cand)
             }
         }
-        if !live.isEmpty { liveTempKeys = live }
+        liveTempKeys = live
+        pendingTempKeys = pending
+        nextTemperatureProbe = now() + BackendTiming.progressInterval
         return live
     }
 
     private func readTemp(_ liveKey: LiveTempKey) -> Float? {
         let result = smc.readKey(liveKey.key)
-        guard result.success else { return nil }
+        let size: UInt32 = liveKey.isIoft ? 8 : 4
+        guard result.success, result.size == size, result.bytes.count == Int(size) else { return nil }
         let temp = liveKey.isIoft
             ? ioftBytesToFloat(result.bytes)
             : smcBytesToFloat(result.bytes, size: result.size)
@@ -539,7 +553,7 @@ public final class FanControl {
         let result = smc.readKey(key)
         guard result.success, result.size == 4, result.bytes.count == 4 else { return nil }
         let value = smcBytesToFloat(result.bytes, size: result.size)
-        return value.isFinite && value >= 0 ? value : nil
+        return value.isFinite && (0...30000).contains(value) ? value : nil
     }
 
     private func log(_ message: String) {

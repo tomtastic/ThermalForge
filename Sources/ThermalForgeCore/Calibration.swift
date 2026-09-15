@@ -204,6 +204,7 @@ public enum CalibrationMode: String, CaseIterable {
 public enum CalibrationError: LocalizedError {
     case insufficientData(reason: String)
     case cancelled
+    case workloadFailed(String)
     case workloadShutdownFailed
 
     public var errorDescription: String? {
@@ -212,6 +213,8 @@ public enum CalibrationError: LocalizedError {
             return reason
         case .cancelled:
             return "Calibration was interrupted"
+        case .workloadFailed(let reason):
+            return reason
         case .workloadShutdownFailed:
             return "Calibration workload did not terminate; controller exit and independent recovery are required"
         }

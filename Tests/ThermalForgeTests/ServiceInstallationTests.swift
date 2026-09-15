@@ -1,7 +1,20 @@
+import Foundation
 import Testing
 @testable import ThermalForgeCore
 
 @Suite struct ServiceInstallationTests {
+    @Test func overlappingTransactionsAreRejectedAndReleaseOnExit() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appendingPathComponent("install.lock").path
+        var first: ServiceInstallationLock? = try ServiceInstallationLock(path: path)
+        #expect(throws: BackendStorageError.self) { try ServiceInstallationLock(path: path) }
+        withExtendedLifetime(first) {}
+        first = nil
+        let replacement = try ServiceInstallationLock(path: path)
+        withExtendedLifetime(replacement) {}
+    }
     @Test func replacementStartsRecoveryBeforeBackend() throws {
         var journal: [String] = []
         let coordinator = ServiceInstallationCoordinator(

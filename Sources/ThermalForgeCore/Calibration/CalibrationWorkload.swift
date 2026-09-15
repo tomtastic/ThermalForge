@@ -1,6 +1,7 @@
 import Foundation
 
 protocol CalibrationWorkload: AnyObject {
+    var failure: String? { get }
     @discardableResult
     func start(intensity: Float) -> Bool
 
@@ -9,11 +10,14 @@ protocol CalibrationWorkload: AnyObject {
     func stop() -> Bool
 }
 
+extension CalibrationWorkload { var failure: String? { nil } }
+
 final class CalibrationWorkloadGroup: CalibrationWorkload {
     private let workloads: [any CalibrationWorkload]
     private let lock = NSLock()
     private var running = false
     private var shutdownIncomplete = false
+    var failure: String? { workloads.compactMap(\.failure).first }
 
     init(workloads: [any CalibrationWorkload]) {
         self.workloads = workloads
@@ -30,7 +34,10 @@ final class CalibrationWorkloadGroup: CalibrationWorkload {
         lock.unlock()
 
         for workload in workloads {
-            workload.start(intensity: intensity)
+            guard workload.start(intensity: intensity) else {
+                _ = stop() // A failed shutdown is retained and retried by cleanup.
+                return false
+            }
         }
         return true
     }

@@ -164,6 +164,7 @@ final class WorkloadIntensityFinder {
         do { result = .success(try runCheck(intensity: intensity, baselineTemperature: baselineTemperature)) }
         catch { result = .failure(error) }
         guard workload.stop() else { throw CalibrationError.workloadShutdownFailed }
+        if let failure = workload.failure { throw CalibrationError.workloadFailed(failure) }
         return try result.get()
     }
 
@@ -176,7 +177,10 @@ final class WorkloadIntensityFinder {
                 + "(\(stressDescription))..."
         )
 
-        _ = workload.start(intensity: intensity)
+        try checkCancellation()
+        guard workload.start(intensity: intensity) else {
+            throw CalibrationError.workloadFailed(workload.failure ?? "Calibration workload could not start")
+        }
         if let warning = workloadWarning() {
             log(warning)
         }
@@ -186,6 +190,7 @@ final class WorkloadIntensityFinder {
 
         while true {
             try checkCancellation()
+            if let failure = workload.failure { throw CalibrationError.workloadFailed(failure) }
             let elapsed = now() - startTime
             let currentTemperature = temperature() ?? 0
             readings.append((elapsed, currentTemperature))

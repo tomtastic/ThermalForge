@@ -28,6 +28,7 @@ final class GPUStressWorkload: CalibrationWorkload {
         defer { lock.unlock() }
         return _lastWarning
     }
+    var failure: String? { lastWarning }
 
     @discardableResult
     func start(intensity: Float) -> Bool {
@@ -41,7 +42,7 @@ final class GPUStressWorkload: CalibrationWorkload {
         lock.unlock()
 
         guard let device = deviceProvider() else {
-            failStartup("Warning: Metal device not available, running CPU-only stress")
+            failStartup("Metal device is unavailable; the requested GPU workload cannot run")
             return false
         }
 
@@ -66,7 +67,7 @@ final class GPUStressWorkload: CalibrationWorkload {
               let pipeline = try? device.makeComputePipelineState(function: function),
               let queue = device.makeCommandQueue()
         else {
-            failStartup("Warning: Metal pipeline setup failed, running CPU-only stress")
+            failStartup("Metal pipeline setup failed")
             return false
         }
 
@@ -75,7 +76,7 @@ final class GPUStressWorkload: CalibrationWorkload {
         let elementCount = max(Int(Float(baseCount) * clampedIntensity), 1024)
         let bufferSize = elementCount * MemoryLayout<Float>.stride
         guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
-            failStartup("Warning: Metal buffer allocation failed, running CPU-only stress")
+            failStartup("Metal buffer allocation failed")
             return false
         }
 
@@ -86,7 +87,10 @@ final class GPUStressWorkload: CalibrationWorkload {
 
         let thread = Thread { [weak self] in
             while let resources = self?.dispatchResources() {
-                Self.dispatch(resources)
+                guard Self.dispatch(resources) else {
+                    self?.failStartup("GPU calibration command failed")
+                    return
+                }
             }
         }
         thread.qualityOfService = .userInteractive
@@ -114,8 +118,8 @@ final class GPUStressWorkload: CalibrationWorkload {
         let activeThread = thread
         lock.unlock()
 
-        let deadline = Date().addingTimeInterval(2)
-        while activeThread?.isFinished == false, Date() < deadline {
+        let deadline = BackendTiming.monotonicNow + 2
+        while activeThread?.isFinished == false, BackendTiming.monotonicNow < deadline {
             Thread.sleep(forTimeInterval: 0.01)
         }
 
@@ -149,7 +153,7 @@ final class GPUStressWorkload: CalibrationWorkload {
         queue: MTLCommandQueue,
         buffer: MTLBuffer,
         elementCount: Int
-    )) {
+    )) -> Bool {
         let groupSize = MTLSize(
             width: resources.pipeline.maxTotalThreadsPerThreadgroup,
             height: 1,
@@ -158,7 +162,7 @@ final class GPUStressWorkload: CalibrationWorkload {
         let gridSize = MTLSize(width: resources.elementCount, height: 1, depth: 1)
         guard let commandBuffer = resources.queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
-        else { return }
+        else { return false }
 
         encoder.setComputePipelineState(resources.pipeline)
         encoder.setBuffer(resources.buffer, offset: 0, index: 0)
@@ -166,6 +170,7 @@ final class GPUStressWorkload: CalibrationWorkload {
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        return commandBuffer.status == .completed
     }
 
     private func failStartup(_ warning: String) {

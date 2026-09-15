@@ -13,8 +13,9 @@ struct CalibrationTemperatureSelector {
         case .cpu:
             selected = cpu
         case .gpu:
-            selected = gpu > 0 ? gpu : cpu
+            selected = gpu
         case .combined:
+            guard cpu > 0, gpu > 0 else { return nil }
             selected = max(cpu, gpu)
         }
         guard selected > 0 else { return nil }

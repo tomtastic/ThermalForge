@@ -42,6 +42,53 @@ The version 2 socket protocol distinguishes requested intent, acknowledged fan
 control, measured sensors, session ownership, and verified Apple handback. See
 [architecture-v2.md](docs/architecture-v2.md) for the protocol and process model.
 
+### How the flow changed from `main`
+
+The previous implementation (`87b66e2`) distributed control between the GUI,
+privileged helper, and CLI. `nextgen` makes the backend the single owner of normal
+control and gives recovery its own process.
+
+| Flow | Previous version | `nextgen` |
+| --- | --- | --- |
+| Profile selection | The GUI loaded profiles, sampled sensors, evaluated rules/curves, and sent coalesced RPM commands to the helper. | The GUI selects a profile in a protected session. The backend loads authoritative configuration, senses, evaluates, and applies commands serially. |
+| Status display | The app's monitor combined local readings and policy state; requested commands could appear successful before hardware acknowledgement. | Clients receive a snapshot separating requested intent, acknowledged control, sensor freshness, and restoration progress. Observing never renews control. |
+| Manual CLI control | Privileged CLI commands could write SMC directly, independently of the GUI/helper. | `set`, `max`, and `watch` hold foreground backend sessions. A second CLI is busy; `--takeover` explicitly revokes the GUI's session. |
+| Normal exit | The GUI performed a global Apple reset, including when another client might be controlling fans. | A client releases only its own session. An observing GUI can quit without changing another owner's fans. |
+| Client communication failure | The helper relied on GUI heartbeats; its watchdog and normal writes shared the same process and SMC lock. | Client renewal and completed backend work have separate ten-second leases. Status traffic cannot keep a stalled controller protected. |
+| Backend crash or stall | A watchdog inside the failed helper could not independently stop it and restore fans. | Recovery revokes permission, terminates the identified backend, confirms exit, then restores and verifies Apple ownership. A durable marker survives recovery restart. |
+| Reconnection | The GUI tried to restore its selected profile after helper outages. | GUI recovery resumes only eligible sessions. Recorded revocations prevent reconnection from undoing CLI takeover or explicit `auto`, including after backend restart. |
+| Calibration | The privileged CLI stopped the GUI and paused/restarted the helper around its own workload and fan writes. | Calibration is an exclusive backend job using the same actuator as normal control. Observers remain connected; cancellation stops workloads before verified handback. |
+| Sleep/wake | The helper saved and reapplied the previous fan command after wake. | Sleep invalidates sessions. Wake requires verified handback and a fresh selection/evaluation; stale RPM commands are not replayed. |
+| Settings and calibration | Profiles/rules lived in user files; calibration could have root and user copies. | Profiles/rules are stored per authenticated console UID; machine calibration is stored once per lid state. Validated legacy imports preserve originals and respect prior backend edits. |
+| Installation/removal | One helper was installed in `/usr/local/bin`; uninstall could continue after reset failure. | A protected executable serves two launchd jobs. Controllers exit before handback, recovery starts before the backend, and failed uninstall restoration retains recovery. |
+
+The normal control paths are:
+
+```mermaid
+flowchart LR
+    subgraph Previous
+        A[GUI sensors and policy] --> B[Command coalescer]
+        B --> C[Privileged helper]
+        C --> D[SMC]
+        E[Privileged CLI or calibration] --> D
+    end
+    subgraph Nextgen
+        F[GUI or foreground CLI session] --> G[Backend sensors and policy]
+        G --> H[Protected actuator]
+        H --> I[SMC]
+        R[Independent recovery] -->|durable permission before manual writes| H
+        R -->|only after failed backend exits| I
+    end
+```
+
+The failure path is **lease expiry or lost recovery communication → cancel/revoke
+control → confirm backend exit when independent recovery is needed → restore every
+fan and diagnostic override → verify ownership → allow new control**. An accepted
+request starts work; it is not proof that manual control or Apple handback has completed.
+
+The [component and failure-mode review](docs/nextgen-review.md) records the safety
+and efficiency changes, interaction tests, and remaining physical release checks.
+
 ## Safety Model
 
 The hottest CPU/GPU temperature drives the 95°C maximum-fan override, which
@@ -53,7 +100,9 @@ a live client session for its temperature override; observers cannot cause write
   on interruption.
 - Recovery uses a separate ten-second monotonic lease. Only completed sensing and
   control advances it; responsive status requests cannot conceal a stalled controller.
-- Recovery durably records its obligation before the first manual write. On
+- Recovery durably records backend registration even while idle, and records
+  manual permission before the first manual write. Registration remains until
+  confirmed exit, so a recovery restart fences even an idle backend. On
   failure it revokes permission, sends SIGTERM, escalates after one second, and
   positively confirms controller exit before touching SMC.
 - Every fan and any diagnostic override must report verified system/automatic
@@ -136,6 +185,13 @@ and rerun Phase 1.
 A calibration is saved only when its converged sweep reaches at least 80°C,
 providing measured coverage for the Smart control range. Underpowered sweeps and
 all-maximum curves are rejected, leaving the previous calibration untouched.
+GPU and combined jobs also require the requested workloads and their sensor
+families to be available; GPU failure cannot silently produce CPU-only calibration.
+
+Cancellation is accepted until the backend enters **saving**, after a complete
+result, confirmed workload shutdown, and verified Apple handback. Saving finishes
+that result even if the client then disconnects. Completion is reported only after
+durable storage succeeds; interrupted workloads never save partial measurements.
 
 Lid-open and clamshell operation are calibrated independently. The backend stores
 both curves in `/Library/Application Support/ThermalForge/machine-calibration-v2.json`.

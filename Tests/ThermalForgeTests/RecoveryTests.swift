@@ -76,7 +76,7 @@ struct RecoveryTests {
         #expect(!h.send(.connect).ok)
         h.begin()
         h.journal.entries.append("manual write")
-        #expect(h.journal.entries == ["restore", "persist", "manual write"])
+        #expect(h.journal.entries == ["restore", "persist", "persist", "manual write"])
         #expect(h.store.value?.generation == "g1")
     }
 
@@ -112,7 +112,34 @@ struct RecoveryTests {
         h.core.tick()
         #expect(!h.core.snapshot().protected)
         #expect(h.core.snapshot().restoration.verified)
-        #expect(h.store.value == nil)
+        #expect(h.store.value?.requiresProtection == false)
+    }
+
+    @Test("Recovery restart fences an idle backend before any independent hardware write")
+    func idleRecoveryRestart() throws {
+        let h = try RecoveryHarness()
+        h.core.tick()
+        #expect(h.send(.connect).ok)
+        #expect(h.store.value?.requiresProtection == false)
+        h.core = try h.makeCore()
+        h.journal.entries = []
+        h.core.tick()
+        #expect(h.journal.entries == ["term"])
+        #expect(!h.send(.authorizeManual).ok)
+        h.clock.value = 1
+        h.core.tick()
+        h.core.tick()
+        #expect(h.journal.entries == ["term", "kill", "exit", "restore", "clear"])
+    }
+
+    @Test("Registration persistence failure prevents backend admission")
+    func failedRegistration() throws {
+        let h = try RecoveryHarness()
+        h.core.tick()
+        h.store.failSave = true
+        #expect(!h.send(.connect).ok)
+        #expect(h.core.snapshot().generation == nil)
+        #expect(!h.send(.authorizeManual).ok)
     }
 
     @Test("Failed durable marker never permits a manual write")

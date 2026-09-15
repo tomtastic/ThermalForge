@@ -50,10 +50,14 @@ public struct RecoveryMarker: Codable, Equatable {
     public let version: Int
     public let identity: BackendProcessIdentity
     public let generation: String
-    public init(identity: BackendProcessIdentity, generation: String) {
+    // Missing in older markers, which always represented manual ownership.
+    public let manualControl: Bool?
+    public var requiresProtection: Bool { manualControl ?? true }
+    public init(identity: BackendProcessIdentity, generation: String, manualControl: Bool = true) {
         version = 1
         self.identity = identity
         self.generation = generation
+        self.manualControl = manualControl
     }
 }
 
@@ -129,7 +133,7 @@ public final class RecoveryCoordinator {
 
     public func snapshot() -> RecoverySnapshot { queue.sync { currentSnapshot() } }
     private func currentSnapshot() -> RecoverySnapshot {
-        RecoverySnapshot(ready: reconciled && !revoked, protected: marker != nil,
+        RecoverySnapshot(ready: reconciled && !revoked, protected: marker?.requiresProtection == true,
                          revoked: revoked, generation: registered?.generation ?? marker?.generation,
                          restoration: restoration)
     }
@@ -147,19 +151,23 @@ public final class RecoveryCoordinator {
                 guard let identity = processes.identity(pid: peer.pid) else {
                     throw RecoveryError.failure("Cannot authenticate backend process identity")
                 }
-                if let active = marker, let lastProgress,
+                if marker?.requiresProtection == true, let lastProgress,
                    now() - lastProgress >= BackendTiming.protectionLease {
                     revoked = true
                     restoration = RestorationResult(verified: false, errors: ["Backend completed-work lease expired"])
-                    _ = active
                 }
                 guard reconciled, !revoked else { throw RecoveryError.failure("Recovery reconciliation pending or permission revoked") }
                 let caller = RecoveryMarker(identity: identity, generation: request.generation)
                 if request.operation == .connect {
                     if let registered, registered != caller {
-                        if marker == nil, processes.state(of: registered.identity) == .exited {
-                            self.registered = nil
-                        } else { throw RecoveryError.failure("A different backend is registered") }
+                        throw RecoveryError.failure("A different backend is registered")
+                    }
+                    if registered == nil {
+                        // Remember even an idle backend durably. Otherwise a recovery
+                        // restart could reset hardware while that backend is still alive.
+                        let idle = RecoveryMarker(identity: identity, generation: request.generation, manualControl: false)
+                        try markerStore.save(idle)
+                        marker = idle
                     }
                     registered = caller
                 }
@@ -167,7 +175,7 @@ public final class RecoveryCoordinator {
                 switch request.operation {
                 case .connect, .status, .inspect: break
                 case .authorizeManual:
-                    if marker == nil {
+                    if marker?.requiresProtection != true {
                         // Permission must never escape if any durable step fails.
                         try markerStore.save(caller)
                         marker = caller
@@ -175,12 +183,15 @@ public final class RecoveryCoordinator {
                         restoration = RestorationResult(verified: false, errors: ["Backend owns manual control"])
                     }
                 case .completedWork:
-                    if marker != nil { lastProgress = now() }
+                    if marker?.requiresProtection == true { lastProgress = now() }
                 case .restored:
                     // Only the backend's verified actuator result permits this
                     // acknowledgement. Once revoked it must exit instead.
-                    if marker != nil { try markerStore.clear() }
-                    marker = nil
+                    if marker?.requiresProtection == true {
+                        let idle = RecoveryMarker(identity: identity, generation: request.generation, manualControl: false)
+                        try markerStore.save(idle)
+                        marker = idle
+                    }
                     lastProgress = nil
                     restoration = RestorationResult(verified: true)
                 }
@@ -196,7 +207,7 @@ public final class RecoveryCoordinator {
     private func tickLocked() {
         if let marker {
             let state = processes.state(of: marker.identity)
-            if state != .alive || lastProgress.map({ now() - $0 >= BackendTiming.protectionLease }) ?? true {
+            if state != .alive || (marker.requiresProtection && (lastProgress.map({ now() - $0 >= BackendTiming.protectionLease }) ?? true)) {
                 revoked = true
             }
             guard revoked else { return }

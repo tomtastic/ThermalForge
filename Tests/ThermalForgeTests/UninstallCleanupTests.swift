@@ -5,6 +5,21 @@ import Testing
 
 @Suite("Uninstall cleanup")
 struct UninstallCleanupTests {
+    @Test("Uninstall removes CLI symlink after its canonical target was removed")
+    func danglingSymlinkRemoval() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let binary = root.appendingPathComponent("binary"), link = root.appendingPathComponent("cli")
+        try Data().write(to: binary)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: binary)
+        let results = UninstallCleanup(homeDirectories: [], systemTargets: [binary, link]).remove()
+        for result in results {
+            if case .removed = result.outcome {} else { Issue.record("Expected removal: \(result.path)") }
+        }
+        #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) == nil)
+    }
+
     @Test("Home resolver includes root and console user once")
     func homeResolverDeduplicatesHomes() {
         let rootHome = URL(fileURLWithPath: "/var/root", isDirectory: true)

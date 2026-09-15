@@ -11,6 +11,10 @@ private actor ClientTestBackend {
     var rejectUpdates = false
     var acquireDelay: UInt64 = 0
     var acquireEntered = false
+    var delayStatus = false
+    var statusEntered = false
+    var restoreDelay: UInt64 = 0
+    var restoreEntered = false
 
     func transport(_ data: Data) async throws -> Data {
         let request = try JSONDecoder().decode(BackendRequest.self, from: data)
@@ -39,6 +43,8 @@ private actor ClientTestBackend {
         case .release:
             if request.session == state.owner { state.owner = nil; state.lastSessionEndReason = .released }
         case .restoreApple:
+            restoreEntered = true
+            if restoreDelay > 0 { try await Task.sleep(nanoseconds: restoreDelay) }
             state.owner = nil; state.lastSessionEndReason = .explicitAuto
         case .updateConfiguration:
             if rejectUpdates {
@@ -51,12 +57,22 @@ private actor ClientTestBackend {
             }
         default: break
         }
+        state.sequence = (state.sequence ?? 0) + 1
         response.snapshot = state
         response.configuration = configuration
+        if request.operation == .status, delayStatus {
+            delayStatus = false
+            statusEntered = true
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
         return try JSONEncoder().encode(response)
     }
 
     func delayAcquisition() { acquireDelay = 100_000_000 }
+    func delayNextStatus() { delayStatus = true; statusEntered = false }
+    func hasEnteredStatus() -> Bool { statusEntered }
+    func delayRestoration() { restoreDelay = 100_000_000 }
+    func hasEnteredRestoration() -> Bool { restoreEntered }
     func hasEnteredAcquire() -> Bool { acquireEntered }
     func currentOwner() -> ControlSession? { state.owner }
     func setFailure() { failNext = true }
@@ -81,6 +97,63 @@ private actor ClientTestBackend {
 }
 
 @Suite struct BackendClientTests {
+    @Test func supersedingAutoBeforeDispatchRetainsTheExistingSession() async throws {
+        let server = ClientTestBackend()
+        let client = BackendClient(transport: { try await server.transport($0) })
+        let original = try await client.acquire(.maximum).owner
+        await server.delayNextStatus()
+        let restoring = Task { try await client.restoreApple() }
+        while !(await server.hasEnteredStatus()) { await Task.yield() }
+        restoring.cancel()
+        _ = try await client.acquire(.rpm(3000))
+        _ = try? await restoring.value
+        #expect(await client.ownsControl)
+        #expect(await server.currentOwner() == original)
+        #expect(await server.operations().contains(.restoreApple) == false)
+    }
+    @Test func laterSelectionWaitsForPendingAppleRestoration() async throws {
+        let server = ClientTestBackend()
+        await server.delayRestoration()
+        let client = BackendClient(transport: { try await server.transport($0) })
+        _ = try await client.acquire(.maximum)
+        let restoring = Task { try await client.restoreApple() }
+        while !(await server.hasEnteredRestoration()) { await Task.yield() }
+        _ = try await client.acquire(.rpm(3000))
+        _ = try await restoring.value
+        #expect(await client.ownsControl)
+        #expect(await client.snapshot?.requestedIntent == .rpm(3000))
+        #expect(await server.currentOwner() == client.snapshot?.owner)
+    }
+    @Test func outOfOrderStatusCannotReplaceNewerOwnershipOrGeneration() async throws {
+        for restart in [false, true] {
+            let server = ClientTestBackend()
+            let client = BackendClient(transport: { try await server.transport($0) })
+            _ = try await client.acquire(.maximum)
+            await server.delayNextStatus()
+            let old = Task { try await client.status() }
+            while !(await server.hasEnteredStatus()) { await Task.yield() }
+            if restart { await server.restart() } else { await server.end(.explicitAuto) }
+            let current = try await client.status()
+            _ = try await old.value
+            #expect(await client.snapshot?.owner == nil)
+            #expect(await client.snapshot?.generation == current.generation)
+            #expect(await client.ownsControl == false)
+        }
+    }
+
+    @Test func observationDuringAcquisitionDoesNotDiscardCandidateSession() async throws {
+        let server = ClientTestBackend()
+        await server.delayAcquisition()
+        let client = BackendClient(transport: { try await server.transport($0) })
+        let acquisition = Task { try await client.acquire(.maximum) }
+        while !(await server.hasEnteredAcquire()) { await Task.yield() }
+        _ = try await client.status()
+        _ = try await acquisition.value
+        #expect(await client.ownsControl)
+        _ = try await client.release()
+        #expect(await server.currentOwner() == nil)
+    }
+
     @Test func observationNeverAcquiresOrRenews() async throws {
         let server = ClientTestBackend()
         let client = BackendClient(transport: { try await server.transport($0) })
@@ -110,7 +183,7 @@ private actor ClientTestBackend {
         _ = try await client.status()
         #expect(await server.operations() == [.status, .acquire, .status])
         _ = try await client.maintain()
-        #expect(await server.operations().suffix(2) == [.status, .renew])
+        #expect(await server.operations() == [.status, .acquire, .status, .renew])
     }
 
     @Test func takeoverLeavesGUIObservingAfterCLIExit() async throws {

@@ -7,16 +7,18 @@ private final class SweepWorkload: CalibrationWorkload {
     private(set) var startIntensities: [Float] = []
     private(set) var stopCount = 0
     private var running = false
+    var starts = true
+    var failure: String?
 
     func start(intensity: Float) -> Bool {
-        guard !running else { return false }
+        guard !running, starts else { return false }
         running = true
         startIntensities.append(intensity)
         return true
     }
 
     func stop() -> Bool {
-        guard running else { return false }
+        guard running else { return true }
         running = false
         stopCount += 1
         return true
@@ -33,6 +35,28 @@ private final class SweepClock {
 
 @Suite("Equilibrium sweep")
 struct EquilibriumSweepTests {
+    @Test("A failed workload cannot produce a calibration measurement or fan write")
+    func startupFailure() {
+        let workload = SweepWorkload()
+        workload.starts = false
+        let clock = SweepClock()
+        var wrote = false
+        let sweep = makeSweep(configuration: .init(maximumWaitPerLevel: 3, sampleInterval: 1), levels: [1],
+                              workload: workload, clock: clock, temperature: 60, setFanRPM: { _ in wrote = true })
+        #expect(throws: CalibrationError.self) { try sweep.run() }
+        #expect(!wrote)
+    }
+
+    @Test("A workload failure during sampling aborts and confirms shutdown")
+    func runtimeFailure() {
+        let workload = SweepWorkload()
+        let clock = SweepClock()
+        let sweep = makeSweep(configuration: .init(maximumWaitPerLevel: 3, sampleInterval: 1), levels: [1],
+                              workload: workload, clock: clock, temperature: 60, setFanRPM: { _ in },
+                              onSample: { _, _ in workload.failure = "GPU command failed" })
+        #expect(throws: CalibrationError.self) { try sweep.run() }
+        #expect(workload.stopCount == 1)
+    }
     @Test("A timed-out level is excluded instead of becoming a measurement")
     func timeoutExcludesLevel() throws {
         let workload = SweepWorkload()

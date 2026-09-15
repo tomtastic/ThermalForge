@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct UninstallRemovalResult {
@@ -47,7 +48,11 @@ public struct UninstallCleanup {
 
     public func remove(fileManager: FileManager = .default) -> [UninstallRemovalResult] {
         targets.map { target in
-            guard fileManager.fileExists(atPath: target.path) else {
+            var info = stat()
+            guard lstat(target.path, &info) == 0 else {
+                if errno != ENOENT {
+                    return UninstallRemovalResult(path: target, outcome: .failed("Cannot inspect path: errno \(errno)"))
+                }
                 return UninstallRemovalResult(path: target, outcome: .alreadyAbsent)
             }
 

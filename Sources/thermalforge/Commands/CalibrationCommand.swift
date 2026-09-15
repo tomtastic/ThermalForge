@@ -48,7 +48,7 @@ struct Calibrate: AsyncParsableCommand {
                     if job.phase == .cancelled { print("Calibration cancelled; Apple control verified."); throw ExitCode(130) }
                     print("Calibration complete; Apple control verified.")
                     return
-                case .pending, .running, .cancelling: break
+                case .pending, .running, .cancelling, .saving: break
                 }
                 try await Task.sleep(nanoseconds: 1_000_000_000)
             }

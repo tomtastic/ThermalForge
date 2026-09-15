@@ -8,6 +8,8 @@ struct Install: ParsableCommand {
         abstract: "Install the protected backend and independent recovery (requires sudo)")
     func run() throws {
         guard geteuid() == 0 else { throw ValidationError("Run with sudo: sudo thermalforge install") }
+        let transaction = try ServiceInstallationLock()
+        defer { withExtendedLifetime(transaction) {} }
         try InstalledServiceManager().coordinator().install()
         print("Backend and independent recovery installed.")
     }
@@ -90,7 +92,7 @@ struct InstalledServiceManager {
             repeat {
                 if let status = try? RecoveryClient.inspect() {
                     last = status.restoration
-                    if status.ready && !status.protected && last.verified { return last }
+                    if status.ready && !status.protected && status.generation == nil && last.verified { return last }
                 }
                 Thread.sleep(forTimeInterval: 0.1)
             } while BackendTiming.monotonicNow < deadline
@@ -108,6 +110,10 @@ struct InstalledServiceManager {
         try secureDirectory(directory)
         try secureDirectory(URL(fileURLWithPath: ThermalForgeDaemon.stateDirectory))
         let target = URL(fileURLWithPath: ThermalForgeDaemon.installPath)
+        var targetInfo = stat()
+        if lstat(target.path, &targetInfo) == 0, targetInfo.st_mode & S_IFMT != S_IFREG {
+            throw ValidationError("Canonical service executable must be a regular file")
+        }
         if source.resolvingSymlinksInPath() != target.resolvingSymlinksInPath() {
             let staging = directory.appendingPathComponent("thermalforge-\(UUID().uuidString)")
             defer { try? fm.removeItem(at: staging) }

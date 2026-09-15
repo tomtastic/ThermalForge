@@ -48,6 +48,8 @@ final class AppState {
     }
     var hasQuickTemperatureRule: Bool { quickTemperatureRule != nil }
     @ObservationIgnored private var pollingTask: Task<Void, Never>?
+    @ObservationIgnored private var controlTask: Task<Void, Never>?
+    @ObservationIgnored private var editTask: Task<Void, Never>?
     @ObservationIgnored private var configuration = BackendConfiguration()
     @ObservationIgnored private var applyingConfiguration = false
     @ObservationIgnored private var menuOpen = false
@@ -113,6 +115,7 @@ final class AppState {
 
     static func releaseForTermination() async throws {
         current?.pollingTask?.cancel()
+        current?.controlTask?.cancel()
         _ = try await client.release()
     }
 
@@ -151,6 +154,7 @@ final class AppState {
     }
 
     private func applyConfiguration(_ value: BackendConfiguration) {
+        guard value.revision >= configuration.revision else { return }
         applyingConfiguration = true
         configuration = value
         profiles = value.profiles
@@ -161,10 +165,14 @@ final class AppState {
     }
 
     private func editConfiguration(_ mutation: @escaping (inout BackendConfiguration) -> Void) {
-        var proposed = configuration
-        mutation(&proposed)
-        Task {
-            do { applyConfiguration(try await Self.client.updateConfiguration(proposed)) }
+        let previous = editTask
+        editTask = Task {
+            await previous?.value
+            do {
+                var proposed = try await Self.client.configuration()
+                mutation(&proposed)
+                applyConfiguration(try await Self.client.updateConfiguration(proposed))
+            }
             catch {
                 lastError = String(describing: error)
                 if let latest = try? await Self.client.configuration() { applyConfiguration(latest) }
@@ -176,17 +184,20 @@ final class AppState {
     func menuDidClose() { menuOpen = false }
     func setSmart() { selectProfile(.smart) }
     func resetAuto() {
-        Task {
+        controlTask?.cancel()
+        controlTask = Task {
             do { publish(try await Self.client.restoreApple()) }
+            catch is CancellationError {}
             catch { lastError = String(describing: error) }
         }
     }
     func selectProfile(_ profile: FanProfile) {
-        Task {
+        controlTask?.cancel()
+        controlTask = Task {
             do {
                 publish(try await Self.client.acquire(.profile(profile.id)))
                 applyConfiguration(try await Self.client.configuration())
-            } catch { lastError = String(describing: error) }
+            } catch is CancellationError {} catch { lastError = String(describing: error) }
         }
     }
     func addQuickRule() { updateQuickTemperatureRule { $0.enabled = true } }
@@ -257,29 +268,29 @@ final class AppState {
         rules.first(where: { $0.id == LegacyTemperatureRuleMigration.ruleID })
     }
 
-    private func updateQuickTemperatureRule(_ update: (inout ThermalRule) -> Void) {
-        var rule = quickTemperatureRule ?? Self.defaultQuickTemperatureRule
-        update(&rule)
-
-        let trigger = min(max(rule.condition.valueCelsius, 40), 95)
-        let release = min(max(rule.untilTempBelowC ?? 50, 35), trigger - 1)
-        let fanPercent: Float
-        if case let .setFanPercent(value) = rule.action {
-            fanPercent = min(max(value, 0.2), 1)
-        } else {
-            fanPercent = 1
-        }
-        rule.condition = ThermalRuleCondition(
-            metric: .maxTemp,
-            comparator: .greaterThanOrEqual,
-            valueCelsius: trigger
-        )
-        rule.action = .setFanPercent(fanPercent)
-        rule.untilTempBelowC = release
-        rule.name = "IF temp ≥ \(Int(trigger))°C THEN \(Int(fanPercent * 100))% until ≤ \(Int(release))°C"
-
-        let updated = rule
+    private func updateQuickTemperatureRule(_ update: @escaping (inout ThermalRule) -> Void) {
         editConfiguration { configuration in
+            var rule = configuration.rules.first { $0.id == LegacyTemperatureRuleMigration.ruleID } ?? Self.defaultQuickTemperatureRule
+            update(&rule)
+
+            let trigger = min(max(rule.condition.valueCelsius, 40), 95)
+            let release = min(max(rule.untilTempBelowC ?? 50, 35), trigger - 1)
+            let fanPercent: Float
+            if case let .setFanPercent(value) = rule.action {
+                fanPercent = min(max(value, 0.2), 1)
+            } else {
+                fanPercent = 1
+            }
+            rule.condition = ThermalRuleCondition(
+                metric: .maxTemp,
+                comparator: .greaterThanOrEqual,
+                valueCelsius: trigger
+            )
+            rule.action = .setFanPercent(fanPercent)
+            rule.untilTempBelowC = release
+            rule.name = "IF temp ≥ \(Int(trigger))°C THEN \(Int(fanPercent * 100))% until ≤ \(Int(release))°C"
+
+            let updated = rule
             configuration.rules.removeAll { $0.id == updated.id }
             configuration.rules.append(updated)
         }

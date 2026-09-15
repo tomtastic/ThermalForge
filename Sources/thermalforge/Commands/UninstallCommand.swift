@@ -7,6 +7,8 @@ struct Uninstall: ParsableCommand {
         abstract: "Verify Apple handback and remove both background services")
     func run() throws {
         guard geteuid() == 0 else { throw ValidationError("Run with sudo: sudo thermalforge uninstall") }
+        let transaction = try ServiceInstallationLock()
+        defer { withExtendedLifetime(transaction) {} }
         let cleanup = UninstallCleanup()
         try InstalledServiceManager().coordinator {
             let failures = cleanup.remove().compactMap { result -> String? in

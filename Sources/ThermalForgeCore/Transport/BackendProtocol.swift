@@ -142,7 +142,7 @@ public enum SessionEndReason: String, Codable {
 }
 
 public enum CalibrationJobPhase: String, Codable {
-    case pending, running, cancelling, completed, cancelled, failed
+    case pending, running, cancelling, saving, completed, cancelled, failed
 }
 
 public struct CalibrationJobSnapshot: Codable {
@@ -158,6 +158,8 @@ public struct CalibrationJobSnapshot: Codable {
 
 public struct BackendSnapshot: Codable {
     public var generation: String
+    /// Ordered within a generation; optional for early protocol-v2 clients.
+    public var sequence: UInt64?
     public var recoveryEpoch: String?
     public var requestedIntent: ControlIntent?
     public var acknowledgedControl: AcknowledgedControl

@@ -76,10 +76,14 @@ private final class HardwareBroker: @unchecked Sendable {
                SystemRecoveryProcessControl().state(of: backendIdentity) != .exited {
                 orderingErrors.append("Independent write before controller exit: \(command.key)")
             }
-            if command.writer == "backend", command.key.hasPrefix("F"),
-               (command.key.hasSuffix("Md") || command.key.hasSuffix("md")), command.bytes == [1],
-               !FileManager.default.fileExists(atPath: directory.appendingPathComponent("recovery/recovery.json").path) {
-                orderingErrors.append("Manual write before durable marker")
+            let manualWrite = (command.bytes == [1] && (command.key == "Ftst" || command.key.hasSuffix("Md") || command.key.hasSuffix("md")))
+                || (command.key.hasSuffix("Tg") && command.bytes.count == 4 && smcBytesToFloat(command.bytes, size: 4) > 0)
+            if command.writer == "backend", manualWrite {
+                let marker = (try? Data(contentsOf: directory.appendingPathComponent("recovery/recovery.json")))
+                    .flatMap { try? JSONDecoder().decode(RecoveryMarker.self, from: $0) }
+                if marker?.requiresProtection != true || marker?.identity != backendIdentity {
+                    orderingErrors.append("Manual write before durable permission for this backend")
+                }
             }
             if failures.contains(command.key), command.bytes == [0] { reply.success = false }
             if reply.success { keys[command.key] = command.bytes }
@@ -247,6 +251,19 @@ struct SubprocessRecoveryTests {
         #expect(fixture.broker.errors().isEmpty)
     }
 
+    @Test func recoveryRestartFencesIdleBackendBeforeWriting() throws {
+        let fixture = try ServiceFixture()
+        try fixture.start()
+        #expect(try !fixture.recoveryState().protected)
+        #expect(kill(fixture.backend.processIdentifier, SIGSTOP) == 0)
+        fixture.stop(fixture.recovery)
+        fixture.recovery = try fixture.spawn("recovery")
+        try fixture.waitFor(timeout: 10) {
+            try !fixture.backend.isRunning && fixture.broker.automatic() && fixture.recoveryState().ready
+        }
+        #expect(fixture.broker.errors().isEmpty, "\(fixture.broker.errors())")
+    }
+
     @Test func partialRestorationKeepsNewBackendBlockedUntilVerified() throws {
         let fixture = try ServiceFixture(ftst: true)
         try fixture.start()
@@ -308,7 +325,12 @@ struct SubprocessRecoveryTests {
         try fixture.start()
         _ = try fixture.acquire()
         #expect(unlink(fixture.directory.appendingPathComponent("b.sock").path) == 0)
-        try fixture.waitFor(timeout: 13) { fixture.broker.automatic() }
+        try fixture.waitFor(timeout: 13) {
+            // The backend socket was deliberately removed; completion is
+            // observed through the independent recovery endpoint.
+            let state = try fixture.recoveryState()
+            return fixture.broker.automatic() && state.restoration.verified && !state.protected
+        }
         #expect(fixture.backend.isRunning)
         #expect(try !fixture.recoveryState().protected)
     }

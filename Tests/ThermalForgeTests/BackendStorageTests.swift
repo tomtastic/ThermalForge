@@ -4,6 +4,37 @@ import Testing
 
 @Suite("Backend authoritative storage")
 struct BackendStorageTests {
+    @Test("State loading rejects symlinks, writable files and oversized data")
+    func unsafeStateFiles() throws {
+        let dir = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: dir) }
+        let store = BackendConfigurationStore(directory: dir)
+        _ = try store.update(BackendConfiguration(), uid: 501)
+        let file = dir.appendingPathComponent("501/configuration.json")
+        let original = try Data(contentsOf: file)
+        let outside = dir.appendingPathComponent("original.json")
+        try original.write(to: outside)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createSymbolicLink(at: file, withDestinationURL: outside)
+        #expect(throws: (any Error).self) { try store.load(uid: 501) }
+        #expect(try Data(contentsOf: outside) == original)
+        try FileManager.default.removeItem(at: file)
+        try original.write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o666], ofItemAtPath: file.path)
+        #expect(throws: (any Error).self) { try store.load(uid: 501) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        try Data(repeating: 0, count: BackendStateFile.maximumBytes + 1).write(to: file)
+        #expect(throws: (any Error).self) { try store.load(uid: 501) }
+    }
+
+    @Test("A symlinked user directory cannot redirect a service write")
+    func unsafeUserDirectory() throws {
+        let dir = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: dir) }
+        let outside = dir.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: dir.appendingPathComponent("501"), withDestinationURL: outside)
+        #expect(throws: (any Error).self) { try BackendConfigurationStore(directory: dir).update(.init(), uid: 501) }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
+    }
     private func temporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

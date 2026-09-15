@@ -12,7 +12,8 @@ public actor BackendClient {
     private var profileRecoveryEpoch: String?
     private var communicationFailed = false
     private var ownershipEpoch = 0
-    private var pendingAcquisition: (epoch: Int, task: Task<BackendResponse, Error>)?
+    private var retiredGenerations: [String] = []
+    private var pendingMutation: (epoch: Int, task: Task<BackendResponse, Error>)?
     public private(set) var snapshot: BackendSnapshot?
 
     public init(kind: ControlClientKind = .cli,
@@ -33,7 +34,7 @@ public actor BackendClient {
 
     public var ownsControl: Bool { session != nil && snapshot?.owner == session }
 
-    private func send(_ request: BackendRequest) async throws -> BackendResponse {
+    private func send(_ request: BackendRequest, acceptRejection: Bool = false) async throws -> BackendResponse {
         let data: Data
         do { data = try await transport(JSONEncoder().encode(request)) }
         catch {
@@ -47,7 +48,7 @@ public actor BackendClient {
             communicationFailed = true
             throw DaemonError.protocolError("Backend version or request identity mismatch")
         }
-        guard response.ok else {
+        guard response.ok || acceptRejection else {
             let error = response.error ?? DaemonErrorPayload(code: "backend_error", message: "Request rejected")
             throw DaemonError.commandFailed(code: error.code, message: error.message)
         }
@@ -59,12 +60,19 @@ public actor BackendClient {
         let epoch = ownershipEpoch
         let response = try await send(BackendRequest(operation: .status))
         guard let value = response.snapshot else { throw DaemonError.protocolError("Missing backend snapshot") }
-        if epoch == ownershipEpoch { observe(value) }
-        return value
+        if epoch == ownershipEpoch, pendingMutation == nil { observe(value) }
+        return snapshot ?? value
     }
 
     private func observe(_ value: BackendSnapshot) {
+        guard !retiredGenerations.contains(value.generation) else { return }
+        if let previous = snapshot, previous.generation == value.generation,
+           let old = previous.sequence, let new = value.sequence, new < old { return }
         let previousGeneration = snapshot?.generation
+        if let previousGeneration, previousGeneration != value.generation {
+            retiredGenerations.append(previousGeneration)
+            retiredGenerations = Array(retiredGenerations.suffix(16))
+        }
         snapshot = value
         guard let owned = session, value.owner != owned else { return }
         let endReason = value.endedSessions[owned.id] ?? value.lastSessionEndReason
@@ -89,7 +97,7 @@ public actor BackendClient {
 
     private func acquire(_ intent: ControlIntent, takeover: Bool, automaticRecovery: Bool) async throws -> BackendSnapshot {
         let epoch = ownershipEpoch
-        if let pending = pendingAcquisition { _ = try? await pending.task.value }
+        if let pending = pendingMutation { _ = try? await pending.task.value }
         let current = try await status()
         try Task.checkCancellation()
         guard epoch == ownershipEpoch else { throw CancellationError() }
@@ -100,14 +108,14 @@ public actor BackendClient {
         if kind == .gui, case let .profile(id) = intent { desiredProfile = id }
         else { desiredProfile = nil }
         do {
-            let response = try await sendAcquisition(BackendRequest(operation: .acquire, session: candidate,
+            let response = try await sendMutation(BackendRequest(operation: .acquire, session: candidate,
                 clientKind: kind, intent: intent, takeover: takeover,
                 automaticRecovery: automaticRecovery, recoveryEpoch: automaticRecovery ? profileRecoveryEpoch : nil))
             guard let value = response.snapshot, value.owner == candidate else {
                 throw DaemonError.protocolError("Acquisition did not return the requested session")
             }
             if acquisitionEpoch == ownershipEpoch {
-                snapshot = value
+                observe(value)
                 communicationFailed = false
                 if !automaticRecovery { profileRecoveryEpoch = value.recoveryEpoch }
             }
@@ -118,24 +126,33 @@ public actor BackendClient {
         }
     }
 
-    private func sendAcquisition(_ request: BackendRequest) async throws -> BackendResponse {
+    private func sendMutation(_ request: BackendRequest) async throws -> BackendResponse {
         let epoch = ownershipEpoch
         let task = Task { try await self.send(request) }
-        pendingAcquisition = (epoch, task)
-        defer { if pendingAcquisition?.epoch == epoch { pendingAcquisition = nil } }
+        pendingMutation = (epoch, task)
+        defer { if pendingMutation?.epoch == epoch { pendingMutation = nil } }
         return try await task.value
     }
 
     /// Call about every two seconds, independently of display/printing cadence.
     @discardableResult public func maintain() async throws -> BackendSnapshot {
-        var current = try await status()
         try Task.checkCancellation()
-        if let owned = session, current.owner == owned {
+        var current: BackendSnapshot
+        if let owned = session, pendingMutation == nil {
             let epoch = ownershipEpoch
-            let response = try await send(BackendRequest(operation: .renew, session: owned))
-            if epoch == ownershipEpoch, let value = response.snapshot { observe(value); current = value }
-            communicationFailed = false
-        } else if kind == .gui, communicationFailed, let profile = desiredProfile,
+            let response = try await send(BackendRequest(operation: .renew, session: owned), acceptRejection: true)
+            guard let value = response.snapshot else { throw DaemonError.protocolError("Missing renewal snapshot") }
+            if epoch == ownershipEpoch { observe(value) }
+            current = snapshot ?? value
+            if !response.ok, let error = response.error, !["notOwner", "staleGeneration"].contains(error.code) {
+                throw DaemonError.commandFailed(code: error.code, message: error.message)
+            }
+            if epoch == ownershipEpoch, current.owner == owned {
+                communicationFailed = false
+                return current
+            }
+        } else { current = try await status() }
+        if kind == .gui, communicationFailed, let profile = desiredProfile,
                   current.owner == nil, current.restoration == .verified {
             session = nil
             current = try await acquire(.profile(profile), takeover: false, automaticRecovery: true)
@@ -146,29 +163,34 @@ public actor BackendClient {
     /// Release only the identity created by this client, never a global reset.
     @discardableResult public func release() async throws -> BackendSnapshot? {
         ownershipEpoch += 1
+        let epoch = ownershipEpoch
         let owned = session
         session = nil
         desiredProfile = nil
         communicationFailed = false
         guard let owned else { return nil }
         // Fence an accepted-but-not-yet-answered acquisition before releasing it.
-        if let pending = pendingAcquisition { _ = try? await pending.task.value }
-        let response = try await send(BackendRequest(operation: .release, session: owned))
-        if let value = response.snapshot { snapshot = value }
+        if let pending = pendingMutation { _ = try? await pending.task.value }
+        let response = try await sendMutation(BackendRequest(operation: .release, session: owned))
+        if epoch == ownershipEpoch, let value = response.snapshot { observe(value) }
         return response.snapshot
     }
 
     @discardableResult public func restoreApple() async throws -> BackendSnapshot {
+        try Task.checkCancellation()
         ownershipEpoch += 1
+        let epoch = ownershipEpoch
         desiredProfile = nil
-        session = nil
         communicationFailed = false
-        if let pending = pendingAcquisition { _ = try? await pending.task.value }
+        if let pending = pendingMutation { _ = try? await pending.task.value }
         let current = try await status()
-        let response = try await send(BackendRequest(operation: .restoreApple,
+        try Task.checkCancellation()
+        guard epoch == ownershipEpoch else { throw CancellationError() }
+        session = nil
+        let response = try await sendMutation(BackendRequest(operation: .restoreApple,
             session: ControlSession(generation: current.generation), clientKind: kind))
         guard let value = response.snapshot else { throw DaemonError.protocolError("Missing restoration snapshot") }
-        snapshot = value
+        if epoch == ownershipEpoch { observe(value) }
         return value
     }
 
@@ -194,7 +216,7 @@ public actor BackendClient {
     @discardableResult public func startCalibration(_ parameters: CalibrationJobParameters,
                                                    takeover: Bool = false) async throws -> BackendSnapshot {
         let epoch = ownershipEpoch
-        if let pending = pendingAcquisition { _ = try? await pending.task.value }
+        if let pending = pendingMutation { _ = try? await pending.task.value }
         let current = try await status()
         try Task.checkCancellation()
         guard epoch == ownershipEpoch else { throw CancellationError() }
@@ -204,13 +226,13 @@ public actor BackendClient {
         session = candidate
         desiredProfile = nil
         do {
-            let response = try await sendAcquisition(BackendRequest(operation: .startCalibration, session: candidate,
+            let response = try await sendMutation(BackendRequest(operation: .startCalibration, session: candidate,
                 clientKind: kind, takeover: takeover, calibration: parameters))
             guard let value = response.snapshot, value.owner == candidate else {
                 throw DaemonError.protocolError("Missing calibration ownership")
             }
             if acquisitionEpoch == ownershipEpoch {
-                snapshot = value
+                observe(value)
                 communicationFailed = false
             }
             return value
@@ -221,11 +243,13 @@ public actor BackendClient {
     }
 
     @discardableResult public func cancelCalibration() async throws -> BackendSnapshot {
+        let epoch = ownershipEpoch
         let current = try await status()
+        guard epoch == ownershipEpoch else { throw CancellationError() }
         let response = try await send(BackendRequest(operation: .cancelCalibration,
             session: session ?? ControlSession(generation: current.generation), clientKind: kind))
         guard let value = response.snapshot else { throw DaemonError.protocolError("Missing calibration snapshot") }
-        snapshot = value
+        if epoch == ownershipEpoch { observe(value) }
         return value
     }
 

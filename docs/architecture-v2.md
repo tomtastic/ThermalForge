@@ -12,8 +12,15 @@ exit. Both launch from a root-owned executable in
 `BackendActuating`. Request handling uses a short state lock, so status and renewal
 remain available during long hardware operations. Requested intent and acknowledged
 hardware state are separate in `BackendSnapshot`; sensor readings carry monotonic
-freshness timestamps. Failed actuation discards the policy engine, restores Apple
+freshness timestamps and snapshots carry a generation-local sequence so late replies
+cannot replace newer state. Configuration mutations, acquisition and calibration
+admission use a separate serial metadata queue; disk work cannot block status,
+cancellation or renewal. Failed actuation discards the policy engine, restores Apple
 ownership, and rebuilds rule latches and RPM assumptions before fresh evaluation.
+Policy changes hand back before replacing the engine. Metadata-only revisions and
+normal policy requests for Apple control retain rule hysteresis. Fresh manual mode
+and matching target readings suppress redundant writes; drift forces reapplication
+or policy reconciliation.
 
 `BackendClient` gives the app and CLI the same asynchronous protocol. Every controlling
 session carries an ID, backend generation, authenticated UID/PID, and ten-second client
@@ -31,7 +38,11 @@ Long operations return accepted/pending, with their result in subsequent snapsho
 
 `RecoveryCoordinator` binds one generation to a PID plus kernel process-start identity.
 `FileRecoveryMarkerStore` fsyncs the marker and directory before permission for manual
-writes is returned. Completed sensing/control advances a separate ten-second monotonic
+writes is returned. Idle registration is also durable and remains after normal
+handback; only confirmed backend exit permits deleting the record. Recovery restart
+therefore fences an idle backend before baseline hardware restoration. Old markers
+without an explicit manual flag conservatively require protection.
+Completed sensing/control advances a separate ten-second monotonic
 lease; client traffic does not. The recovery timer checks every second. Unlock preparation
 is cancellable and has an eight-second total budget.
 
@@ -55,18 +66,27 @@ versioned envelopes track edits, import completion and recovery revocation. Lega
 imports contain values only, retain source files, and cannot overwrite explicit edits.
 Machine calibration stores separate lid states in one envelope, prefers valid root
 legacy data, and rejects ambiguous lid metadata. Reset records a tombstone.
+Writes fsync the replacement and parent directory. Bounded readers reject symlinked,
+non-regular, incorrectly owned or externally writable authoritative state files.
 
 Calibration runs on the same hardware queue with injected sensing, gated actuation,
 cancellation, storage and progress. Profile evaluation is suspended. The existing runner
 retains convergence, temperature, coverage and intensity checks. Workloads must actually
 stop before handback; a failed shutdown terminates the backend and leaves recovery to the
 independent process. Cancellation or client loss never saves partial data or restarts jobs.
+Workload startup/runtime failures abort the job. GPU and combined calibration require
+their corresponding sensor families. Once complete data, workload exit and handback
+are verified, the job atomically enters `saving`, the cancellation cutoff. Disk I/O
+does not hold the short request lock, and `completed` is published only after saving.
 
 ## Installation and verification
 
 `ServiceInstallationCoordinator` fences old controllers, verifies handback, stages protected
 files, starts recovery, then starts the backend. Uninstall retains recovery if handback
 fails. Bundle creation requires both production executables and excludes the test fixture.
+An installer-specific advisory lock excludes overlapping install/uninstall transactions.
+Handback confirmation requires recovery to have reconciled the exited registration,
+not merely a cached Apple-control acknowledgement from the formerly idle backend.
 
 `ThermalForgeFixture` runs the real backend/recovery implementations against a parent-owned
 SMC broker. Its operation journal survives subprocess crashes and verifies ordering across

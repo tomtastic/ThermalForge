@@ -56,8 +56,8 @@ final class CPUStressWorkload: CalibrationWorkload {
         let activeThreads = threads
         lock.unlock()
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while activeThreads.contains(where: { !$0.isFinished }), Date() < deadline {
+        let deadline = BackendTiming.monotonicNow + timeout
+        while activeThreads.contains(where: { !$0.isFinished }), BackendTiming.monotonicNow < deadline {
             Thread.sleep(forTimeInterval: 0.01)
         }
 

@@ -2,6 +2,8 @@ import Darwin
 import Foundation
 import ThermalForgeCore
 
+private struct FixtureLid: LidStateProvider { let isLidClosed = false }
+
 // This executable is never installed or bundled. Hardware state is owned by
 // the parent test broker and survives the death of either subprocess.
 private struct BrokerRequest: Codable {
@@ -110,6 +112,7 @@ do {
             actuator: fan, recovery: recovery,
             configurationStore: BackendConfigurationStore(directory: directory.appendingPathComponent("users")),
             calibrationStore: BackendCalibrationStore(directory: directory, legacyRoot: nil),
+            lidStateProvider: FixtureLid(),
             generation: generation, calibrationFactory: { context in
                 FixtureCalibration(context: context, broker: broker, directory: directory)
             }, configurationUID: { $0.uid }, onFatalFailure: { _ in exit(3) })

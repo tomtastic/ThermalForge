@@ -77,11 +77,15 @@ final class EquilibriumSweep {
         let result: Result<EquilibriumSweepResult, Error>
         do { result = .success(try runSweep()) } catch { result = .failure(error) }
         guard workload.stop() else { throw CalibrationError.workloadShutdownFailed }
+        if let failure = workload.failure { throw CalibrationError.workloadFailed(failure) }
         return try result.get()
     }
 
     private func runSweep() throws -> EquilibriumSweepResult {
-        _ = workload.start(intensity: workloadIntensity)
+        try checkCancellation()
+        guard workload.start(intensity: workloadIntensity) else {
+            throw CalibrationError.workloadFailed(workload.failure ?? "Calibration workload could not start")
+        }
         if let warning = workloadWarning() {
             log(warning)
         }
@@ -91,6 +95,7 @@ final class EquilibriumSweep {
 
         for fanPercent in levels {
             try checkCancellation()
+            if let failure = workload.failure { throw CalibrationError.workloadFailed(failure) }
             let targetRPM = max(maximumRPM * fanPercent, minimumRPM)
             let levelPercent = Int(fanPercent * 100)
             log(
@@ -107,6 +112,7 @@ final class EquilibriumSweep {
 
             while now() < deadline {
                 try checkCancellation()
+                if let failure = workload.failure { throw CalibrationError.workloadFailed(failure) }
                 let elapsedSeconds = Int(now() - levelStart)
                 guard let temperature = sample() else {
                     try wait(configuration.sampleInterval)

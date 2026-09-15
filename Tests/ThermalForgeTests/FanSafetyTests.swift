@@ -10,6 +10,8 @@ private final class SafetySMC: SMCReading {
     var rejectedWrites: Set<String> = []
     var ignoredWrites: Set<String> = []
     var targetWriteRestoresManual = false
+    var targetWriteRestoresAuto = false
+    var onRead: ((String) -> Void)?
     var journal: [String] = []
     init(uppercase: Bool = false, ftst: Bool = false, fans: Int = 2) {
         table["FNum"] = [UInt8(fans)]
@@ -27,6 +29,7 @@ private final class SafetySMC: SMCReading {
         return table[key].map { .present(size: UInt32($0.count)) } ?? .absent
     }
     func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32) {
+        onRead?(key)
         journal.append("read:\(key)")
         guard !unreadable.contains(key), let bytes = table[key] else { return (false, [], 0) }
         return (true, bytes, UInt32(bytes.count))
@@ -39,6 +42,7 @@ private final class SafetySMC: SMCReading {
             let modeKey = String(key.prefix(2)) + "md"
             table[modeKey] = [1]
         }
+        if targetWriteRestoresAuto, key.hasSuffix("Tg") { table[String(key.prefix(2)) + "md"] = [0] }
         return true
     }
     func getKeyInfo(_ key: String) -> (size: UInt32, type: String)? {
@@ -50,6 +54,51 @@ private final class SafetySMC: SMCReading {
 
 @Suite("Verified SMC safety")
 struct FanSafetyTests {
+    @Test("A temporarily unreadable CPU is discovered even when another sensor works")
+    func temporarySensorLoss() throws {
+        let smc = SafetySMC()
+        smc.table["Tp01"] = floatToSMCBytes(100)
+        smc.table["Tg0f"] = floatToSMCBytes(55)
+        smc.unreadable.insert("Tp01")
+        smc.unavailable.insert("Tp01")
+        var time: TimeInterval = 0
+        let fan = FanControl(smc: smc, wait: { _ in }, now: { time })
+        #expect(try fan.status().temperatures["Tp01"] == nil)
+        smc.unreadable = []; smc.unavailable = []
+        time = 2
+        #expect(try fan.status().temperatures["Tp01"] == 100)
+        smc.table["Tp01"] = [0, 0, 0, 0, 0, 0, 0, 0]
+        #expect(try fan.status().temperatures["Tp01"] == nil)
+    }
+
+    @Test("Oversized firmware RPM values cannot trap integer conversion or authorize control")
+    func oversizedRPM() throws {
+        let smc = SafetySMC()
+        smc.table["F0Ac"] = floatToSMCBytes(.greatestFiniteMagnitude)
+        smc.table["F0Mx"] = floatToSMCBytes(.greatestFiniteMagnitude)
+        let fan = FanControl(smc: smc)
+        #expect(try fan.status().fans[0].actualRPM == 0)
+        #expect(throws: ThermalForgeError.self) { try fan.setMax() }
+        #expect(!smc.journal.contains { $0.hasPrefix("write:") })
+    }
+
+    @Test("Manual target acknowledgement also requires the fan to remain manual")
+    func manualOwnershipReadback() {
+        let smc = SafetySMC()
+        smc.targetWriteRestoresAuto = true
+        #expect(throws: ThermalForgeError.self) { try FanControl(smc: smc).setMax() }
+    }
+
+    @Test("Cancellation during mode discovery prevents the diagnostic override write")
+    func cancellationDuringDiscovery() {
+        let smc = SafetySMC(ftst: true)
+        smc.table["F0md"] = [0]
+        let token = CancellationToken()
+        smc.onRead = { if $0 == "F0md" { token.cancel() } }
+        #expect(throws: ThermalForgeError.self) { try FanControl(smc: smc).setMax(cancellation: token) }
+        #expect(!smc.journal.contains { $0.hasPrefix("write:") })
+    }
+
     @Test("Unreadable mode is unknown, never reported as Apple auto")
     func unknownMode() throws {
         let smc = SafetySMC()

@@ -30,6 +30,7 @@ public final class BackendCoordinator: BackendRequestHandling {
     private let calibrationFactory: BackendCalibrationFactory
     private let onFatalFailure: (String) -> Void
     private let lock = NSLock()
+    private let metadata = DispatchQueue(label: "com.thermalforge.backend.metadata")
     private let work = DispatchQueue(label: "com.thermalforge.backend.work", qos: .userInitiated)
     private let scheduling = DispatchQueue(label: "com.thermalforge.backend.leases", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
@@ -51,7 +52,7 @@ public final class BackendCoordinator: BackendRequestHandling {
     // Accessed exclusively by work.
     private var engine: RuntimeControlDecisionEngine?
     private var engineSession: String?
-    private var engineRevision: Int?
+    private var engineConfiguration: BackendConfiguration?
     private var engineIntent: ControlIntent?
     private var manualSafetyOverride = false
     private var tickInterval: Float = 1
@@ -95,6 +96,7 @@ public final class BackendCoordinator: BackendRequestHandling {
 
     private func state<T>(_ operation: () throws -> T) rethrows -> T {
         lock.lock(); defer { lock.unlock() }
+        snapshot.sequence = (snapshot.sequence ?? 0) &+ 1
         return try operation()
     }
 
@@ -141,7 +143,20 @@ public final class BackendCoordinator: BackendRequestHandling {
     }
 
     public func handle(_ request: BackendRequest, peer: AuthenticatedPeer) -> BackendResponse {
+        switch request.operation {
+        case .configuration, .updateConfiguration, .importLegacy, .resetCalibration, .acquire, .startCalibration:
+            // Keep disk mutations, their exclusivity checks and publication ordered.
+            // Status, cancellation and lease renewals never wait for this queue.
+            return metadata.sync { handleRequest(request, peer: peer) }
+        default: return handleRequest(request, peer: peer)
+        }
+    }
+
+    private func handleRequest(_ request: BackendRequest, peer: AuthenticatedPeer) -> BackendResponse {
         guard request.version == 2 else { return error(request, "unsupportedVersion", "Protocol version 2 is required") }
+        if let session = request.session, session.id.isEmpty || session.id.utf8.count > 128 || session.generation.utf8.count > 128 {
+            return error(request, "invalidSession", "Session identity exceeds protocol limits")
+        }
         if request.operation == .status {
             return state { BackendResponse(requestID: request.requestID, snapshot: snapshot) }
         }
@@ -208,6 +223,9 @@ public final class BackendCoordinator: BackendRequestHandling {
                 return state {
                     guard calibrationActive, owns(request.session, peer: peer) else {
                         return errorLocked(request, "notOwner", "Only the calibration owner may cancel it; Apple restoration is available to all clients")
+                    }
+                    guard snapshot.calibration?.phase != .saving else {
+                        return errorLocked(request, "alreadyFinishing", "Workloads stopped and Apple control was verified; the completed result is being saved")
                     }
                     endSession(.released)
                     return BackendResponse(requestID: request.requestID, accepted: true, snapshot: snapshot)
@@ -344,7 +362,7 @@ public final class BackendCoordinator: BackendRequestHandling {
         snapshot.lastSessionEndReason = reason
         snapshot.restoration = .pending
         needsRestoration = true
-        if calibrationActive { snapshot.calibration?.phase = .cancelling }
+        if calibrationActive, snapshot.calibration?.phase != .saving { snapshot.calibration?.phase = .cancelling }
     }
 
     func expireClient() {
@@ -357,6 +375,7 @@ public final class BackendCoordinator: BackendRequestHandling {
     func requestTick() {
         state {
             guard !stopped, !sleeping, !fatal, !working, !calibrationActive else { return }
+            for uid in pendingEpochUIDs where !epochTasks.contains(uid) { queueEpochInvalidation(uid: uid) }
             working = true
             work.async { [weak self] in
                 guard let self else { return }
@@ -369,11 +388,12 @@ public final class BackendCoordinator: BackendRequestHandling {
     func drainWork() { work.sync {} }
 
     private func validOwner(_ expected: Owner) throws {
-        try state {
-            guard !fatal, !stopped, !sleeping, let owner,
+        try state { try validOwnerLocked(expected) }
+    }
+    private func validOwnerLocked(_ expected: Owner) throws {
+        guard !fatal, !stopped, !sleeping, let owner,
                   owner.cancellation === expected.cancellation, owner.expiry > now(),
                   !expected.cancellation.isCancelled else { throw CalibrationError.cancelled }
-        }
     }
     private func sample(owner expected: Owner? = nil) throws -> ThermalStatus {
         if let expected { try validOwner(expected) }
@@ -398,18 +418,21 @@ public final class BackendCoordinator: BackendRequestHandling {
     private func apply(_ command: FanCommand, owner expected: Owner) throws {
         try validOwner(expected)
         if command == .resetAuto {
-            guard restoreOnWorkQueue() else { throw Failure.rejected("Apple restoration failed") }
+            guard restoreOnWorkQueue(resetPolicy: false) else { throw Failure.rejected("Apple restoration failed") }
             return
         }
         guard !state({ needsRestoration || pendingEpochUIDs.contains(expected.uid) }) else {
             throw Failure.rejected("Recovery and durable control revocation must complete before manual control")
         }
+        let appliedCommand: FanCommand
+        if case .setRPM(let rpm) = command, let fans = state({ snapshot.sensors?.fans }),
+           let minimum = fans.map(\.minRPM).max(), let maximum = fans.map(\.maxRPM).min() {
+            guard minimum <= maximum else { throw Failure.rejected("Fan RPM ranges do not overlap") }
+            appliedCommand = .setRPM(min(max(rpm, Float(minimum)), Float(maximum)))
+        } else { appliedCommand = command }
+        if state({ commandIsAcknowledged(appliedCommand, sensors: snapshot.sensors) }) { return }
         try protect { try recovery.authorizeManual() }
         try validOwner(expected)
-        let appliedCommand: FanCommand
-        if case .setRPM(let rpm) = command, let fan = state({ snapshot.sensors?.fans.first }) {
-            appliedCommand = .setRPM(min(max(rpm, Float(fan.minRPM)), Float(fan.maxRPM)))
-        } else { appliedCommand = command }
         try actuator.apply(appliedCommand, cancellation: expected.cancellation)
         try validOwner(expected)
         state {
@@ -422,6 +445,19 @@ public final class BackendCoordinator: BackendRequestHandling {
             }
         }
     }
+
+    // Fresh mode and target readings allow steady manual sessions to avoid
+    // rewriting unchanged SMC targets. Any drift requires a new acknowledgement.
+    private func commandIsAcknowledged(_ command: FanCommand, sensors: ThermalStatus?) -> Bool {
+        guard let fans = sensors?.fans, !fans.isEmpty, fans.allSatisfy({ $0.mode == "manual" }) else { return false }
+        switch command {
+        case .setMax:
+            return snapshot.acknowledgedControl == .maximum && fans.allSatisfy { $0.targetRPM == $0.maxRPM }
+        case .setRPM(let rpm):
+            return snapshot.acknowledgedControl == .manualRPM(Int(rpm)) && fans.allSatisfy { $0.targetRPM == Int(rpm) }
+        case .resetAuto: return false
+        }
+    }
     // Called with the state lock; duplicate pending explicit handbacks share
     // one durable invalidation, so no gap can admit a stale automatic request.
     private func queueEpochInvalidation(uid: UInt32) {
@@ -431,11 +467,18 @@ public final class BackendCoordinator: BackendRequestHandling {
     }
 
     private func persistRecoveryEpoch(uid: UInt32) {
+        metadata.sync { persistRecoveryEpochLocked(uid: uid) }
+    }
+    private func persistRecoveryEpochLocked(uid: UInt32) {
         do {
             let configuration = try configurationStore.invalidateAutomaticRecovery(uid: uid)
             state {
                 pendingEpochUIDs.remove(uid)
                 epochTasks.remove(uid)
+                if pendingEpochUIDs.isEmpty, !needsRestoration, snapshot.acknowledgedControl == .apple {
+                    snapshot.restoration = .verified
+                    snapshot.restorationErrors = []
+                }
                 if let epoch = configuration.recoveryEpoch { knownEpochs[uid] = epoch }
                 if owner == nil || owner?.uid == uid {
                     snapshot.recoveryEpoch = configuration.recoveryEpoch
@@ -448,11 +491,15 @@ public final class BackendCoordinator: BackendRequestHandling {
             state {
                 epochTasks.remove(uid)
                 snapshot.restorationErrors.append("Could not persist control revocation: \(error.localizedDescription)")
+                snapshot.restorationErrors = Array(snapshot.restorationErrors.suffix(8))
             }
         }
     }
 
     private func persistSelection(owner expected: Owner) {
+        metadata.sync { persistSelectionLocked(owner: expected) }
+    }
+    private func persistSelectionLocked(owner expected: Owner) {
         guard case .profile(let id) = expected.intent else { return }
         do {
             try validOwner(expected)
@@ -481,6 +528,19 @@ public final class BackendCoordinator: BackendRequestHandling {
             if state({ needsRestoration }), !restoreOnWorkQueue() { return }
             let status = try sample(owner: expected)
             if let expected, let intent = expected.intent {
+                if case .profile = intent, engine != nil {
+                    let drift = state { () -> Bool in
+                        switch snapshot.acknowledgedControl {
+                        case .maximum: return !commandIsAcknowledged(.setMax, sensors: status)
+                        case .manualRPM(let rpm): return !commandIsAcknowledged(.setRPM(Float(rpm)), sensors: status)
+                        case .apple, .unknown: return false
+                        }
+                    }
+                    if drift {
+                        guard restoreOnWorkQueue() else { throw Failure.rejected("Fan ownership drift requires Apple restoration") }
+                        try validOwner(expected)
+                    }
+                }
                 let command: FanCommand?
                 switch intent {
                 case .rpm(let rpm):
@@ -491,13 +551,20 @@ public final class BackendCoordinator: BackendRequestHandling {
                 case .maximum: command = .setMax
                 case .profile(let profileID):
                     let config = expected.configuration
-                    if engineSession != expected.session.id || engineRevision != config.revision || engineIntent != intent {
+                    let policyChanged = engineConfiguration.map {
+                        $0.profiles != config.profiles || $0.rules != config.rules || $0.rulesEnabled != config.rulesEnabled
+                    } ?? false
+                    if engineSession != expected.session.id || policyChanged || engineIntent != intent {
+                        if engine != nil {
+                            guard restoreOnWorkQueue() else { throw Failure.rejected("Policy replacement requires Apple restoration") }
+                            try validOwner(expected)
+                        }
                         let profile = config.profiles.first { $0.id == profileID } ?? .silent
                         let service = ControlService()
                         service.replaceRules(config.rules, enabled: config.rulesEnabled)
                         engine = RuntimeControlDecisionEngine(profile: profile, controlService: service, profiles: config.profiles)
                         engineSession = expected.session.id
-                        engineRevision = config.revision
+                        engineConfiguration = config
                         engineIntent = intent
                     }
                     let lidClosed = lidStateProvider.isLidClosed
@@ -520,10 +587,12 @@ public final class BackendCoordinator: BackendRequestHandling {
     }
 
     @discardableResult
-    private func restoreOnWorkQueue() -> Bool {
+    private func restoreOnWorkQueue(resetPolicy: Bool = true) -> Bool {
         // Calibration owns this queue until its runner confirms workload exit.
         guard !state({ unsafeWorkloads }) else { return false }
-        engine = nil; engineSession = nil; engineRevision = nil; engineIntent = nil; manualSafetyOverride = false
+        if resetPolicy {
+            engine = nil; engineSession = nil; engineConfiguration = nil; engineIntent = nil; manualSafetyOverride = false
+        }
         let result = actuator.restoreApple()
         state {
             snapshot.restoration = result.verified ? (pendingEpochUIDs.isEmpty ? .verified : .pending) : .failed
@@ -544,7 +613,10 @@ public final class BackendCoordinator: BackendRequestHandling {
             if let expected, owner?.cancellation === expected.cancellation { endSession(.backendFailure) }
             snapshot.restorationErrors = [error.localizedDescription]
         }
-        _ = restoreOnWorkQueue()
+        if expected != nil || state({ needsRestoration || snapshot.acknowledgedControl != .apple }) {
+            _ = restoreOnWorkQueue()
+        }
+        state { snapshot.restorationErrors = Array(([error.localizedDescription] + snapshot.restorationErrors).prefix(8)) }
         if let message = state({ protectionFailure }) { fatalFailure(message) }
     }
     private func fatalFailure(_ message: String) {
@@ -586,6 +658,10 @@ public final class BackendCoordinator: BackendRequestHandling {
                 readStatus: { [self] in
                     do {
                         let status = try sample(owner: expected)
+                        guard let stress = CalibrationStressType(rawValue: parameters.stressType),
+                              CalibrationTemperatureSelector(stressType: stress).select(from: status.temperatures) != nil else {
+                            throw Failure.rejected("Fresh sensors for every requested calibration workload are required")
+                        }
                         try protect { try recovery.completedWork() }
                         return status
                     } catch {
@@ -621,11 +697,22 @@ public final class BackendCoordinator: BackendRequestHandling {
             guard restored, calibration.lidClosed == lidClosed, lidStateProvider.isLidClosed == lidClosed else {
                 throw Failure.rejected("Calibration handback or lid-state verification failed")
             }
-            try calibrationStore.save(calibration)
-            state { snapshot.calibration?.phase = .completed; snapshot.calibration?.message = "Calibration saved"; snapshot.calibrationLidClosed = lidClosed }
+            try metadata.sync {
+                try state {
+                    // This is the cancellation cutoff: only a complete result,
+                    // stopped workloads and verified handback can reach saving.
+                    // Slow disk I/O then runs without holding the request lock.
+                    try validOwnerLocked(expected)
+                    snapshot.calibration?.phase = .saving
+                    snapshot.calibration?.message = "Saving completed calibration"
+                }
+                try calibrationStore.save(calibration)
+                state { snapshot.calibration?.phase = .completed; snapshot.calibration?.message = "Calibration saved"; snapshot.calibrationLidClosed = lidClosed }
+            }
         } catch {
             state {
-                snapshot.calibration?.phase = expected.cancellation.isCancelled ? .cancelled : .failed
+                let cancelled = expected.cancellation.isCancelled && snapshot.calibration?.phase != .saving
+                snapshot.calibration?.phase = cancelled ? .cancelled : .failed
                 snapshot.calibration?.message = error.localizedDescription
             }
             if case Failure.protection = error { fatalFailure(error.localizedDescription) }

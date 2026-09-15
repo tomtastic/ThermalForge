@@ -28,6 +28,7 @@ private final class WorkloadEventRecorder {
 private final class RecordingCalibrationWorkload: CalibrationWorkload {
     private let name: String
     private let recorder: WorkloadEventRecorder
+    var starts = true
 
     init(name: String, recorder: WorkloadEventRecorder) {
         self.name = name
@@ -36,7 +37,7 @@ private final class RecordingCalibrationWorkload: CalibrationWorkload {
 
     func start(intensity: Float) -> Bool {
         recorder.append(.started(name, intensity))
-        return true
+        return starts
     }
 
     func stop() -> Bool {
@@ -250,8 +251,28 @@ struct CalibrationConvergenceTests {
 
         #expect(!workload.start(intensity: 0.25))
         #expect(!workload.isRunning)
-        #expect(workload.lastWarning == "Warning: Metal device not available, running CPU-only stress")
+        #expect(workload.failure == "Metal device is unavailable; the requested GPU workload cannot run")
         #expect(workload.stop())
+    }
+
+    @Test("GPU and combined calibration require readings from their stressed sensor families")
+    func missingStressSensors() {
+        let cpuOnly: [String: Float] = ["Tp01": 60]
+        #expect(CalibrationTemperatureSelector(stressType: .gpu).select(from: cpuOnly) == nil)
+        #expect(CalibrationTemperatureSelector(stressType: .combined).select(from: cpuOnly) == nil)
+        #expect(CalibrationTemperatureSelector(stressType: .cpu).select(from: cpuOnly)?.selected == 60)
+    }
+
+    @Test("A combined workload failure stops every component and rejects partial stress")
+    func combinedStartupFailure() {
+        let recorder = WorkloadEventRecorder()
+        let cpu = RecordingCalibrationWorkload(name: "cpu", recorder: recorder)
+        let gpu = RecordingCalibrationWorkload(name: "gpu", recorder: recorder)
+        gpu.starts = false
+        let group = CalibrationWorkloadGroup(workloads: [cpu, gpu])
+        #expect(!group.start(intensity: 0.1))
+        #expect(group.stop())
+        #expect(recorder.snapshot == [.started("cpu", 0.1), .started("gpu", 0.1), .stopped("gpu"), .stopped("cpu")])
     }
 
     @Test("All-maximum calibration curves are rejected")
