@@ -53,6 +53,28 @@ The full suite also exposed a test that checked protection between hardware mode
 restoration and durable acknowledgement. It now waits for completion through the
 independent recovery socket, because that scenario deliberately removes the backend socket.
 
+## RC startup regression
+
+Live RC2 installation exposed a service that exited cleanly after startup. The CLI
+uses an asynchronous ArgumentParser entry point, which can invoke synchronous
+service commands on a worker thread. Those commands tried to run the main thread's
+run loop. The original subprocess fixture had a synchronous entry point and missed
+this boundary.
+
+Both services now run their calling thread's Core Foundation loop, retain a loop
+source and keep their service objects alive for its duration. Power notifications
+use that same loop. An explicit source also avoids the empty-loop return described
+in [Apple's run-loop documentation](https://developer.apple.com/documentation/foundation/runloop/run()).
+The fixture now uses the production async command boundary and actual backend
+server lifetime, and selects the fixture matching Debug/Release test configuration.
+The cold-start regression reproduced the premature return before the fix.
+
+Installer retry now handles a loaded but unreachable old recovery job: stop and
+confirm its exit, reconcile the durable backend identity using the recovery
+coordinator, then verify handback. Failed process fencing or restoration retains
+recovery and prevents replacement. Tests cover both absent and outstanding markers,
+unkillable processes, failed handback and failed recovery restart.
+
 ## Release boundaries
 
 - Direct-mode and `Ftst` machines still need physical handback, sleep/wake and

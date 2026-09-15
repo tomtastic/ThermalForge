@@ -24,13 +24,24 @@ struct InstalledServiceManager {
 
     func coordinator(removeFiles: @escaping () throws -> Void = {}) -> ServiceInstallationCoordinator {
         ServiceInstallationCoordinator(stopControllers: stopControllers, restore: verifyHandback,
-            stopRecovery: { try stopService(ThermalForgeDaemon.recoveryLabel) },
+            stopRecovery: stopRecovery,
             stageFiles: stageFiles, startRecovery: startRecovery, startBackend: startBackend,
             removeFiles: removeFiles)
     }
 
     func stopControllers() throws {
         try stopService(ThermalForgeDaemon.label)
+        try fenceDiscoveredProcesses(recoveryOnly: false)
+    }
+
+    func stopRecovery() throws {
+        try stopService(ThermalForgeDaemon.recoveryLabel)
+        // A job may spawn between its PID query and bootout. Once unloaded it
+        // cannot respawn; fence any remaining recovery process before SMC work.
+        try fenceDiscoveredProcesses(recoveryOnly: true)
+    }
+
+    func fenceDiscoveredProcesses(recoveryOnly: Bool) throws {
         // Fence old foreground writers and the old GUI before touching SMC.
         // The process name is only discovery; each signal is bound to a start identity.
         let result = try ProcessRunner().run(executableURL: URL(fileURLWithPath: "/bin/ps"),
@@ -42,12 +53,13 @@ struct InstalledServiceManager {
             guard fields.count >= 2, let pid = Int32(fields[0]), pid != getpid() else { continue }
             let name = URL(fileURLWithPath: String(fields[1])).lastPathComponent
             guard name == "ThermalForgeApp" || name == "thermalforge" else { continue }
+            let arguments = fields.count > 2 ? String(fields[2]) : ""
+            let words = arguments.split(whereSeparator: \.isWhitespace)
+            let isRecovery = name == "thermalforge" && words.contains("recovery")
+            guard isRecovery == recoveryOnly else { continue }
             if name == "thermalforge" {
-                let arguments = fields.count > 2 ? String(fields[2]) : ""
-                // Do not stop the independent service or another installer.
-                guard !arguments.split(whereSeparator: \.isWhitespace).contains("recovery"),
-                      !arguments.split(whereSeparator: \.isWhitespace).contains("install"),
-                      !arguments.split(whereSeparator: \.isWhitespace).contains("uninstall") else { continue }
+                // Do not stop another installer.
+                guard !words.contains("install"), !words.contains("uninstall") else { continue }
             }
             guard let identity = processes.identity(pid: pid) else {
                 if kill(pid, 0) == -1 && errno == ESRCH { continue }
@@ -89,13 +101,30 @@ struct InstalledServiceManager {
         if case .loaded = try launchd.serviceState(label: ThermalForgeDaemon.recoveryLabel) {
             let deadline = BackendTiming.monotonicNow + 15
             var last = RestorationResult(verified: false, errors: ["Recovery unavailable"])
+            var receivedSnapshot = false
             repeat {
-                if let status = try? RecoveryClient.inspect() {
+                do {
+                    let status = try RecoveryClient.inspect()
+                    receivedSnapshot = true
                     last = status.restoration
-                    if status.ready && !status.protected && status.generation == nil && last.verified { return last }
+                    if status.readyForInstallation { return last }
+                } catch {
+                    if !receivedSnapshot { last.errors = [String(describing: error)] }
                 }
                 Thread.sleep(forTimeInterval: 0.1)
             } while BackendTiming.monotonicNow < deadline
+            if !receivedSnapshot {
+                return RecoveryServiceRepair(stop: stopRecovery, makeCoordinator: {
+                    let store = try FileRecoveryMarkerStore(directory: RecoveryService.stateDirectory)
+                    let fanControl = try FanControl()
+                    return try RecoveryCoordinator(markerStore: store, processControl: processes,
+                        restore: { fanControl.restoreApple() })
+                }, restart: {
+                    if case .notLoaded = try launchd.serviceState(label: ThermalForgeDaemon.recoveryLabel) {
+                        try launchd.bootstrap(plistPath: ThermalForgeDaemon.recoveryPlistPath)
+                    }
+                }).restore()
+            }
             return .init(verified: false, errors: last.errors + ["Independent recovery has not confirmed handback"])
         }
         // Upgrade from v1: all old writers have positively exited and there is
@@ -159,11 +188,20 @@ struct InstalledServiceManager {
     func startRecovery() throws {
         try launchd.bootstrap(plistPath: ThermalForgeDaemon.recoveryPlistPath)
         let deadline = BackendTiming.monotonicNow + 15
+        var last = "No recovery response"
         repeat {
-            if let state = try? RecoveryClient.inspect(), state.ready && !state.protected && state.restoration.verified { return }
+            do {
+                let state = try RecoveryClient.inspect()
+                if state.readyForInstallation { return }
+                last = "Recovery pending: " + state.restoration.errors.joined(separator: "; ")
+                if state.generation != nil { last += "; a backend generation is still registered" }
+            } catch { last = "Recovery socket: \(error)" }
             Thread.sleep(forTimeInterval: 0.1)
         } while BackendTiming.monotonicNow < deadline
-        throw ServiceInstallationError.serviceUnavailable(ThermalForgeDaemon.recoveryLabel)
+        if let state = try? launchd.serviceState(label: ThermalForgeDaemon.recoveryLabel) {
+            last += "; launchd state: \(state)"
+        }
+        throw ServiceInstallationError.serviceUnavailable(ThermalForgeDaemon.recoveryLabel, detail: last)
     }
 
     func startBackend() throws {

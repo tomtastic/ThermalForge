@@ -260,13 +260,16 @@ public final class DaemonServer {
     static let maximumRequestBytes = BackendTiming.maximumFrameBytes
     private let listener: UnixSocketListener
     private let coordinator: BackendCoordinator
+    private let observeSystemPower: Bool
     private var rootPort: io_connect_t = 0
     private var notifyPort: IONotificationPortRef?
     private var notifier: io_object_t = 0
 
     public init(coordinator: BackendCoordinator, socketPath: String = ThermalForgeDaemon.socketPath,
-                authorize: @escaping (AuthenticatedPeer) -> Bool = DaemonServer.isAuthorized) throws {
+                authorize: @escaping (AuthenticatedPeer) -> Bool = DaemonServer.isAuthorized,
+                observeSystemPower: Bool = true) throws {
         self.coordinator = coordinator
+        self.observeSystemPower = observeSystemPower
         let router = BackendRequestRouter(backend: coordinator)
         listener = try UnixSocketListener(path: socketPath, mode: 0o666, authorize: authorize,
                                          handler: router.handle)
@@ -277,12 +280,14 @@ public final class DaemonServer {
     }
 
     public func run() {
-        start()
-        RunLoop.main.run()
+        withExtendedLifetime(self) {
+            start()
+            ServiceRunLoop.run()
+        }
     }
 
     public func start() {
-        registerPowerNotifications()
+        if observeSystemPower { registerPowerNotifications() }
         coordinator.start()
         listener.start()
     }
@@ -306,7 +311,7 @@ public final class DaemonServer {
                 }
             }, &notifier)
         if rootPort != 0, let notifyPort {
-            CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue(), .defaultMode)
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue(), .defaultMode)
         }
     }
 

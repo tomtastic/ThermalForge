@@ -2,12 +2,13 @@ import Foundation
 
 public enum ServiceInstallationError: LocalizedError {
     case restorationUnverified([String])
-    case serviceUnavailable(String)
+    case serviceUnavailable(String, detail: String? = nil)
     public var errorDescription: String? {
         switch self {
         case .restorationUnverified(let errors):
             return "Apple fan ownership is unverified; recovery is retained and new control remains blocked. " + errors.joined(separator: "; ")
-        case .serviceUnavailable(let label): return "Service did not become ready: \(label)"
+        case .serviceUnavailable(let label, let detail):
+            return "Service did not become ready: \(label)" + (detail.map { ". \($0)" } ?? "")
         }
     }
 }

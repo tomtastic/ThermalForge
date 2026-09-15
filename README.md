@@ -293,7 +293,22 @@ Installation fences old controllers and verifies handback before enabling either
 service. Recovery starts successfully before the backend. Failed uninstall restoration
 retains recovery and reports the failure. Automated tests do not replace installed services.
 
+If a previous recovery job is loaded but unreachable, installation first stops it
+and confirms process exit. The installer then reconciles any durable backend marker
+and verifies Apple ownership before replacing the services. Failed reconciliation
+retains the old recovery job and blocks installation; it does not bypass handback.
+
 ## Troubleshooting
+
+For a recovery readiness failure, retry with the latest candidate's bundled installer:
+
+```bash
+sudo "/Applications/ThermalForge.app/Contents/Resources/thermalforge" install
+```
+
+Repairing an unreachable older job can take an additional 15 seconds. Readiness
+errors include the last socket/restoration result and launchd state. Inspect a job
+without changing it using `sudo launchctl print system/com.thermalforge.recovery`.
 
 If macOS blocks the app after download:
 ```bash

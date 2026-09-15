@@ -70,6 +70,69 @@ private final class RecoveryHarness {
 
 @Suite("Independent recovery ordering")
 struct RecoveryTests {
+    @Test("Installer repair fences failed recovery before opening SMC and reconciles durable backend identity", arguments: [false, true])
+    func installationRepairFencesBothWriters(outstandingBackend: Bool) throws {
+        let h = try RecoveryHarness()
+        if outstandingBackend { h.begin() }
+        h.journal.entries = []
+        let repair = RecoveryServiceRepair(stop: { h.journal.entries.append("recovery-exit") },
+            makeCoordinator: { h.journal.entries.append("open-SMC"); return try h.makeCore() },
+            restart: { h.journal.entries.append("restart-recovery") },
+            now: { h.clock.value }, wait: { h.clock.value += $0 })
+
+        #expect(repair.restore(timeout: 3).verified)
+        let expected = outstandingBackend
+            ? ["recovery-exit", "open-SMC", "term", "kill", "exit", "restore", "clear"]
+            : ["recovery-exit", "open-SMC", "restore"]
+        #expect(h.journal.entries == expected)
+        #expect(h.store.value == nil)
+    }
+
+    @Test("Failed recovery fencing prevents local repair from opening SMC")
+    func installationRepairRequiresRecoveryExit() throws {
+        let h = try RecoveryHarness()
+        let repair = RecoveryServiceRepair(stop: { throw RecoveryError.failure("recovery still alive") },
+            makeCoordinator: { h.journal.entries.append("open-SMC"); return try h.makeCore() },
+            restart: { h.journal.entries.append("retain-recovery") })
+
+        let result = repair.restore()
+        #expect(!result.verified)
+        #expect(result.errors.contains("recovery still alive"))
+        #expect(h.journal.entries == ["retain-recovery"])
+    }
+
+    @Test("Repair retains recovery and its marker when a backend cannot be fenced")
+    func installationRepairCannotBypassOutstandingWriter() throws {
+        let h = try RecoveryHarness()
+        h.begin()
+        h.processes.killExits = false
+        h.journal.entries = []
+        let repair = RecoveryServiceRepair(stop: { h.journal.entries.append("recovery-exit") },
+            makeCoordinator: { try h.makeCore() },
+            restart: { h.journal.entries.append("retain-recovery") },
+            now: { h.clock.value }, wait: { h.clock.value += $0 })
+
+        #expect(!repair.restore(timeout: 2).verified)
+        #expect(!h.journal.entries.contains("restore"))
+        #expect(!h.journal.entries.contains("clear"))
+        #expect(h.journal.entries.last == "retain-recovery")
+        #expect(h.store.value?.generation == "g1")
+    }
+
+    @Test("Repair preserves failed hardware restoration and recovery restart errors")
+    func installationRepairReportsHandbackAndRestartFailure() throws {
+        let h = try RecoveryHarness()
+        h.restorationWorks = false
+        let repair = RecoveryServiceRepair(stop: {}, makeCoordinator: { try h.makeCore() },
+            restart: { throw RecoveryError.failure("bootstrap rejected") },
+            now: { h.clock.value }, wait: { h.clock.value += $0 })
+
+        let result = repair.restore(timeout: 1)
+        #expect(!result.verified)
+        #expect(result.errors.contains("SMC unavailable"))
+        #expect(result.errors.contains { $0.contains("bootstrap rejected") })
+    }
+
     @Test("Initial verified handback precedes registration and durable marker precedes permission")
     func initialReconciliationAndMarker() throws {
         let h = try RecoveryHarness()
@@ -100,6 +163,9 @@ struct RecoveryTests {
         #expect(!h.send(.authorizeManual).ok)
         #expect(h.core.snapshot().generation == nil)
         #expect(h.store.value == nil)
+        #expect(h.core.snapshot().readyForInstallation)
+        #expect(h.send(.connect).ok)
+        #expect(!h.core.snapshot().readyForInstallation)
     }
 
     @Test("Verified backend handback clears protection and idle work cannot recreate it")

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import ArgumentParser
 import ThermalForgeCore
 
 private struct FixtureLid: LidStateProvider { let isLidClosed = false }
@@ -92,17 +93,41 @@ private final class FixtureCalibration: BackendCalibrationRunning {
     }
 }
 
-let args = CommandLine.arguments
-guard args.count == 4 else { fatalError("fixture <backend|recovery|owner> <isolated-directory> <broker-socket>") }
-let role = args[1]
-let directory = URL(fileURLWithPath: args[2], isDirectory: true)
-private let broker = BrokerSMC(path: args[3], writer: role)
-let recoveryPath = directory.appendingPathComponent("r.sock").path
-let backendPath = directory.appendingPathComponent("b.sock").path
-let fan = FanControl(smc: broker)
+// Match the production async root / synchronous service subcommand boundary.
+// A synchronous top-level fixture hides thread-affinity startup failures.
+@main
+struct FixtureMain: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        subcommands: [FixtureCommand.self], defaultSubcommand: FixtureCommand.self)
+}
 
-do {
-    if role == "recovery" {
+struct FixtureCommand: ParsableCommand {
+    @Argument var role: String
+    @Argument var directoryPath: String
+    @Argument var brokerPath: String
+
+    func run() throws {
+        try runFixture(role: role, directoryPath: directoryPath, brokerPath: brokerPath)
+    }
+}
+
+private func runFixture(role: String, directoryPath: String, brokerPath: String) throws {
+    let directory = URL(fileURLWithPath: directoryPath, isDirectory: true)
+    let broker = BrokerSMC(path: brokerPath, writer: role)
+    let recoveryPath = directory.appendingPathComponent("r.sock").path
+    let backendPath = directory.appendingPathComponent("b.sock").path
+    let fan = FanControl(smc: broker)
+
+    if role == "recovery-cold" {
+        // Unlike the broker-backed fixture, startup does not perform socket I/O
+        // that can incidentally initialize a Foundation main-run-loop source.
+        let coordinator = try RecoveryCoordinator(
+            markerStore: FileRecoveryMarkerStore(directory: directory.appendingPathComponent("recovery")),
+            processControl: SystemRecoveryProcessControl(), restore: { .init(verified: true) })
+        try RecoveryService(coordinator: coordinator, socketPath: recoveryPath,
+            authorize: { $0.uid == getuid() }).run()
+        exit(9) // A service lifetime must not silently return after startup.
+    } else if role == "recovery" {
         try RecoveryService(fanControl: fan, socketPath: recoveryPath,
             stateDirectory: directory.appendingPathComponent("recovery"), authorize: { $0.uid == getuid() }).run()
     } else if role == "backend" {
@@ -117,13 +142,12 @@ do {
                 FixtureCalibration(context: context, broker: broker, directory: directory)
             }, configurationUID: { $0.uid }, onFatalFailure: { _ in exit(3) })
         let runtime = BackendServiceRuntime(coordinator: coordinator, recovery: recovery)
-        let router = BackendRequestRouter(backend: coordinator)
-        let listener = try UnixSocketListener(path: backendPath, authorize: { $0.uid == getuid() }, handler: router.handle)
+        let server = try DaemonServer(coordinator: coordinator, socketPath: backendPath,
+            authorize: { $0.uid == getuid() }, observeSystemPower: false)
         coordinator.start(interval: 0.1)
         runtime.start()
-        listener.start()
-        RunLoop.main.run()
-        withExtendedLifetime((coordinator, runtime, listener)) {}
+        server.run()
+        withExtendedLifetime((coordinator, runtime, server)) {}
     } else if role == "owner" {
         func send(_ request: BackendRequest) throws -> BackendResponse {
             try JSONDecoder().decode(BackendResponse.self, from:
@@ -142,7 +166,4 @@ do {
             guard try send(BackendRequest(operation: .renew, session: session)).ok else { exit(6) }
         }
     } else { exit(2) }
-} catch {
-    FileHandle.standardError.write(Data("fixture failed: \(error)\n".utf8))
-    exit(1)
 }

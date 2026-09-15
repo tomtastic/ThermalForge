@@ -125,6 +125,7 @@ private final class ServiceFixture {
     let directory: URL
     let broker: HardwareBroker
     private(set) var processes: [Process] = []
+    private var errorLogs: [URL] = []
     var backend: Process!
     var recovery: Process!
     let executable: URL
@@ -134,8 +135,13 @@ private final class ServiceFixture {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         broker = try HardwareBroker(directory: directory, lowerMode: lowerMode, ftst: ftst)
         let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let candidates = [repository.appendingPathComponent(".build/debug/ThermalForgeFixture"),
-                          repository.appendingPathComponent(".build/out/Products/Debug/ThermalForgeFixture")]
+        #if DEBUG
+        let configuration = "Debug"
+        #else
+        let configuration = "Release"
+        #endif
+        let candidates = [repository.appendingPathComponent(".build/\(configuration.lowercased())/ThermalForgeFixture"),
+                          repository.appendingPathComponent(".build/out/Products/\(configuration)/ThermalForgeFixture")]
         executable = try #require(candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }, "Build the test-only ThermalForgeFixture target")
     }
     func spawn(_ role: String) throws -> Process {
@@ -143,9 +149,14 @@ private final class ServiceFixture {
         process.executableURL = executable
         process.arguments = [role, directory.path, directory.appendingPathComponent("h.sock").path]
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        let log = directory.appendingPathComponent("\(role)-\(UUID().uuidString).stderr")
+        FileManager.default.createFile(atPath: log.path, contents: nil)
+        let errorFile = try FileHandle(forWritingTo: log)
+        defer { try? errorFile.close() }
+        process.standardError = errorFile
         try process.run()
         processes.append(process)
+        errorLogs.append(log)
         return process
     }
     func start() throws {
@@ -179,7 +190,10 @@ private final class ServiceFixture {
             Thread.sleep(forTimeInterval: 0.05)
         }
         struct Expired: Error {}
-        Issue.record("Timed out waiting for isolated service state")
+        let exits = processes.filter { !$0.isRunning }.map { "pid \($0.processIdentifier): exit \($0.terminationStatus)" }
+        let errors = errorLogs.compactMap { try? Data(contentsOf: $0) }
+            .map { String(decoding: $0.suffix(4096), as: UTF8.self) }
+        Issue.record("Timed out waiting for isolated service state. \((exits + errors).joined(separator: "; "))")
         throw Expired()
     }
     func flag(_ name: String) throws { try Data().write(to: directory.appendingPathComponent(name)) }
@@ -195,6 +209,17 @@ private final class ServiceFixture {
 
 @Suite("Subprocess backend and independent recovery", .serialized)
 struct SubprocessRecoveryTests {
+    @Test func coldRecoveryRemainsAliveWithoutIncidentalRunLoopSources() throws {
+        let fixture = try ServiceFixture()
+        let recovery = try fixture.spawn("recovery-cold")
+        try fixture.waitFor { (try? fixture.recoveryState().ready) == true }
+        // Observe through more than one expiry tick, without registering a writer.
+        Thread.sleep(forTimeInterval: BackendTiming.expiryInterval * 2)
+        #expect(recovery.isRunning)
+        #expect(try fixture.recoveryState().ready)
+        #expect(try fixture.recoveryState().generation == nil)
+    }
+
     @Test func killedControllerIsFencedBeforeRestoration() throws {
         let fixture = try ServiceFixture()
         try fixture.start()

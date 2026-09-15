@@ -40,7 +40,12 @@ public final class RecoveryService {
         timer.resume()
     }
     public func stop() { timer?.cancel(); timer = nil; listener.stop() }
-    public func run() { start(); RunLoop.main.run() }
+    public func run() {
+        withExtendedLifetime(self) {
+            start()
+            ServiceRunLoop.run()
+        }
+    }
     deinit { stop() }
 }
 

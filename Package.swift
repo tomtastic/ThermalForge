@@ -37,7 +37,10 @@ let package = Package(
         // Test-only command. Release packaging copies only the two production executables.
         .executableTarget(
             name: "ThermalForgeFixture",
-            dependencies: ["ThermalForgeCore"],
+            dependencies: [
+                "ThermalForgeCore",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
             path: "Tests/IntegrationFixture"
         ),
     ]

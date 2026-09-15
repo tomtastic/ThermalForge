@@ -92,6 +92,10 @@ public struct RecoverySnapshot: Codable {
     public let revoked: Bool
     public let generation: String?
     public let restoration: RestorationResult
+
+    public var readyForInstallation: Bool {
+        ready && !protected && !revoked && generation == nil && restoration.verified
+    }
 }
 
 public struct RecoveryResponse: Codable {
