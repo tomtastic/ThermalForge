@@ -88,6 +88,8 @@ request starts work; it is not proof that manual control or Apple handback has c
 
 The [component and failure-mode review](docs/nextgen-review.md) records the safety
 and efficiency changes, interaction tests, and remaining physical release checks.
+The [fan-control test plan](docs/control-test-plan.md) explains the RC failures,
+the regression coverage, and the outstanding UI and hardware release gates.
 
 ## Safety Model
 
