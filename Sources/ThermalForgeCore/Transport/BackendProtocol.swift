@@ -169,6 +169,9 @@ public struct BackendSnapshot: Codable {
     public var ownerKind: ControlClientKind?
     public var restoration: RestorationState
     public var restorationErrors: [String]
+    /// A failed manual operation remains visible after successful handback.
+    /// Optional so earlier protocol-v2 snapshots continue to decode.
+    public var controlError: String?
     public var lastSessionEndReason: SessionEndReason?
     public var endedSessions: [String: SessionEndReason]
     public var calibration: CalibrationJobSnapshot?
@@ -181,6 +184,7 @@ public struct BackendSnapshot: Codable {
                 sensors: ThermalStatus? = nil, sampledAt: TimeInterval? = nil,
                 owner: ControlSession? = nil, ownerKind: ControlClientKind? = nil,
                 restoration: RestorationState = .unknown, restorationErrors: [String] = [],
+                controlError: String? = nil,
                 lastSessionEndReason: SessionEndReason? = nil,
                 endedSessions: [String: SessionEndReason] = [:],
                 calibration: CalibrationJobSnapshot? = nil, configurationRevision: Int = 0,
@@ -195,6 +199,7 @@ public struct BackendSnapshot: Codable {
         self.ownerKind = ownerKind
         self.restoration = restoration
         self.restorationErrors = restorationErrors
+        self.controlError = controlError
         self.lastSessionEndReason = lastSessionEndReason
         self.endedSessions = endedSessions
         self.calibration = calibration

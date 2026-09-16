@@ -32,6 +32,7 @@ private final class HardwareBroker: @unchecked Sendable {
     private var entries: [Entry] = []
     private var failures: Set<String> = []
     private var unknown: Set<String> = []
+    private var ignoredTargets: Set<String> = []
     private var backendIdentity: BackendProcessIdentity?
     private var orderingErrors: [String] = []
     let directory: URL
@@ -86,7 +87,9 @@ private final class HardwareBroker: @unchecked Sendable {
                 }
             }
             if failures.contains(command.key), command.bytes == [0] { reply.success = false }
-            if reply.success { keys[command.key] = command.bytes }
+            let ignored = ignoredTargets.contains(command.key) && command.bytes.count == 4
+                && smcBytesToFloat(command.bytes, size: 4) > 0
+            if reply.success, !ignored { keys[command.key] = command.bytes }
         case "count": reply.count = UInt32(keys.count); reply.success = true
         case "index":
             let names = keys.keys.sorted()
@@ -107,6 +110,13 @@ private final class HardwareBroker: @unchecked Sendable {
     func unreadable(_ key: String, enabled: Bool) {
         lock.lock(); defer { lock.unlock() }
         if enabled { unknown.insert(key) } else { unknown.remove(key) }
+    }
+    func ignoreTarget(_ key: String) {
+        lock.lock(); defer { lock.unlock() }; ignoredTargets.insert(key)
+    }
+    func setTemperature(_ value: Float) {
+        lock.lock(); defer { lock.unlock() }
+        keys["Tp01"] = withUnsafeBytes(of: value) { Array($0) }
     }
     func manual() -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -209,6 +219,48 @@ private final class ServiceFixture {
 
 @Suite("Subprocess backend and independent recovery", .serialized)
 struct SubprocessRecoveryTests {
+    @Test("Hardware failure cannot restart GUI control, including a missed error across backend restart",
+          arguments: [false, true])
+    func failedTargetCannotAutomaticallyReacquire(_ restart: Bool) async throws {
+        let fixture = try ServiceFixture(lowerMode: true)
+        try fixture.start()
+        fixture.broker.setTemperature(96)
+        fixture.broker.ignoreTarget("F1Tg") // first fan succeeds; second reports success without applying
+        let client = BackendClient(kind: .gui, socketPath: fixture.directory.appendingPathComponent("b.sock").path)
+        _ = try await client.acquire(.profile("smart"))
+        try fixture.waitFor {
+            let state = try fixture.status()
+            return state.controlError != nil && state.restoration == .verified
+        }
+        let error = try #require(fixture.status().controlError)
+        #expect(error.contains("F1Tg"))
+        #expect(fixture.broker.automatic())
+        let writes = fixture.broker.journal().filter { $0.operation == "write" && $0.key.hasSuffix("Tg") && smcBytesToFloat($0.bytes, size: 4) > 0 }.count
+        #expect(writes == 2)
+        if restart {
+            // The GUI never sees the failed snapshot. Durable revocation still
+            // prevents its reconnection policy from retrying on a new backend.
+            fixture.stop(fixture.backend)
+            try fixture.waitFor { try fixture.recoveryState().ready && fixture.recoveryState().generation == nil }
+            fixture.backend = try fixture.spawn("backend")
+            fixture.broker.track(fixture.backend)
+            try fixture.waitFor { (try? fixture.status().restoration) == .verified }
+            do {
+                _ = try await client.maintain()
+                Issue.record("A missed hardware failure must revoke automatic recovery")
+            } catch let DaemonError.commandFailed(code, _) {
+                #expect(code == "recoveryRevoked")
+            }
+        } else {
+            #expect(try await client.maintain().controlError == error)
+        }
+        for _ in 0..<3 { _ = try await client.maintain() }
+        #expect(await client.ownsControl == false)
+        #expect(fixture.broker.journal().filter { $0.operation == "write" && $0.key.hasSuffix("Tg") && smcBytesToFloat($0.bytes, size: 4) > 0 }.count == writes)
+        #expect(fixture.broker.automatic())
+        #expect(fixture.broker.errors().isEmpty, "\(fixture.broker.errors())")
+    }
+
     @Test func coldRecoveryRemainsAliveWithoutIncidentalRunLoopSources() throws {
         let fixture = try ServiceFixture()
         let recovery = try fixture.spawn("recovery-cold")

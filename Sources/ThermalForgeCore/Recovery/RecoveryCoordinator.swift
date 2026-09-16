@@ -67,8 +67,9 @@ public protocol RecoveryMarkerStoring: AnyObject {
     func clear() throws
 }
 
-public enum RecoveryError: Error, CustomStringConvertible {
+public enum RecoveryError: LocalizedError, CustomStringConvertible {
     case failure(String)
+    public var errorDescription: String? { description }
     public var description: String {
         switch self { case .failure(let message): return message }
     }

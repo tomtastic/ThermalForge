@@ -34,12 +34,14 @@ public enum ThermalForgeDaemon {
 
 // MARK: - Daemon Client
 
-public enum DaemonError: Error, CustomStringConvertible {
+public enum DaemonError: LocalizedError, CustomStringConvertible {
     case notRunning
     case connectionFailed
     case timedOut
     case protocolError(String)
     case commandFailed(code: String, message: String)
+
+    public var errorDescription: String? { description }
 
     public var description: String {
         switch self {

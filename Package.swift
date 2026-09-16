@@ -31,7 +31,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ThermalForgeTests",
-            dependencies: ["ThermalForgeCore", "ThermalForgeFixture"],
+            dependencies: ["ThermalForgeCore", "ThermalForgeFixture", "thermalforge"],
             path: "Tests/ThermalForgeTests"
         ),
         // Test-only command. Release packaging copies only the two production executables.

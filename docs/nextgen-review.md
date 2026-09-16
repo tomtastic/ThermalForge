@@ -7,6 +7,37 @@ physical firmware behavior or claim that all possible failures have been exhaust
 
 ## Components
 
+RC3 hardware testing on Mac17,7/macOS 27 reproduced an SMC write failure with
+both Smart and the foreground maximum-speed command. The error's Foundation
+description discarded the key and failure stage. Error descriptions now survive
+the socket protocol; target failures include transport/firmware status or requested
+versus observed RPM and ownership. The menu wraps the full error. No hardware
+acknowledgement checks have been weakened: the precise firmware failure still
+requires a run of the updated backend on the affected machine.
+
+Actuator failure now revokes automatic profile recovery through the durable
+configuration epoch and retains a separate control error after verified handback.
+This stops repeated unlock/write/restore attempts, including from older v2 clients
+and after restart. Explicit profile selection permits a fresh attempt. Tests use
+the actual backend and shared GUI client together, cover failed restoration, and
+retain the existing automatic-reconnection tests for communication outages.
+
+The earlier component tests correctly rejected failed readbacks, but did not run
+that failure through the GUI's recovery policy. The original subprocess broker
+also echoed every accepted target exactly. `ControlPipelineTests` now injects at
+the IOKit boundary and runs the actual SMC adapter, fan actuator, backend and GUI
+client together. It separates transport acceptance, firmware acceptance, target
+readback and mode changes, including delayed and partial writes.
+
+This exposed a second defect: the actuator accepted a target within 1 RPM, while
+subsequent backend sensing required exact integer equality. A -0.75 RPM readback
+caused twelve target writes instead of two over five follow-up ticks. Both layers
+now share the existing 1 RPM tolerance; a separate test still requires repair for
+larger drift. Subprocess tests cover a GUI that misses the error across backend
+restart, and the actual foreground CLI loop is tested for detailed error reporting
+after completed handback. These tests check observable sequences and ownership,
+not only whether an individual call throws.
+
 | Component | Findings and changes | Verification |
 | --- | --- | --- |
 | Backend coordination | Serialized configuration mutations, publication and calibration admission separately from hardware and short request handling. Policy changes restore Apple ownership before replacing engine state. A normal policy handback preserves rule latches. Revocation persistence retries keep new control blocked until successful. | `BackendCoordinatorTests`: active-curve replacement, Apple-rule hysteresis, metadata edits, stalled sensing with responsive renewals, failed handback, sleep/wake and ownership revocation. |

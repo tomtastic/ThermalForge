@@ -14,9 +14,9 @@ public final class BackendCoordinator: BackendRequestHandling {
         var configuration: BackendConfiguration
     }
     private enum Failure: LocalizedError {
-        case rejected(String), protection(String)
+        case rejected(String), protection(String), actuation(String)
         var errorDescription: String? {
-            switch self { case .rejected(let message), .protection(let message): return message }
+            switch self { case .rejected(let message), .protection(let message), .actuation(let message): return message }
         }
     }
     private let sensorProvider: SensorProvider
@@ -213,6 +213,7 @@ public final class BackendCoordinator: BackendRequestHandling {
                 }
             case .restoreApple:
                 return state {
+                    snapshot.controlError = nil
                     let affectedUID = owner?.uid ?? uid
                     queueEpochInvalidation(uid: affectedUID)
                     endSession(.explicitAuto)
@@ -241,7 +242,7 @@ public final class BackendCoordinator: BackendRequestHandling {
                 let response = state { () -> BackendResponse in
                     guard !stopped, !sleeping, !fatal else { return errorLocked(request, "unavailable", "Backend control is unavailable") }
                     if request.automaticRecovery, pendingEpochUIDs.contains(uid) || request.recoveryEpoch != (knownEpochs[uid] ?? config.recoveryEpoch) {
-                        return errorLocked(request, "recoveryRevoked", "Automatic profile recovery was revoked by an explicit control action")
+                        return errorLocked(request, "recoveryRevoked", "Automatic profile recovery was revoked; select a profile explicitly to retry")
                     }
                     guard !calibrationActive else { return errorLocked(request, "busy", "Calibration is exclusive") }
                     guard snapshot.restoration != .failed else { return errorLocked(request, "restorationRequired", "Apple restoration is unverified") }
@@ -271,6 +272,7 @@ public final class BackendCoordinator: BackendRequestHandling {
                         }
                     }
                     owner = newOwner
+                    snapshot.controlError = nil
                     snapshot.owner = session
                     snapshot.ownerKind = kind
                     snapshot.requestedIntent = request.intent
@@ -433,7 +435,12 @@ public final class BackendCoordinator: BackendRequestHandling {
         if state({ commandIsAcknowledged(appliedCommand, sensors: snapshot.sensors) }) { return }
         try protect { try recovery.authorizeManual() }
         try validOwner(expected)
-        try actuator.apply(appliedCommand, cancellation: expected.cancellation)
+        do { try actuator.apply(appliedCommand, cancellation: expected.cancellation) }
+        catch {
+            // Cancellation/takeover must not be mistaken for hardware failure.
+            try validOwner(expected)
+            throw Failure.actuation(error.localizedDescription)
+        }
         try validOwner(expected)
         state {
             snapshot.restoration = .unknown
@@ -452,9 +459,13 @@ public final class BackendCoordinator: BackendRequestHandling {
         guard let fans = sensors?.fans, !fans.isEmpty, fans.allSatisfy({ $0.mode == "manual" }) else { return false }
         switch command {
         case .setMax:
-            return snapshot.acknowledgedControl == .maximum && fans.allSatisfy { $0.targetRPM == $0.maxRPM }
+            return snapshot.acknowledgedControl == .maximum && fans.allSatisfy {
+                FanTargetAcknowledgement.matches(observed: Float($0.targetRPM), requested: Float($0.maxRPM))
+            }
         case .setRPM(let rpm):
-            return snapshot.acknowledgedControl == .manualRPM(Int(rpm)) && fans.allSatisfy { $0.targetRPM == Int(rpm) }
+            return snapshot.acknowledgedControl == .manualRPM(Int(rpm)) && fans.allSatisfy {
+                FanTargetAcknowledgement.matches(observed: Float($0.targetRPM), requested: Float(Int(rpm)))
+            }
         case .resetAuto: return false
         }
     }
@@ -610,7 +621,15 @@ public final class BackendCoordinator: BackendRequestHandling {
 
     private func failControl(_ error: Error, expected: Owner?) {
         state {
-            if let expected, owner?.cancellation === expected.cancellation { endSession(.backendFailure) }
+            if let expected, owner?.cancellation === expected.cancellation {
+                if case .actuation(let message) = error as? Failure {
+                    snapshot.controlError = message
+                    // Also fence older clients, and clients that reconnect after
+                    // a backend restart, using the existing durable epoch.
+                    queueEpochInvalidation(uid: expected.uid)
+                }
+                endSession(.backendFailure)
+            }
             snapshot.restorationErrors = [error.localizedDescription]
         }
         if expected != nil || state({ needsRestoration || snapshot.acknowledgedControl != .apple }) {

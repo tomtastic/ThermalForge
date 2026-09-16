@@ -65,7 +65,10 @@ struct MenuBarView: View {
                 Text(message).font(.caption).padding(.horizontal, 12)
             }
             if let error = appState.lastError {
-                Text(error).font(.caption2).foregroundStyle(.red).padding(.horizontal, 12)
+                Text(error).font(.caption2).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12)
             }
 
             // Fan speeds

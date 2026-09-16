@@ -3,6 +3,22 @@ import Testing
 @testable import ThermalForgeCore
 
 @Suite struct BackendProtocolTests {
+    @Test func failureMessagesSurviveFoundationAndWireEncoding() throws {
+        let errors: [Error] = [ThermalForgeError.writeFailed("F0Tg: write rejected"),
+            DaemonError.commandFailed(code: "busy", message: "Another session owns control"),
+            RecoveryError.failure("Recovery marker could not be persisted")]
+        for error in errors {
+            #expect(error.localizedDescription == String(describing: error))
+            let original = BackendSnapshot(generation: "one", controlError: error.localizedDescription)
+            let decoded = try JSONDecoder().decode(BackendSnapshot.self, from: JSONEncoder().encode(original))
+            #expect(decoded.controlError == error.localizedDescription)
+        }
+        let legacy = BackendSnapshot(generation: "early-v2")
+        let data = try JSONEncoder().encode(legacy)
+        #expect(!String(decoding: data, as: UTF8.self).contains("controlError"))
+        #expect(try JSONDecoder().decode(BackendSnapshot.self, from: data).controlError == nil)
+    }
+
     @Test func sessionAndIntentRoundTrip() throws {
         let session = ControlSession(generation: "generation-a")
         let request = BackendRequest(operation: .acquire, session: session,

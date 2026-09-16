@@ -121,11 +121,17 @@ final class AppState {
 
     private func publish(_ state: BackendSnapshot) {
         daemonAvailable = true
-        lastError = state.restorationErrors.isEmpty ? nil : state.restorationErrors.joined(separator: "; ")
+        let errors = [state.controlError].compactMap { $0 } + state.restorationErrors.filter { $0 != state.controlError }
+        lastError = errors.isEmpty ? nil : errors.joined(separator: "; ")
         if let profile = profiles.first(where: { $0.id == state.activeProfileID }) { activeProfile = profile }
         switch state.acknowledgedControl {
         case .unknown: ownershipDescription = "Fan ownership unknown"; monitorState = .idle
-        case .apple: ownershipDescription = "Apple fan control"; monitorState = .idle
+        case .apple:
+            if state.controlError != nil { ownershipDescription = "Control paused · Apple fan control" }
+            else if case .profile = state.requestedIntent {
+                ownershipDescription = "\(activeProfile.name) · idle, Apple fan control"
+            } else { ownershipDescription = "Apple fan control" }
+            monitorState = .idle
         case let .manualRPM(rpm): ownershipDescription = "Backend control · \(rpm) RPM acknowledged"; monitorState = .active(profileName: activeProfile.name)
         case .maximum: ownershipDescription = "Backend control · maximum acknowledged"; monitorState = .active(profileName: activeProfile.name)
         }

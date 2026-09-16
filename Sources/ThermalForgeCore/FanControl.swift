@@ -7,9 +7,16 @@
 
 import Foundation
 
+/// Write acknowledgement and subsequent sensing must agree on quantization.
+enum FanTargetAcknowledgement {
+    static func matches(observed: Float, requested: Float) -> Bool {
+        observed.isFinite && requested.isFinite && abs(observed - requested) <= 1
+    }
+}
+
 // MARK: - Types
 
-public enum ThermalForgeError: Error, CustomStringConvertible {
+public enum ThermalForgeError: LocalizedError, CustomStringConvertible {
     case smcConnectionFailed
     case unlockFailed(String)
     case readFailed(String)
@@ -17,6 +24,8 @@ public enum ThermalForgeError: Error, CustomStringConvertible {
     case cancelled
     case restorationFailed([String])
     case rpmOutOfRange(requested: Float, min: Float, max: Float)
+
+    public var errorDescription: String? { description }
 
     public var description: String {
         switch self {
@@ -29,7 +38,7 @@ public enum ThermalForgeError: Error, CustomStringConvertible {
         case .readFailed(let key):
             return "Failed to read SMC key: \(key)"
         case .writeFailed(let key):
-            return "Failed to write SMC key: \(key). Run with sudo."
+            return "SMC write failed: \(key)"
         case .rpmOutOfRange(let req, let min, let max):
             return "RPM \(Int(req)) is out of range [\(Int(min))–\(Int(max))]"
         }
@@ -271,16 +280,20 @@ public final class FanControl {
 
     private func writeTarget(fan index: Int, rpm: Float) throws {
         let targetKey = SMCFanKey.key(SMCFanKey.target, fan: index)
-        guard smc.writeKey(targetKey, bytes: floatToSMCBytes(rpm)) else {
-            throw ThermalForgeError.writeFailed(targetKey)
+        if case .failure(let detail) = smc.writeKeyResult(targetKey, bytes: floatToSMCBytes(rpm)) {
+            throw ThermalForgeError.writeFailed("\(targetKey): \(detail)")
         }
         let acknowledged = smc.readKey(targetKey)
-        guard acknowledged.success, acknowledged.size == 4, acknowledged.bytes.count == 4,
-              abs(smcBytesToFloat(acknowledged.bytes, size: acknowledged.size) - rpm) <= 1 else {
-            throw ThermalForgeError.writeFailed("\(targetKey) acknowledgement")
+        guard acknowledged.success, acknowledged.size == 4, acknowledged.bytes.count == 4 else {
+            throw ThermalForgeError.writeFailed("\(targetKey): target readback unavailable (size \(acknowledged.size))")
         }
-        guard readMode(index) == "manual" else {
-            throw ThermalForgeError.writeFailed("fan \(index) manual ownership acknowledgement")
+        let observed = smcBytesToFloat(acknowledged.bytes, size: acknowledged.size)
+        guard FanTargetAcknowledgement.matches(observed: observed, requested: rpm) else {
+            throw ThermalForgeError.writeFailed("\(targetKey): requested \(rpm) RPM, read back \(observed) RPM")
+        }
+        let mode = readMode(index)
+        guard mode == "manual" else {
+            throw ThermalForgeError.writeFailed("fan \(index): manual ownership lost (mode \(mode))")
         }
     }
 

@@ -13,7 +13,9 @@ func runForegroundSession(client: BackendClient, interval: Double = 1,
             while !Task.isCancelled && !cancellation.isCancelled {
                 _ = try await client.maintain()
                 guard await client.ownsControl else {
-                    throw ValidationError("Control session ended; fan ownership is reported by the backend.")
+                    let state = await client.snapshot
+                    throw ValidationError(state?.controlError ?? state?.restorationErrors.first
+                        ?? "Control session ended; fan ownership is reported by the backend.")
                 }
                 try await Task.sleep(nanoseconds: 2_000_000_000)
             }
@@ -37,8 +39,14 @@ func runForegroundSession(client: BackendClient, interval: Double = 1,
     } catch { failure = error }
     leaseTask.cancel()
     do { try await leaseTask.value } catch is CancellationError {} catch { failure = failure ?? error }
+    if let message = await client.snapshot?.controlError {
+        failure = failure ?? ValidationError(message)
+    }
     do {
-        if let state = try await client.release(), state.restoration != .verified {
+        let released = try await client.release()
+        let observed = await client.snapshot
+        let state = released ?? observed
+        if let state, state.owner == nil, state.restoration != .verified {
             _ = try await waitForRestoration(client)
         }
     } catch {

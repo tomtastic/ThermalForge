@@ -54,6 +54,49 @@ private final class SafetySMC: SMCReading {
 
 @Suite("Verified SMC safety")
 struct FanSafetyTests {
+    @Test("SMC diagnostics preserve transport, firmware, and malformed-reply failures")
+    func writeFailureDiagnostics() {
+        for scenario in 0..<3 {
+            let smc = SMCConnection { input, output, size in
+                output.keyInfo.dataSize = 4
+                if input.data8 == SMCCommand.writeBytes.rawValue {
+                    switch scenario {
+                    case 0: return kIOReturnNotPrivileged
+                    case 1: output.result = 0x85; output.status = 2
+                    default: size = 12
+                    }
+                }
+                return kIOReturnSuccess
+            }
+            let result = smc.writeKeyResult("F0Tg", bytes: floatToSMCBytes(3500))
+            switch scenario {
+            case 0: #expect(result == .failure(String(format: "IOKit status 0x%08x", UInt32(bitPattern: kIOReturnNotPrivileged))))
+            case 1: #expect(result == .failure("firmware result 0x85, status 0x02"))
+            default: #expect(result == .failure("reply size 12, expected 80"))
+            }
+            #expect(!smc.writeKey("F0Tg", bytes: floatToSMCBytes(3500)))
+        }
+    }
+
+    @Test("Target failures report the key, requested RPM, observed RPM, or lost mode")
+    func targetFailureDiagnostics() {
+        let smc = SafetySMC()
+        smc.ignoredWrites.insert("F0Tg")
+        do {
+            try FanControl(smc: smc).setAllFans(rpm: 3500)
+            Issue.record("Unacknowledged target was accepted")
+        } catch {
+            #expect(error.localizedDescription == "SMC write failed: F0Tg: requested 3500.0 RPM, read back 3000.0 RPM")
+        }
+        smc.ignoredWrites = []; smc.targetWriteRestoresAuto = true
+        do {
+            try FanControl(smc: smc).setMax()
+            Issue.record("Lost manual ownership was accepted")
+        } catch {
+            #expect(error.localizedDescription == "SMC write failed: fan 0: manual ownership lost (mode auto)")
+        }
+    }
+
     @Test("A temporarily unreadable CPU is discovered even when another sensor works")
     func temporarySensorLoss() throws {
         let smc = SafetySMC()

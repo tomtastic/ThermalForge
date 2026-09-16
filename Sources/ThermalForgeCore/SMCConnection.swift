@@ -77,16 +77,25 @@ public enum SMCKeyAvailability: Equatable {
     case present(size: UInt32), absent, unknown
 }
 
+public enum SMCWriteResult: Equatable {
+    case success, failure(String)
+}
+
 public protocol SMCReading: AnyObject {
     func keyAvailability(_ key: String) -> SMCKeyAvailability
     func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32)
     func writeKey(_ key: String, bytes: [UInt8]) -> Bool
+    func writeKeyResult(_ key: String, bytes: [UInt8]) -> SMCWriteResult
     func getKeyInfo(_ key: String) -> (size: UInt32, type: String)?
     func getKeyCount() -> UInt32
     func getKeyAtIndex(_ index: UInt32) -> String?
 }
 
 public extension SMCReading {
+    func writeKeyResult(_ key: String, bytes: [UInt8]) -> SMCWriteResult {
+        writeKey(key, bytes: bytes) ? .success : .failure("write rejected")
+    }
+
     func keyAvailability(_ key: String) -> SMCKeyAvailability {
         guard let info = getKeyInfo(key), info.size > 0, info.size <= 32 else { return .unknown }
         return .present(size: info.size)
@@ -189,6 +198,11 @@ public final class SMCConnection {
 
     /// Write raw bytes to an SMC key
     public func writeKey(_ key: String, bytes: [UInt8]) -> Bool {
+        writeKeyResult(key, bytes: bytes) == .success
+    }
+
+    /// Preserve transport and firmware diagnostics without relaxing validation.
+    public func writeKeyResult(_ key: String, bytes: [UInt8]) -> SMCWriteResult {
         var input = SMCParamStruct()
         var output = SMCParamStruct()
         let code = fourCharCode(key)
@@ -200,27 +214,30 @@ public final class SMCConnection {
             dataSize = cached
         } else {
             input.data8 = SMCCommand.readKeyInfo.rawValue
-            guard callSMC(&input, &output) == kIOReturnSuccess else {
-                return false
+            var detail: String?
+            guard callSMC(&input, &output, failureDetail: &detail) == kIOReturnSuccess else {
+                return .failure("metadata: \(detail ?? "unknown failure")")
             }
             dataSize = output.keyInfo.dataSize
-            guard dataSize > 0, dataSize <= 32 else { return false }
+            guard dataSize > 0, dataSize <= 32 else { return .failure("invalid key size \(dataSize)") }
             setCachedSize(code, dataSize)
         }
 
-        guard bytes.count == Int(dataSize), dataSize <= 32 else { return false }
+        guard bytes.count == Int(dataSize), dataSize <= 32 else {
+            return .failure("payload size \(bytes.count), expected \(dataSize)")
+        }
 
         // Write value
         input.data8 = SMCCommand.writeBytes.rawValue
         input.keyInfo.dataSize = dataSize
         input.bytes = arrayToTuple(bytes)
 
-        guard callSMC(&input, &output) == kIOReturnSuccess else {
-            return false
+        var detail: String?
+        guard callSMC(&input, &output, failureDetail: &detail) == kIOReturnSuccess else {
+            return .failure(detail ?? "unknown failure")
         }
 
-        // IOKit may return success even when SMC firmware rejects the write
-        return output.result == 0
+        return .success
     }
 
     /// Get total number of SMC keys
@@ -283,6 +300,12 @@ public final class SMCConnection {
 
     private func callSMC(_ input: inout SMCParamStruct, _ output: inout SMCParamStruct,
                          acceptFirmwareError: Bool = false) -> kern_return_t {
+        var detail: String?
+        return callSMC(&input, &output, acceptFirmwareError: acceptFirmwareError, failureDetail: &detail)
+    }
+
+    private func callSMC(_ input: inout SMCParamStruct, _ output: inout SMCParamStruct,
+                         acceptFirmwareError: Bool = false, failureDetail: inout String?) -> kern_return_t {
         var outputSize = MemoryLayout<SMCParamStruct>.stride
         output = SMCParamStruct()
         let result: kern_return_t
@@ -298,9 +321,18 @@ public final class SMCConnection {
             &outputSize
             )
         }
-        guard result == kIOReturnSuccess else { return result }
-        guard outputSize == MemoryLayout<SMCParamStruct>.stride else { return kIOReturnUnderrun }
-        guard acceptFirmwareError || output.result == 0 else { return kIOReturnError }
+        guard result == kIOReturnSuccess else {
+            failureDetail = String(format: "IOKit status 0x%08x", UInt32(bitPattern: result))
+            return result
+        }
+        guard outputSize == MemoryLayout<SMCParamStruct>.stride else {
+            failureDetail = "reply size \(outputSize), expected \(MemoryLayout<SMCParamStruct>.stride)"
+            return kIOReturnUnderrun
+        }
+        guard acceptFirmwareError || output.result == 0 else {
+            failureDetail = String(format: "firmware result 0x%02x, status 0x%02x", output.result, output.status)
+            return kIOReturnError
+        }
         return kIOReturnSuccess
     }
 

@@ -78,7 +78,7 @@ public actor BackendClient {
         let endReason = value.endedSessions[owned.id] ?? value.lastSessionEndReason
         // Explicit user actions always beat automatic profile reconnection,
         // even if another session subsequently expired while this client was away.
-        if value.owner != nil || [.takeover, .explicitAuto, .released, .sleep].contains(endReason) {
+        if value.owner != nil || value.controlError != nil || [.takeover, .explicitAuto, .released, .sleep].contains(endReason) {
             session = nil
             desiredProfile = nil
             communicationFailed = false
@@ -153,7 +153,7 @@ public actor BackendClient {
             }
         } else { current = try await status() }
         if kind == .gui, communicationFailed, let profile = desiredProfile,
-                  current.owner == nil, current.restoration == .verified {
+                  current.owner == nil, current.controlError == nil, current.restoration == .verified {
             session = nil
             current = try await acquire(.profile(profile), takeover: false, automaticRecovery: true)
         }

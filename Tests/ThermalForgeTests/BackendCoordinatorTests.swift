@@ -29,10 +29,12 @@ private final class BackendSensors: SensorProvider {
 private final class BackendActuator: BackendActuating {
     let journal: BackendJournal
     var failApply = false
+    var applyError: Error?
     var restored = true
     init(_ journal: BackendJournal) { self.journal = journal }
     func apply(_ command: FanCommand, cancellation: CancellationToken) throws {
         journal.append("apply:\(command)")
+        if let applyError { throw applyError }
         if failApply { throw BackendTestError.failed }
     }
     func restoreApple() -> RestorationResult {
@@ -129,6 +131,60 @@ private final class BackendHarness {
 
 @Suite("Central backend coordination")
 struct BackendCoordinatorTests {
+    @Test("A hardware failure survives handback, blocks automatic retries, and allows explicit selection")
+    func hardwareFailureRequiresExplicitRetry() async throws {
+        let h = BackendHarness(); defer { h.close() }
+        let client = BackendClient(kind: .gui, transport: { data in
+            let request = try JSONDecoder().decode(BackendRequest.self, from: data)
+            return try JSONEncoder().encode(h.backend.handle(request, peer: h.gui))
+        })
+        let detail = "F0Tg: requested 7826.0 RPM, read back 0.0 RPM"
+        h.actuator.applyError = ThermalForgeError.writeFailed(detail)
+        h.sensors.temperatures = ["TC0P": 96]
+        let acquired = try await client.acquire(.profile("smart"))
+        h.backend.drainWork()
+        let failed = try await client.maintain()
+        #expect(failed.controlError == "SMC write failed: \(detail)")
+        #expect(failed.acknowledgedControl == .apple)
+        // Handback may still be waiting for durable retry revocation.
+        h.backend.drainWork()
+        #expect(h.snapshot.restoration == .verified)
+        #expect(await client.ownsControl == false)
+        let writeCount = h.journal.values.filter { $0.hasPrefix("apply:") }.count
+        for _ in 0..<3 { _ = try await client.maintain(); h.tick() }
+        #expect(h.journal.values.filter { $0.hasPrefix("apply:") }.count == writeCount)
+        #expect(h.snapshot.controlError == failed.controlError)
+        // Existing v2 clients that do not understand controlError are fenced too.
+        let retry = BackendRequest(operation: .acquire, session: .init(generation: "generation"),
+            clientKind: .gui, intent: .profile("smart"), automaticRecovery: true,
+            recoveryEpoch: acquired.recoveryEpoch)
+        #expect(h.backend.handle(retry, peer: h.gui).error?.code == "recoveryRevoked")
+        let reopened = BackendConfigurationStore(directory: h.directory.appendingPathComponent("users"))
+        #expect(try reopened.load(uid: 501).recoveryEpoch != acquired.recoveryEpoch)
+        h.actuator.applyError = nil
+        _ = try await client.acquire(.profile("smart")); h.backend.drainWork()
+        #expect(h.snapshot.controlError == nil)
+        #expect(h.snapshot.acknowledgedControl == .maximum)
+    }
+
+    @Test("Failed handback retains both the control cause and restoration failure")
+    func hardwareFailureWithFailedRestoration() {
+        let h = BackendHarness(); defer { h.close() }
+        h.actuator.applyError = ThermalForgeError.writeFailed("F0Tg: write rejected")
+        h.actuator.restored = false
+        _ = h.acquire(); h.backend.drainWork()
+        #expect(h.snapshot.controlError == "SMC write failed: F0Tg: write rejected")
+        #expect(h.snapshot.acknowledgedControl == .unknown)
+        #expect(h.snapshot.restoration == .failed)
+        #expect(h.snapshot.restorationErrors.contains("restore failed"))
+        h.actuator.restored = true
+        h.tick()
+        #expect(h.snapshot.restoration == .verified)
+        #expect(h.snapshot.controlError != nil)
+        _ = h.request(.restoreApple); h.backend.drainWork()
+        #expect(h.snapshot.controlError == nil)
+    }
+
     @Test("Oversized session IDs cannot inflate durable ownership snapshots")
     func boundedSessionIdentity() {
         let h = BackendHarness(); defer { h.close() }
