@@ -227,10 +227,10 @@ return to Apple control and rebuild policy state before another evaluation.
 
 A selected profile describes the requested policy; Apple can still own the fans
 while that profile is idle below its trigger. The menu reports this as, for example,
-`Smart · idle, Apple fan control`. A failed manual write pauses control, restores
-Apple ownership, and retains the detailed SMC error. Select a profile explicitly
-to retry after a hardware failure. Automatic reconnection remains available for
-communication/backend outages, but cannot repeatedly retry a rejected hardware
+`Smart · idle, Apple fan control`. Failed control operations, including lost sensors
+or unreadable policy data, pause control, restore Apple ownership, and retain the
+detailed error. Select a profile explicitly to retry. Automatic reconnection remains
+available for communication/backend outages, but cannot repeatedly retry a rejected hardware
 operation, even across a backend restart.
 
 ## Rules (IF/THEN)

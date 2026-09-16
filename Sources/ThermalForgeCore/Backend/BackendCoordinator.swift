@@ -14,9 +14,9 @@ public final class BackendCoordinator: BackendRequestHandling {
         var configuration: BackendConfiguration
     }
     private enum Failure: LocalizedError {
-        case rejected(String), protection(String), actuation(String)
+        case rejected(String), protection(String)
         var errorDescription: String? {
-            switch self { case .rejected(let message), .protection(let message), .actuation(let message): return message }
+            switch self { case .rejected(let message), .protection(let message): return message }
         }
     }
     private let sensorProvider: SensorProvider
@@ -435,12 +435,7 @@ public final class BackendCoordinator: BackendRequestHandling {
         if state({ commandIsAcknowledged(appliedCommand, sensors: snapshot.sensors) }) { return }
         try protect { try recovery.authorizeManual() }
         try validOwner(expected)
-        do { try actuator.apply(appliedCommand, cancellation: expected.cancellation) }
-        catch {
-            // Cancellation/takeover must not be mistaken for hardware failure.
-            try validOwner(expected)
-            throw Failure.actuation(error.localizedDescription)
-        }
+        try actuator.apply(appliedCommand, cancellation: expected.cancellation)
         try validOwner(expected)
         state {
             snapshot.restoration = .unknown
@@ -622,8 +617,11 @@ public final class BackendCoordinator: BackendRequestHandling {
     private func failControl(_ error: Error, expected: Owner?) {
         state {
             if let expected, owner?.cancellation === expected.cancellation {
-                if case .actuation(let message) = error as? Failure {
-                    snapshot.controlError = message
+                // A failed operation in a live session is not a backend outage.
+                // This also covers sensor/configuration failures, while genuine
+                // recovery-channel loss still exits and permits reconnection.
+                if protectionFailure == nil, expected.expiry > now(), !expected.cancellation.isCancelled {
+                    snapshot.controlError = error.localizedDescription
                     // Also fence older clients, and clients that reconnect after
                     // a backend restart, using the existing durable epoch.
                     queueEpochInvalidation(uid: expected.uid)

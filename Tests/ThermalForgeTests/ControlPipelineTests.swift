@@ -182,4 +182,42 @@ struct ControlPipelineTests {
         #expect(try await h.client.status().acknowledgedControl == .maximum)
         #expect(h.firmware.unsafeWrites.isEmpty)
     }
+
+    @Test("Sensor loss pauses the session even after readings return")
+    func missingSensorsDoNotRestartTheGUI() async throws {
+        let h = PipelineHarness(); defer { h.close() }
+        _ = try await h.client.acquire(.profile("smart")); h.settle()
+        h.firmware.table["Tp01"] = h.firmware.bytes(0)
+        h.tick()
+        let failed = try await h.client.maintain()
+        #expect(failed.controlError?.contains("Fresh control sensors") == true)
+        #expect(await h.client.ownsControl == false)
+        let writes = h.firmware.targetWrites
+        h.firmware.table["Tp01"] = h.firmware.bytes(96)
+        for _ in 0..<3 { h.tick(); _ = try await h.client.maintain() }
+        #expect(h.firmware.targetWrites == writes)
+        #expect(h.firmware.automatic)
+        _ = try await h.client.acquire(.profile("smart")); h.settle()
+        #expect(try await h.client.status().acknowledgedControl == .maximum)
+    }
+
+    @Test("Unreadable policy data cannot cause repeated GUI acquisition and handback")
+    func invalidCalibrationPausesControl() async throws {
+        let h = PipelineHarness(); defer { h.close() }
+        _ = try await h.client.acquire(.profile("smart")); h.settle()
+        let path = h.directory.appendingPathComponent("calibration/machine-calibration-v2.json")
+        let original = try Data(contentsOf: path)
+        try Data(#"{"version":999,"reset":false,"checkedRoot":true}"#.utf8).write(to: path)
+        h.tick()
+        let failed = try await h.client.maintain()
+        #expect(failed.controlError?.contains("Unsupported calibration storage version") == true)
+        #expect(await h.client.ownsControl == false)
+        let writes = h.firmware.targetWrites
+        try original.write(to: path)
+        for _ in 0..<3 { h.tick(); _ = try await h.client.maintain() }
+        #expect(h.firmware.targetWrites == writes)
+        #expect(h.firmware.automatic)
+        _ = try await h.client.acquire(.profile("smart")); h.settle()
+        #expect(try await h.client.status().acknowledgedControl == .maximum)
+    }
 }

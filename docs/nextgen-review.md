@@ -15,7 +15,7 @@ versus observed RPM and ownership. The menu wraps the full error. No hardware
 acknowledgement checks have been weakened: the precise firmware failure still
 requires a run of the updated backend on the affected machine.
 
-Actuator failure now revokes automatic profile recovery through the durable
+Control-operation failure now revokes automatic profile recovery through the durable
 configuration epoch and retains a separate control error after verified handback.
 This stops repeated unlock/write/restore attempts, including from older v2 clients
 and after restart. Explicit profile selection permits a fresh attempt. Tests use
@@ -37,6 +37,12 @@ larger drift. Subprocess tests cover a GUI that misses the error across backend
 restart, and the actual foreground CLI loop is tested for detailed error reporting
 after completed handback. These tests check observable sequences and ownership,
 not only whether an individual call throws.
+
+A subsequent sensor-loss interaction test exposed the same retry policy on the
+sensing path: restoring readings restarted manual control without a fresh user
+selection. The pause now covers failures within a live session, including sensing
+and policy loading. Cancellation and recovery-service communication loss remain
+separate, preserving intentional handoffs and backend-outage reconnection.
 
 | Component | Findings and changes | Verification |
 | --- | --- | --- |
