@@ -9,7 +9,8 @@ final class AppState {
     static let client = BackendClient(kind: .gui)
     private static weak var current: AppState?
     var latestStatus: ThermalStatus?
-    var activeProfile: FanProfile = .silent
+    var selectedProfileID: String?
+    var controlPaused = false
     var profiles: [FanProfile] = FanProfile.builtIn
     var monitorState: MonitorState = .idle
     var calibrationState: CalibrationState = .none
@@ -54,6 +55,7 @@ final class AppState {
     @ObservationIgnored private var applyingConfiguration = false
     @ObservationIgnored private var menuOpen = false
     @ObservationIgnored private var lastStatus: ThermalStatus?
+    @ObservationIgnored private var lastBackendSnapshot: BackendSnapshot?
 
     init() {
         launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -101,6 +103,9 @@ final class AppState {
                     self?.daemonAvailable = false
                     self?.ownershipDescription = "Fan ownership unknown"
                     self?.monitorState = .idle
+                    self?.selectedProfileID = nil
+                    self?.controlPaused = false
+                    self?.lastBackendSnapshot = nil
                     self?.lastError = String(describing: error)
                     let status = await Self.readLocalSensors()
                     self?.publishSensors(status, description: status == nil ? "Sensors unavailable" : "Live local sensors · fan ownership unknown")
@@ -123,25 +128,20 @@ final class AppState {
         daemonAvailable = true
         let errors = [state.controlError].compactMap { $0 } + state.restorationErrors.filter { $0 != state.controlError }
         lastError = errors.isEmpty ? nil : errors.joined(separator: "; ")
-        if let profile = profiles.first(where: { $0.id == state.activeProfileID }) { activeProfile = profile }
-        switch state.acknowledgedControl {
-        case .unknown: ownershipDescription = "Fan ownership unknown"; monitorState = .idle
-        case .apple:
-            if state.controlError != nil { ownershipDescription = "Control paused · Apple fan control" }
-            else if case .profile = state.requestedIntent {
-                ownershipDescription = "\(activeProfile.name) · idle, Apple fan control"
-            } else { ownershipDescription = "Apple fan control" }
-            monitorState = .idle
-        case let .manualRPM(rpm): ownershipDescription = "Backend control · \(rpm) RPM acknowledged"; monitorState = .active(profileName: activeProfile.name)
-        case .maximum: ownershipDescription = "Backend control · maximum acknowledged"; monitorState = .active(profileName: activeProfile.name)
-        }
-        if state.restoration == .pending { ownershipDescription = "Restoring Apple control…" }
-        if state.restoration == .failed { ownershipDescription = "Apple restoration unverified" }
-        if state.ownerKind == .cli { ownershipDescription += " · CLI session (observing)" }
+        lastBackendSnapshot = state
+        publishControl(state)
         calibrationState = state.calibrationLidClosed.map { CalibrationState(active: true, lidClosed: $0) } ?? .none
         calibrationMessage = state.calibration?.message
         let fresh = state.sampledAt.map { BackendTiming.monotonicNow - $0 < BackendTiming.clientLease } ?? false
         publishSensors(fresh ? state.sensors : nil, description: fresh ? "Live backend sensors" : "Backend sensors stale or unavailable")
+    }
+
+    private func publishControl(_ state: BackendSnapshot) {
+        let presentation = ControlPresentation(snapshot: state, profiles: profiles)
+        selectedProfileID = presentation.selectedProfileID
+        ownershipDescription = presentation.ownershipDescription
+        monitorState = presentation.monitorState
+        controlPaused = presentation.paused
     }
 
     private func publishSensors(_ status: ThermalStatus?, description: String) {
@@ -166,7 +166,7 @@ final class AppState {
         profiles = value.profiles
         rules = value.rules
         rulesEnabled = value.rulesEnabled
-        if let selected = profiles.first(where: { $0.id == value.selectedProfileID }) { activeProfile = selected }
+        if let state = lastBackendSnapshot { publishControl(state) }
         applyingConfiguration = false
     }
 

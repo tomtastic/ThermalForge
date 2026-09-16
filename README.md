@@ -233,6 +233,16 @@ detailed error. Select a profile explicitly to retry. Automatic reconnection rem
 available for communication/backend outages, but cannot repeatedly retry a rejected hardware
 operation, even across a backend restart.
 
+The profile picker reflects a live GUI policy. Explicit Apple control selects
+Silent; a paused session or a CLI owner leaves GUI profiles unselected. A paused
+Smart profile can therefore be selected again to request a fresh session.
+
+Accepted SMC target writes may take time to become readable. The backend polls
+for acknowledgement for up to two seconds per fan, without repeating the write.
+Unlocking and all target acknowledgements share an eight-second budget; cancellation
+or loss of manual ownership stops the operation. During these writes the menu says
+`Applying fan control…`, and ownership remains unverified until completion.
+
 ## Rules (IF/THEN)
 
 Profiles, rules, selected profile, and rule preferences are authoritative in

@@ -12,6 +12,9 @@ private final class PipelineFirmware {
     }
     var fault: Fault?
     var targetOffset: Float = 0
+    var targetDelay: TimeInterval?
+    var pendingTargets: [String: (at: TimeInterval, bytes: [UInt8])] = [:]
+    var onWait: (() -> Void)?
     var table: [String: [UInt8]] = [:]
     var delayed: [String: [UInt8]] = [:]
     var journal: [String] = []
@@ -39,6 +42,10 @@ private final class PipelineFirmware {
         Float(bitPattern: bytes.enumerated().reduce(UInt32(0)) { $0 | UInt32($1.element) << ($1.offset * 8) })
     }
     func exchange(_ input: inout SMCParamStruct, _ output: inout SMCParamStruct, _ size: inout Int) -> kern_return_t {
+        for (key, pending) in pendingTargets where pending.at <= now {
+            table[key] = pending.bytes
+            pendingTargets.removeValue(forKey: key)
+        }
         let key = String(bytes: (0..<4).map { UInt8(truncatingIfNeeded: input.key >> ((3 - $0) * 8)) }, encoding: .ascii)!
         guard let value = table[key] else { output.result = 0x84; return kIOReturnSuccess }
         if input.data8 == 9 { output.keyInfo.dataSize = UInt32(value.count); return kIOReturnSuccess }
@@ -67,7 +74,9 @@ private final class PipelineFirmware {
             case .secondFan where key == "F1Tg": output.result = 0x85; return kIOReturnSuccess
             default: break
             }
-            table[key] = bytes(rpm(payload) + targetOffset)
+            if let targetDelay {
+                pendingTargets[key] = (now + targetDelay, bytes(rpm(payload) + targetOffset))
+            } else { table[key] = bytes(rpm(payload) + targetOffset) }
         } else { table[key] = payload }
         return kIOReturnSuccess
     }
@@ -98,7 +107,7 @@ private final class PipelineHarness {
     init() {
         let firmware = firmware
         let smc = SMCConnection(transport: firmware.exchange)
-        let fan = FanControl(smc: smc, wait: { firmware.now += $0 }, now: { firmware.now })
+        let fan = FanControl(smc: smc, wait: { firmware.now += $0; firmware.onWait?() }, now: { firmware.now })
         let backend = BackendCoordinator(sensorProvider: fan, actuator: fan, recovery: PipelineProtection(firmware),
             configurationStore: BackendConfigurationStore(directory: directory.appendingPathComponent("users")),
             calibrationStore: BackendCalibrationStore(directory: directory.appendingPathComponent("calibration"), legacyRoot: nil),
@@ -124,6 +133,36 @@ private final class PipelineHarness {
 
 @Suite("SMC to GUI failure interactions")
 struct ControlPipelineTests {
+    @Test("Delayed firmware targets keep status responsive and publish success only after both fans acknowledge",
+          arguments: [false, true])
+    func delayedFirmwareAcknowledgement(_ smart: Bool) async throws {
+        let h = PipelineHarness(); defer { h.close() }
+        h.firmware.targetDelay = 0.2
+        h.firmware.table["Tp01"] = h.firmware.bytes(smart ? 96 : 80)
+        h.firmware.table["F0Tg"] = h.firmware.bytes(4224)
+        h.firmware.table["F1Tg"] = h.firmware.bytes(4224)
+        var observedPending = 0
+        h.firmware.onWait = {
+            let state = h.backend.handle(.init(operation: .status), peer: .init(uid: 501, pid: 456)).snapshot!
+            #expect(state.acknowledgedControl == .unknown)
+            #expect(state.restoration == .unknown)
+            #expect(state.controlError == nil)
+            observedPending += 1
+        }
+        _ = try await h.client.acquire(smart ? .profile("smart") : .rpm(2317))
+        h.settle()
+        h.firmware.onWait = nil
+        let state = try await h.client.status()
+        #expect(observedPending > 0)
+        #expect(state.acknowledgedControl == (smart ? .maximum : .manualRPM(2317)))
+        #expect(state.controlError == nil)
+        #expect(h.firmware.targetWrites == 2)
+        #expect(h.firmware.now >= 0.4 && h.firmware.now < 0.6)
+        for _ in 0..<3 { h.tick(); _ = try await h.client.maintain() }
+        #expect(h.firmware.targetWrites == 2)
+        #expect(h.firmware.unsafeWrites.isEmpty)
+    }
+
     @Test("Partial, rejected, altered and delayed writes pause the GUI after verified handback",
           arguments: PipelineFirmware.Fault.allCases)
     fileprivate func hardwareFailureDoesNotRetry(_ fault: PipelineFirmware.Fault) async throws {

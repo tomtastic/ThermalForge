@@ -435,6 +435,13 @@ public final class BackendCoordinator: BackendRequestHandling {
         if state({ commandIsAcknowledged(appliedCommand, sensors: snapshot.sensors) }) { return }
         try protect { try recovery.authorizeManual() }
         try validOwner(expected)
+        state {
+            // Manual preparation invalidates the previous Apple acknowledgement.
+            // Slow firmware must not leave status claiming verified Apple control
+            // while modes/targets are being changed on the hardware queue.
+            snapshot.acknowledgedControl = .unknown
+            snapshot.restoration = .unknown
+        }
         try actuator.apply(appliedCommand, cancellation: expected.cancellation)
         try validOwner(expected)
         state {

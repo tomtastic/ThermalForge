@@ -33,6 +33,8 @@ private final class HardwareBroker: @unchecked Sendable {
     private var failures: Set<String> = []
     private var unknown: Set<String> = []
     private var ignoredTargets: Set<String> = []
+    private var targetDelay: TimeInterval = 0
+    private var pendingTargets: [String: (at: TimeInterval, bytes: [UInt8])] = [:]
     private var backendIdentity: BackendProcessIdentity?
     private var orderingErrors: [String] = []
     let directory: URL
@@ -61,6 +63,10 @@ private final class HardwareBroker: @unchecked Sendable {
     }
     func handle(_ command: BrokerCommand, peer: AuthenticatedPeer) -> BrokerReply {
         lock.lock(); defer { lock.unlock() }
+        for (key, pending) in pendingTargets where pending.at <= BackendTiming.monotonicNow {
+            keys[key] = pending.bytes
+            pendingTargets.removeValue(forKey: key)
+        }
         entries.append(.init(operation: command.operation, writer: command.writer,
                              pid: peer.pid, key: command.key, bytes: command.bytes))
         var reply = BrokerReply()
@@ -89,7 +95,15 @@ private final class HardwareBroker: @unchecked Sendable {
             if failures.contains(command.key), command.bytes == [0] { reply.success = false }
             let ignored = ignoredTargets.contains(command.key) && command.bytes.count == 4
                 && smcBytesToFloat(command.bytes, size: 4) > 0
-            if reply.success, !ignored { keys[command.key] = command.bytes }
+            if reply.success, !ignored {
+                if targetDelay > 0, command.key.hasSuffix("Tg"), command.bytes.count == 4,
+                   smcBytesToFloat(command.bytes, size: 4) > 0 {
+                    pendingTargets[command.key] = (BackendTiming.monotonicNow + targetDelay, command.bytes)
+                } else {
+                    pendingTargets.removeValue(forKey: command.key)
+                    keys[command.key] = command.bytes
+                }
+            }
         case "count": reply.count = UInt32(keys.count); reply.success = true
         case "index":
             let names = keys.keys.sorted()
@@ -113,6 +127,9 @@ private final class HardwareBroker: @unchecked Sendable {
     }
     func ignoreTarget(_ key: String) {
         lock.lock(); defer { lock.unlock() }; ignoredTargets.insert(key)
+    }
+    func delayTargets(_ delay: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }; targetDelay = delay
     }
     func setTemperature(_ value: Float) {
         lock.lock(); defer { lock.unlock() }
@@ -219,6 +236,29 @@ private final class ServiceFixture {
 
 @Suite("Subprocess backend and independent recovery", .serialized)
 struct SubprocessRecoveryTests {
+    @Test("Delayed hardware acknowledgement keeps the service responsive and protected")
+    func delayedTargetKeepsServiceResponsive() async throws {
+        let fixture = try ServiceFixture(lowerMode: true)
+        try fixture.start()
+        fixture.broker.setTemperature(96)
+        fixture.broker.delayTargets(0.3)
+        let client = BackendClient(kind: .gui, socketPath: fixture.directory.appendingPathComponent("b.sock").path)
+        _ = try await client.acquire(.profile("smart"))
+        try fixture.waitFor { try fixture.status().acknowledgedControl == .unknown && fixture.broker.manual() }
+        let pending = try await client.status()
+        #expect(pending.acknowledgedControl == .unknown)
+        #expect(pending.restoration == .unknown)
+        #expect(pending.controlError == nil)
+        #expect(try fixture.recoveryState().protected)
+        try fixture.waitFor { try fixture.status().acknowledgedControl == .maximum }
+        #expect(try await client.status().controlError == nil)
+        let writes = fixture.broker.journal().filter { $0.operation == "write" && $0.key.hasSuffix("Tg") && smcBytesToFloat($0.bytes, size: 4) > 0 }
+        #expect(writes.count == 2)
+        _ = try await client.release()
+        try fixture.waitFor { try fixture.status().restoration == .verified && fixture.broker.automatic() }
+        #expect(fixture.broker.errors().isEmpty, "\(fixture.broker.errors())")
+    }
+
     @Test("Hardware failure cannot restart GUI control, including a missed error across backend restart",
           arguments: [false, true])
     func failedTargetCannotAutomaticallyReacquire(_ restart: Bool) async throws {

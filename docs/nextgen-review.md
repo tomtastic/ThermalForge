@@ -114,6 +114,23 @@ unkillable processes, failed handback and failed recovery restart.
 
 ## Release boundaries
 
+RC4 on the affected Mac reported a successful write call followed immediately by
+`F0Tg: requested 2317.0 RPM, read back 4224.0 RPM`. This identifies the failing
+readback check; it does not establish whether the target eventually takes effect.
+Target acknowledgement now polls for up to two seconds without rewriting, while
+checking cancellation and manual ownership. Unlocking and acknowledgement share
+one eight-second budget. Status remains responsive and reports unknown ownership
+during manual preparation; it cannot retain an Apple acknowledgement while modes
+are changing. Persistent mismatches still pause control and trigger handback.
+
+The actual menu presentation is now covered by tests as well. Saved selection no
+longer sets the radio buttons: a live GUI policy is selected, explicit Apple control
+selects Silent, and a paused session or CLI owner selects no GUI profile. A paused
+profile can be selected again. New tests cover delayed successful readback, timeout,
+cancellation, ownership loss, exhausted unlock budget, late blocking reads, and
+status/protection during a real subprocess's delayed acknowledgement. Physical
+validation of the bounded wait is still required on the affected machine.
+
 - Direct-mode and `Ftst` machines still need physical handback, sleep/wake and
   calibration checks. Readable firmware acknowledgement is the software criterion;
   actual RPM can take time to settle.

@@ -9,6 +9,7 @@ public enum BackendTiming {
     public static let expiryInterval: TimeInterval = 1
     public static let terminationGrace: TimeInterval = 1
     public static let unlockBudget: TimeInterval = 8
+    public static let targetAcknowledgementBudget: TimeInterval = 2
     public static let maximumFrameBytes = 1024 * 1024
     public static var monotonicNow: TimeInterval {
         TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000

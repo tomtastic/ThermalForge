@@ -208,11 +208,10 @@ public final class FanControl {
 
     private func checkCancellation(_ cancellation: CancellationToken, deadline: TimeInterval) throws {
         guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
-        guard now() < deadline else { throw ThermalForgeError.unlockFailed("Eight-second preparation budget expired") }
+        guard now() < deadline else { throw ThermalForgeError.unlockFailed("Eight-second fan operation budget expired") }
     }
 
-    private func unlockFans(_ indices: [Int], cancellation: CancellationToken) throws {
-        let deadline = now() + BackendTiming.unlockBudget
+    private func unlockFans(_ indices: [Int], cancellation: CancellationToken, deadline: TimeInterval) throws {
         try checkCancellation(cancellation, deadline: deadline)
         let ftstAvailability = smc.keyAvailability(SMCFanKey.forceTest)
         switch ftstAvailability {
@@ -278,27 +277,54 @@ public final class FanControl {
         }
     }
 
-    private func writeTarget(fan index: Int, rpm: Float) throws {
+    private func writeTarget(fan index: Int, rpm: Float, cancellation: CancellationToken,
+                             deadline: TimeInterval) throws {
+        try checkCancellation(cancellation, deadline: deadline)
         let targetKey = SMCFanKey.key(SMCFanKey.target, fan: index)
         if case .failure(let detail) = smc.writeKeyResult(targetKey, bytes: floatToSMCBytes(rpm)) {
             throw ThermalForgeError.writeFailed("\(targetKey): \(detail)")
         }
-        let acknowledged = smc.readKey(targetKey)
-        guard acknowledged.success, acknowledged.size == 4, acknowledged.bytes.count == 4 else {
-            throw ThermalForgeError.writeFailed("\(targetKey): target readback unavailable (size \(acknowledged.size))")
-        }
-        let observed = smcBytesToFloat(acknowledged.bytes, size: acknowledged.size)
-        guard FanTargetAcknowledgement.matches(observed: observed, requested: rpm) else {
-            throw ThermalForgeError.writeFailed("\(targetKey): requested \(rpm) RPM, read back \(observed) RPM")
-        }
-        let mode = readMode(index)
-        guard mode == "manual" else {
-            throw ThermalForgeError.writeFailed("fan \(index): manual ownership lost (mode \(mode))")
+        let acknowledgementDeadline = min(deadline, now() + BackendTiming.targetAcknowledgementBudget)
+        while true {
+            guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
+            let mode = readMode(index)
+            guard mode == "manual" else {
+                throw ThermalForgeError.writeFailed("fan \(index): manual ownership lost (mode \(mode))")
+            }
+            let acknowledged = smc.readKey(targetKey)
+            let detail: String
+            if acknowledged.success, acknowledged.size == 4, acknowledged.bytes.count == 4 {
+                let observed = smcBytesToFloat(acknowledged.bytes, size: acknowledged.size)
+                if FanTargetAcknowledgement.matches(observed: observed, requested: rpm) {
+                    try checkCancellation(cancellation, deadline: deadline)
+                    let finalMode = readMode(index)
+                    guard finalMode == "manual" else {
+                        throw ThermalForgeError.writeFailed("fan \(index): manual ownership lost (mode \(finalMode))")
+                    }
+                    try checkCancellation(cancellation, deadline: deadline)
+                    guard now() <= acknowledgementDeadline else {
+                        throw ThermalForgeError.writeFailed("\(targetKey): acknowledgement arrived after the deadline")
+                    }
+                    return
+                }
+                detail = "requested \(rpm) RPM, read back \(observed) RPM"
+            } else {
+                detail = "target readback unavailable (size \(acknowledged.size))"
+            }
+            let remaining = acknowledgementDeadline - now()
+            guard remaining > 0 else {
+                throw ThermalForgeError.writeFailed("\(targetKey): \(detail) (acknowledgement timed out)")
+            }
+            // Firmware acceptance can precede the new readable target. Poll
+            // without rewriting it; ownership, cancellation and the shared
+            // eight-second operation deadline continue to bound the wait.
+            wait(min(0.05, remaining))
         }
     }
 
     /// Set all fans to maximum RPM
     public func setMax(cancellation: CancellationToken = CancellationToken()) throws {
+        let deadline = now() + BackendTiming.unlockBudget
         let count = try fanCount()
         guard count > 0 else { throw ThermalForgeError.unlockFailed("No controllable fans") }
         var maxima: [Float] = []
@@ -307,28 +333,30 @@ public final class FanControl {
             try validate(rpm: limits.max, limits: limits)
             maxima.append(limits.max)
         }
-        try unlockFans(Array(0..<count), cancellation: cancellation)
+        try unlockFans(Array(0..<count), cancellation: cancellation, deadline: deadline)
         for index in 0..<count {
             guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
-            try writeTarget(fan: index, rpm: maxima[index])
+            try writeTarget(fan: index, rpm: maxima[index], cancellation: cancellation, deadline: deadline)
             log("Set fan \(index) to max (\(Int(maxima[index])) RPM)")
         }
     }
 
     /// Set a single fan to a specific RPM
     public func setSpeed(fan index: Int, rpm: Float, cancellation: CancellationToken = CancellationToken()) throws {
+        let deadline = now() + BackendTiming.unlockBudget
         guard index >= 0, index < (try fanCount()) else { throw ThermalForgeError.readFailed("fan index") }
         try validate(rpm: rpm, limits: verifiedFanLimits(index))
 
-        try unlockFans([index], cancellation: cancellation)
+        try unlockFans([index], cancellation: cancellation, deadline: deadline)
 
         guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
-        try writeTarget(fan: index, rpm: rpm)
+        try writeTarget(fan: index, rpm: rpm, cancellation: cancellation, deadline: deadline)
         log("Set fan \(index) to \(Int(rpm)) RPM")
     }
 
     /// Set all fans to a specific RPM
     public func setAllFans(rpm: Float, cancellation: CancellationToken = CancellationToken()) throws {
+        let deadline = now() + BackendTiming.unlockBudget
         let count = try fanCount()
         guard count > 0 else { throw ThermalForgeError.unlockFailed("No controllable fans") }
 
@@ -337,11 +365,11 @@ public final class FanControl {
             try validate(rpm: rpm, limits: limits)
         }
 
-        try unlockFans(Array(0..<count), cancellation: cancellation)
+        try unlockFans(Array(0..<count), cancellation: cancellation, deadline: deadline)
 
         for i in 0..<count {
             guard !cancellation.isCancelled else { throw ThermalForgeError.cancelled }
-            try writeTarget(fan: i, rpm: rpm)
+            try writeTarget(fan: i, rpm: rpm, cancellation: cancellation, deadline: deadline)
             log("Set fan \(i) to \(Int(rpm)) RPM")
         }
     }

@@ -54,6 +54,75 @@ private final class SafetySMC: SMCReading {
 
 @Suite("Verified SMC safety")
 struct FanSafetyTests {
+    @Test("Delayed target readback is acknowledged without repeating the write")
+    func delayedTargetAcknowledgement() throws {
+        let smc = SafetySMC()
+        smc.ignoredWrites.insert("F0Tg")
+        var time: TimeInterval = 0
+        let fan = FanControl(smc: smc, wait: {
+            time += $0
+            if time >= 0.15 { smc.table["F0Tg"] = floatToSMCBytes(3500) }
+        }, now: { time })
+        try fan.setAllFans(rpm: 3500)
+        #expect(time >= 0.15 && time < 0.25)
+        #expect(smc.journal.filter { $0.hasPrefix("write:F0Tg") }.count == 1)
+        #expect(smc.table["F1Tg"] == floatToSMCBytes(3500))
+    }
+
+    @Test("Cancellation during acknowledgement prevents remaining fan writes")
+    func targetAcknowledgementCancellation() {
+        let smc = SafetySMC()
+        smc.ignoredWrites.insert("F0Tg")
+        let token = CancellationToken()
+        var time: TimeInterval = 0
+        let fan = FanControl(smc: smc, wait: { time += $0; token.cancel() }, now: { time })
+        #expect(throws: ThermalForgeError.self) { try fan.setAllFans(rpm: 3500, cancellation: token) }
+        #expect(time == 0.05)
+        #expect(!smc.journal.contains { $0.hasPrefix("write:F1Tg") })
+        #expect(fan.restoreApple().verified)
+    }
+
+    @Test("Lost manual mode during acknowledgement stops waiting immediately")
+    func targetAcknowledgementLosesOwnership() {
+        let smc = SafetySMC()
+        smc.ignoredWrites.insert("F0Tg")
+        var time: TimeInterval = 0
+        let fan = FanControl(smc: smc, wait: { time += $0; smc.table["F0md"] = [0] }, now: { time })
+        do {
+            try fan.setAllFans(rpm: 3500)
+            Issue.record("Lost ownership must not be acknowledged")
+        } catch { #expect(error.localizedDescription.contains("manual ownership lost (mode auto)")) }
+        #expect(time == 0.05)
+        #expect(!smc.journal.contains { $0.hasPrefix("write:F1Tg") })
+    }
+
+    @Test("Unlock and target acknowledgement share the whole-operation deadline")
+    func targetWaitSharesUnlockBudget() {
+        let smc = SafetySMC()
+        smc.table["F0md"] = [0]
+        smc.table["F1md"] = [0]
+        smc.rejectedWrites.insert("F0md")
+        smc.ignoredWrites.insert("F0Tg")
+        var time: TimeInterval = 0
+        let fan = FanControl(smc: smc, wait: {
+            time += $0
+            if time >= 6.8 { smc.rejectedWrites.remove("F0md") }
+        }, now: { time })
+        #expect(throws: ThermalForgeError.self) { try fan.setAllFans(rpm: 3500) }
+        #expect(time >= 8 && time < 8.01)
+        #expect(!smc.journal.contains { $0.hasPrefix("write:F1Tg") })
+    }
+
+    @Test("A blocking read cannot report a late acknowledgement as success")
+    func targetReadExceedsDeadline() {
+        let smc = SafetySMC()
+        var time: TimeInterval = 0
+        smc.onRead = { if $0 == "F0Tg" { time = 3 } }
+        let fan = FanControl(smc: smc, wait: { time += $0 }, now: { time })
+        #expect(throws: ThermalForgeError.self) { try fan.setAllFans(rpm: 3500) }
+        #expect(!smc.journal.contains { $0.hasPrefix("write:F1Tg") })
+    }
+
     @Test("SMC diagnostics preserve transport, firmware, and malformed-reply failures")
     func writeFailureDiagnostics() {
         for scenario in 0..<3 {
@@ -86,7 +155,7 @@ struct FanSafetyTests {
             try FanControl(smc: smc).setAllFans(rpm: 3500)
             Issue.record("Unacknowledged target was accepted")
         } catch {
-            #expect(error.localizedDescription == "SMC write failed: F0Tg: requested 3500.0 RPM, read back 3000.0 RPM")
+            #expect(error.localizedDescription == "SMC write failed: F0Tg: requested 3500.0 RPM, read back 3000.0 RPM (acknowledgement timed out)")
         }
         smc.ignoredWrites = []; smc.targetWriteRestoresAuto = true
         do {

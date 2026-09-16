@@ -106,42 +106,41 @@ struct MenuBarView: View {
 
             // Profile picker
             SectionHeader(title: "PROFILE")
-            Picker("Profile", selection: Binding(
-                get: { appState.activeProfile.id },
-                set: { id in
-                    if let profile = appState.profiles.first(where: { $0.id == id }) {
-                        appState.selectProfile(profile)
-                    }
-                }
-            )) {
+            VStack(alignment: .leading, spacing: 2) {
                 ForEach(appState.profiles) { profile in
-                    HStack {
-                        Text(profile.name)
-                        Spacer()
-                        if !profile.curve.handsOff {
-                            let unit = appState.useFahrenheit ? "F" : "C"
-                            if profile.curve.instantEngage {
-                                let startC = profile.curve.startTemp
-                                let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
-                                Text("\(Int(startDisp))°\(unit) instant")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                let startC = profile.curve.startTemp
-                                let ceilC = profile.curve.ceilingTemp
-                                let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
-                                let ceilDisp = appState.useFahrenheit ? ceilC * 9 / 5 + 32 : ceilC
-                                Text("\(Int(startDisp))→\(Int(ceilDisp))°\(unit)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                    Button { appState.selectProfile(profile) } label: {
+                        HStack {
+                            Image(systemName: appState.selectedProfileID == profile.id ? "largecircle.fill.circle" : "circle")
+                                .foregroundStyle(appState.selectedProfileID == profile.id ? Color.accentColor : Color.secondary)
+                                .accessibilityHidden(true)
+                            Text(profile.name)
+                            Spacer()
+                            if !profile.curve.handsOff {
+                                let unit = appState.useFahrenheit ? "F" : "C"
+                                if profile.curve.instantEngage {
+                                    let startC = profile.curve.startTemp
+                                    let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
+                                    Text("\(Int(startDisp))°\(unit) instant")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    let startC = profile.curve.startTemp
+                                    let ceilC = profile.curve.ceilingTemp
+                                    let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
+                                    let ceilDisp = appState.useFahrenheit ? ceilC * 9 / 5 + 32 : ceilC
+                                    Text("\(Int(startDisp))→\(Int(ceilDisp))°\(unit)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
+                        .contentShape(Rectangle())
                     }
-                    .tag(profile.id)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(profile.name)
+                    .accessibilityValue(appState.selectedProfileID == profile.id ? "Selected" : "Not selected")
                 }
             }
-            .pickerStyle(.inline)
-            .labelsHidden()
             .padding(.horizontal, 12)
 
             // Calibration indicator
@@ -271,19 +270,25 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var stateIndicator: some View {
-        switch appState.monitorState {
-        case .safetyOverride:
-            Label("SAFETY", systemImage: "exclamationmark.triangle.fill")
+        if appState.controlPaused {
+            Label("Paused", systemImage: "pause.circle")
                 .font(.caption)
                 .foregroundStyle(.red)
-        case .active(let name):
-            Label(name, systemImage: "fan.fill")
-                .font(.caption)
-                .foregroundStyle(.orange)
-        case .idle:
-            Label("Idle", systemImage: "fan")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        } else {
+            switch appState.monitorState {
+            case .safetyOverride:
+                Label("SAFETY", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            case .active(let name):
+                Label(name, systemImage: "fan.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            case .idle:
+                Label("Idle", systemImage: "fan")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
