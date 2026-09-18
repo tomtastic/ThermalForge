@@ -14,8 +14,8 @@ plutil -lint "$SMOKE_APP/Contents/Info.plist" >/dev/null
 test -x "$SMOKE_APP/Contents/MacOS/ThermalForgeApp"
 test -x "$SMOKE_APP/Contents/Resources/thermalforge"
 "$SMOKE_APP/Contents/Resources/thermalforge" --help > "$ROOT_DIR/.build/smoke-help.txt"
-rg -q 'recovery' "$ROOT_DIR/.build/smoke-help.txt"
-if find "$SMOKE_APP" -iname '*fixture*' | rg -q .; then
+/usr/bin/grep -q 'recovery' "$ROOT_DIR/.build/smoke-help.txt"
+if find "$SMOKE_APP" -iname '*fixture*' | /usr/bin/grep . >/dev/null; then
   echo "ERROR: integration fixtures leaked into the app bundle" >&2
   exit 1
 fi
